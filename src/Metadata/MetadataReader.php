@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pixiaoka\Orm\Metadata;
 
 use Pixiaoka\Orm\Annotation\Column;
+use Pixiaoka\Orm\Annotation\CreatedAt;
+use Pixiaoka\Orm\Annotation\UpdatedAt;
 use Pixiaoka\Orm\Cast\Decimal;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
 use Pixiaoka\Orm\Annotation\Temporal;
@@ -90,23 +92,57 @@ final class MetadataReader
             $byProperty,
             $primary,
             $generated === [] ? 'natural' : 'surrogate',
-            $this->timestamps($byProperty),
+            $this->timestamps($class, $reflection, $byProperty),
         );
     }
 
     /**
+     * 显式时间角色优先；兼容传统 int created_at/updated_at。
+     *
+     * @param class-string<Entity> $class
+     * @param ReflectionClass<Entity> $reflection
      * @param array<string, FieldMeta> $fields
-     * @return array{created_at?: true, updated_at?: true}
+     * @return array{created_at?: string, updated_at?: string}
      */
-    private function timestamps(array $fields): array
+    private function timestamps(string $class, ReflectionClass $reflection, array $fields): array
     {
         $ts = [];
-        foreach ($fields as $property => $field) {
-            if ($property === 'created_at' && $field->typeName() === 'int') {
-                $ts['created_at'] = true;
+        foreach ($reflection->getProperties() as $property) {
+            $name = $property->getName();
+            if (!isset($fields[$name])) {
+                if ($property->getAttributes(CreatedAt::class) !== []
+                    || $property->getAttributes(UpdatedAt::class) !== []) {
+                    throw new MetadataException("$class::$name 时间角色必须同时声明 #[Column]");
+                }
+                continue;
             }
-            if ($property === 'updated_at' && $field->typeName() === 'int') {
-                $ts['updated_at'] = true;
+            $field = $fields[$name];
+            $roles = [];
+            if ($property->getAttributes(CreatedAt::class) !== []) {
+                $roles[] = 'created_at';
+            }
+            if ($property->getAttributes(UpdatedAt::class) !== []) {
+                $roles[] = 'updated_at';
+            }
+            if (count($roles) > 1) {
+                throw new MetadataException("$class::$name 创建时间和更新时间角色不能共用同一字段");
+            }
+            foreach ($roles as $role) {
+                if (isset($ts[$role])) {
+                    throw new MetadataException("$class::$name 时间角色 $role 重复声明");
+                }
+                if ($field->primary) {
+                    throw new MetadataException("$class::$name 主键不能作为自动时间角色");
+                }
+                if (!in_array($field->typeName(), ['int', \DateTimeImmutable::class], true)) {
+                    throw new MetadataException("$class::$name 自动时间角色只支持 int 或 DateTimeImmutable");
+                }
+                $ts[$role] = $name;
+            }
+        }
+        foreach (['created_at', 'updated_at'] as $role) {
+            if (!isset($ts[$role]) && isset($fields[$role]) && $fields[$role]->typeName() === 'int') {
+                $ts[$role] = $role;
             }
         }
 

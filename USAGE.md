@@ -122,17 +122,32 @@ public DateTimeImmutable $happened_at;
 public DateTimeImmutable $created_at;
 ```
 
-### 时间戳自动填充
+### 可配置时间字段自动填充
 
-字段名 `created_at` / `updated_at`（int 类型）会自动填充。插入时两者都填，更新时只填 `updated_at`。
+传统 `int $created_at` / `int $updated_at` 不写其他注解仍兼容。自定义字段名使用 `#[CreatedAt]` 和 `#[UpdatedAt]`，支持 `int` 与 `DateTimeImmutable`：
 
 ```php
-#[Column]
-public int $created_at;   // 插入时自动 = time()
+use Pixiaoka\Orm\Annotation\CreatedAt;
+use Pixiaoka\Orm\Annotation\UpdatedAt;
+use Pixiaoka\Orm\Annotation\Temporal;
 
 #[Column]
-public int $updated_at = 0;  // 每次 save 都自动 = time()
+#[CreatedAt]
+public DateTimeImmutable $created_on; // 默认 UTC Y-m-d H:i:s
+
+#[Column(name: 'modify_time')]
+#[UpdatedAt]
+public int $modify_time; // Unix 秒
+
+#[Column]
+#[UpdatedAt]
+#[Temporal(Temporal::UNIX)]
+public DateTimeImmutable $updated_unix; // DateTimeImmutable 也可存 Unix 秒
 ```
+
+插入时填充两者，更新时只刷新更新时间。调用方显式修改过更新时间则不覆盖；创建时间不会在普通更新或 UPSERT 冲突更新中被覆盖。插入、批量插入和 UPSERT 都支持自动填充。每个角色只能声明一次、不能共用同一字段、不能标在主键上；不支持其他 PHP 类型。没有这些字段的模型无需配置。
+
+模型生成器会为传统的 `created_at` / `updated_at` 自动附加时间角色注解，但仅当它们映射为 `int` 或可无损读取的 `DateTimeImmutable` 时；其他列名需自行添加上述注解。
 
 ## 3. Active Record
 
@@ -642,7 +657,7 @@ webman 的 `orm:gen` 只负责读取框架配置并调用同一库内 API，不�
 ## 14. 测试与真实数据库验收
 
 ```bash
-# 库内完整测试：181 tests / 626 assertions（2 项显式 DSN 实连测试默认跳过）
+# 库内完整测试：191 tests / 669 assertions（2 项显式 DSN 实连测试默认跳过）
 vendor/bin/phpunit
 
 # SQLite / MySQL / PostgreSQL 实连；进程环境变量覆盖 .env
@@ -653,7 +668,7 @@ MySQL/PostgreSQL 推荐使用独立 Docker 测试实例，例如 `mysql:8.4`、`
 
 生成器另有 `tests/SchemaLiveTest.php`，只有显式设置 `PIXIAOKA_ORM_LIVE_MYSQL_DSN`、`PIXIAOKA_ORM_LIVE_PGSQL_DSN` 及对应 `_USER`、`_PASSWORD` 才连接外部数据库；默认跳过，不隐式读取本机服务或 `.env`。该测试使用原生预处理，覆盖主键、默认值、时间类型、生成文件 lint 和元数据，完整示例见 [README](README.md#模型生成器实连测试)。
 
-本次默认套件为 181 tests / 626 assertions；显式配置专用 MySQL/PostgreSQL 后为 181 tests / 674 assertions，零跳过。此前复杂查询内核已通过 SQLite 55 项、Docker MySQL 54 项、Docker PostgreSQL 57 项实连检查。
+本次默认套件为 191 tests / 669 assertions；显式配置专用 MySQL/PostgreSQL 后为 191 tests / 717 assertions，零跳过。此前复杂查询内核已通过 SQLite 55 项、Docker MySQL 54 项、Docker PostgreSQL 57 项实连检查。
 
 ## 15. 项目集成示例
 

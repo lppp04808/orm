@@ -15,7 +15,7 @@ final readonly class ModelMeta
      * @param array<string, FieldMeta> $fields 属性名 => 字段
      * @param list<FieldMeta> $primaryKey 有序主键列
      * @param 'surrogate'|'natural' $identityKind
-     * @param array{created_at?: true, updated_at?: true} $timestamps
+     * @param array{created_at?: string, updated_at?: string} $timestamps 时间角色 => 属性名
      */
     public function __construct(
         public string $class,
@@ -30,6 +30,11 @@ final readonly class ModelMeta
     public function field(string $property): FieldMeta
     {
         return $this->fields[$property] ?? throw new \LogicException('未知字段: ' . $property);
+    }
+
+    public function timestampField(string $role): ?FieldMeta
+    {
+        return isset($this->timestamps[$role]) ? $this->field($this->timestamps[$role]) : null;
     }
 
     /** @return list<string> */

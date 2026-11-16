@@ -73,6 +73,7 @@ final class EntityGateway
         $meta = $this->metadata->read($entity::class);
         $generated = $meta->generatedField();
         $this->fillTimestamp($entity, $meta, 'created_at');
+        $this->fillTimestamp($entity, $meta, 'updated_at');
         $entity->beforeSave();
         $entity->beforeInsert();
         $params = [];
@@ -233,14 +234,13 @@ final class EntityGateway
             $placeholders = [];
             foreach ($fieldList as $field) {
                 $column = $field->column;
-                $isTimestamp = ($column === 'created_at' || $column === 'updated_at')
-                    && ($meta->timestamps[$column] ?? false);
+                $isTimestamp = in_array($field->property, $meta->timestamps, true);
                 $has = $isEntity
                     ? $row->propSet($field->property)
                     : (array_key_exists($column, $row) || array_key_exists($field->property, $row));
                 if ($isTimestamp && !$has) {
                     // P1-2：时间戳只在未提供时才填充，显式给值的不覆盖
-                    $value = $now;
+                    $value = $this->currentTimestamp($field, $now);
                 } elseif ($has) {
                     $value = $isEntity
                         ? $row->{$field->property}
@@ -841,16 +841,12 @@ final class EntityGateway
             }
         }
         $updates = [];
-        $createdAt = isset($meta->timestamps['created_at'])
-            ? [$meta->fields['created_at']->column]
-            : [];
+        $createdAtField = $meta->timestampField('created_at');
+        $createdAt = $createdAtField === null ? [] : [$createdAtField->column];
         foreach (['created_at', 'updated_at'] as $timestamp) {
-            if (!isset($meta->timestamps[$timestamp])) {
-                continue;
-            }
-            $field = $meta->fields[$timestamp];
-            if (!array_key_exists($field->column, $insert)) {
-                $insert[$field->column] = $this->toDbValue($meta, $field, time());
+            $field = $meta->timestampField($timestamp);
+            if ($field !== null && !array_key_exists($field->column, $insert)) {
+                $insert[$field->column] = $this->toDbValue($meta, $field, $this->currentTimestamp($field));
             }
         }
         foreach ($meta->fields as $field) {
@@ -862,16 +858,17 @@ final class EntityGateway
             $updateColumns ??= array_values(array_diff(
                 array_keys($insert),
                 array_keys($conflicts),
-                // created_at 只在插入时填充，冲突更新默认不覆盖创建时间。
+                // 创建时间只在插入时写入；即使显式传值，冲突更新也不覆盖。
                 $createdAt,
             ));
+            $updateColumns = array_values(array_diff($updateColumns, $createdAt));
             if ($updateColumns !== null && $updateColumns !== []) {
                 $updateColumns = array_map(
                     static fn (string $column): string => $resolve($column)->column,
                     $updateColumns,
                 );
-                $updatedAt = $meta->fields['updated_at']->column ?? null;
-                if ($updatedAt !== null && isset($meta->timestamps['updated_at'])
+                $updatedAt = $meta->timestampField('updated_at')?->column;
+                if ($updatedAt !== null
                     && $updateColumns !== [$updatedAt]
                     && !in_array($updatedAt, $updateColumns, true)) {
                     $updateColumns[] = $updatedAt;
@@ -1106,36 +1103,42 @@ final class EntityGateway
         return implode(' AND ', $clauses);
     }
 
-    /** P1-2：created_at 仅在未设置时填充，显式提供的值不被覆盖。 */
-    private function fillTimestamp(Entity $entity, ModelMeta $meta, string $name): void
+    /** 创建时间仅在未设置时填充，显式提供的值不被覆盖。 */
+    private function fillTimestamp(Entity $entity, ModelMeta $meta, string $role): void
     {
-        if (!($meta->timestamps[$name] ?? false)) {
-            return;
-        }
-
-        if (!$entity->propSet($name)) {
-            $entity->$name = time();
+        $field = $meta->timestampField($role);
+        if ($field !== null && !$entity->propSet($field->property)) {
+            $entity->{$field->property} = $this->currentTimestamp($field);
         }
     }
 
     /**
-     * updated_at 是“最后修改时间”语义：脏跟踪基础上自动刷新。
-     * 调用方在本次生命周期里显式改过（与读出快照不同）则尊重调用方；
-     * 没改过（或未设置）则由内核刷新为当前时间。
+     * 更新时间是“最后修改时间”语义：调用方本次显式改过则尊重，否则刷新。
      *
      * @param array<string, mixed> $original
      */
     private function fillUpdatedAt(Entity $entity, ModelMeta $meta, array $original): void
     {
-        if (!($meta->timestamps['updated_at'] ?? false)) {
+        $field = $meta->timestampField('updated_at');
+        if ($field === null) {
             return;
         }
-        if ($entity->propSet('updated_at')
-            && array_key_exists('updated_at', $original)
-            && $entity->updated_at !== $original['updated_at']) {
+        $property = $field->property;
+        if ($entity->propSet($property)
+            && array_key_exists($property, $original)
+            && $entity->{$property} != $original[$property]) {
             return;
         }
-        $entity->updated_at = time();
+        $entity->{$property} = $this->currentTimestamp($field);
+    }
+
+    private function currentTimestamp(FieldMeta $field, ?int $now = null): int|DateTimeImmutable
+    {
+        if ($field->typeName() === 'int') {
+            return $now ?? time();
+        }
+
+        return (new DateTimeImmutable('@' . ($now ?? time())))->setTimezone(new \DateTimeZone('UTC'));
     }
 
     private function cacheSet(Entity $entity): void

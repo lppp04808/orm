@@ -108,6 +108,31 @@ $code = $generator->render($tableSchema, 'App\\Model'); // 仅返回代码，不
 
 时间映射以当前 ORM 的无损读取能力为边界：SQLite 无精度 `datetime/timestamp`、PostgreSQL 无精度 `timestamp without time zone` 映射为 `DateTimeImmutable + #[Temporal]`；`DATE`、`TIME`、带时区、带小数秒的时间以及 MySQL `datetime/timestamp` 保守映射为 `string`。默认值按驱动方言处理：MySQL 元数据是已解码文本，SQLite/PostgreSQL 保留 SQL 字面量；PostgreSQL `E'...'` 使用独立转义解析。Unicode 转义按码点生成 UTF-8，原始高位字节按服务器编码校验和转换；非 UTF-8 编码下混合两类字节、SQL_ASCII、未知编码或非法序列不会猜测默认值，而是使用安全的 PHP 属性兜底值。无法无损静态表达的默认值不会写入 PHP 属性。
 
+### 可配置的创建时间与更新时间
+
+时间字段不再只能叫 `created_at`、`updated_at`，也不要求是 `int`。用 `#[CreatedAt]` 和 `#[UpdatedAt]` 标记实际的持久化字段：
+
+```php
+use Pixiaoka\Orm\Annotation\CreatedAt;
+use Pixiaoka\Orm\Annotation\Temporal;
+use Pixiaoka\Orm\Annotation\UpdatedAt;
+
+#[Column]
+#[CreatedAt]
+public DateTimeImmutable $created_on;
+
+#[Column(name: 'modify_time')]
+#[UpdatedAt]
+public int $modify_time;
+
+#[Column]
+#[CreatedAt]
+#[Temporal(Temporal::UNIX)]
+public DateTimeImmutable $created_unix;
+```
+
+`int` 自动写入 Unix 秒；`DateTimeImmutable` 默认写 UTC `Y-m-d H:i:s`，结合 `#[Temporal(Temporal::UNIX)]` 写 Unix 秒。创建时间仅在插入时填充；更新时间在 `save()` 更新时刷新，调用方显式修改过则不覆盖。插入、批量插入和 UPSERT 都遵守显式提供的时间值，UPSERT 默认不在冲突更新时覆盖创建时间。每个角色只能声明一次、不能共用同一字段，且不能标在主键上。传统 `int $created_at` / `int $updated_at` 不写新注解仍兼容；没有这些字段的表无需配置。
+
 ### Active Record
 
 ```php
@@ -279,13 +304,13 @@ final class BcNumber implements Pixiaoka\Orm\Cast\Decimal
 
 ```bash
 composer install
-vendor/bin/phpunit          # 181 tests / 626 assertions；2 项外部 DSN 测试默认跳过
+vendor/bin/phpunit          # 191 tests / 669 assertions；2 项外部 DSN 测试默认跳过
 
 # 实连脚本：进程环境变量覆盖 .env；两个真实库均不可达时自动 SQLite 兜底
 php -d extension=pdo_sqlite -d extension=pdo_pgsql -d extension=pdo_mysql tests/orm_live_verify.php
 ```
 
-本次验收结果：默认 SQLite 套件 181 tests / 626 assertions（含生成器和真实 CLI smoke，2 项显式 DSN 测试跳过）；配置专用 MySQL 8.4、PostgreSQL 16（alpine）后完整套件 181 tests / 674 assertions，零跳过。此前复杂查询内核独立实连验收：SQLite 55 项、MySQL 54 项、PostgreSQL 57 项，均通过。
+本次验收结果：默认 SQLite 套件 191 tests / 669 assertions（含生成器和真实 CLI smoke，2 项显式 DSN 测试跳过）；配置专用 MySQL 8.4、PostgreSQL 16（alpine）后完整套件 191 tests / 717 assertions，零跳过。此前复杂查询内核独立实连验收：SQLite 55 项、MySQL 54 项、PostgreSQL 57 项，均通过。
 
 ### Docker 复验
 

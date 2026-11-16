@@ -99,6 +99,22 @@ final class ModelGeneratorTest extends TestCase
         self::assertStringContainsString("'guest'", (string) file_get_contents($file));
     }
 
+    public function testGeneratedTimeColumnsUseConfigurableTimestampRoles(): void
+    {
+        $pdo = $this->sqlite();
+        $pdo->exec('CREATE TABLE timestamped_item (id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, updated_at DATETIME NOT NULL, renamed_at DATETIME NOT NULL)');
+        $code = (new ModelGenerator($pdo))->render((new SchemaInspector($pdo))->table('timestamped_item'), 'GeneratedTime\\Model');
+        self::assertStringContainsString("#[CreatedAt]\n    public int \$created_at = 0;", $code);
+        self::assertStringContainsString("#[UpdatedAt]\n    public DateTimeImmutable \$updated_at;", $code);
+        self::assertStringNotContainsString("#[CreatedAt]\n    public DateTimeImmutable \$renamed_at;", $code);
+        $file = (new ModelGenerator($pdo))->generate($this->directory, 'GeneratedTime\\Model', tables: ['timestamped_item'])['generated']['timestamped_item'];
+        $this->lint($file);
+        require $file;
+        $meta = (new MetadataReader())->read(\GeneratedTime\Model\TimestampedItem::class);
+        self::assertSame('created_at', $meta->timestampField('created_at')?->property);
+        self::assertSame('updated_at', $meta->timestampField('updated_at')?->property);
+    }
+
     public function testCompositePrimaryKeyKeepsConstraintOrderAndDefaults(): void
     {
         $pdo = $this->sqlite();

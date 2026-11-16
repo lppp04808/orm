@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Pixiaoka\Orm\Schema;
 
 use DateTimeImmutable;
+use Pixiaoka\Orm\Annotation\CreatedAt;
 use Pixiaoka\Orm\Annotation\Temporal;
+use Pixiaoka\Orm\Annotation\UpdatedAt;
 use Pixiaoka\Orm\Cast\BcDecimal;
 
 /** 将数据库列映射为 ORM 支持的 PHP 类型，并仅渲染静态合法默认值。 */
@@ -69,6 +71,14 @@ final class TypeMapper
         }
         if ($type === DateTimeImmutable::class) {
             $imports[] = Temporal::class;
+        }
+        if (in_array($type, ['int', DateTimeImmutable::class], true)) {
+            if ($column->name === 'created_at') {
+                $imports[] = CreatedAt::class;
+            }
+            if ($column->name === 'updated_at') {
+                $imports[] = UpdatedAt::class;
+            }
         }
 
         return $imports;

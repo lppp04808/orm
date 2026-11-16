@@ -6,6 +6,7 @@ namespace Pixiaoka\Orm;
 
 use InvalidArgumentException;
 use Pixiaoka\Orm\Annotation\Column;
+use Pixiaoka\Orm\Annotation\CreatedAt;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
 use Pixiaoka\Orm\Schema\SchemaInspector;
 use Pixiaoka\Orm\Schema\TableSchema;
@@ -124,6 +125,14 @@ final readonly class ModelGenerator
             }
             if ($this->types->phpType($column) === \DateTimeImmutable::class) {
                 $body .= "    #[Temporal]\n";
+            }
+            if (!$column->primary() && in_array($this->types->phpType($column), ['int', \DateTimeImmutable::class], true)) {
+                if ($column->name === 'created_at') {
+                    $body .= "    #[CreatedAt]\n";
+                }
+                if ($column->name === 'updated_at') {
+                    $body .= "    #[UpdatedAt]\n";
+                }
             }
             $type = $this->types->nullableType($column);
             $body .= "    public $type \$$property" . $this->types->defaultInitializer($column) . ";\n\n";
