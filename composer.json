@@ -1,0 +1,35 @@
+{
+    "name": "pixiaoka/orm",
+    "description": "Annotation-driven Active Record ORM for PHP 8.3+. Zero framework dependency. PDO based. Supports composite primary keys, strict type casting at the boundary, dirty tracking, lifecycle hooks, row cache, transactions, coroutine-safe sessions.",
+    "type": "library",
+    "license": "MIT",
+    "bin": [
+        "bin/pixiaoka-orm"
+    ],
+    "require": {
+        "php": ">=8.3",
+        "ext-pdo": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^12.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Pixiaoka\\Orm\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\Pixiaoka\\Orm\\": "tests/"
+        }
+    },
+    "suggest": {
+        "ext-pdo_sqlite": "Running the test suite without external databases (in-memory SQLite)",
+        "ext-bcmath": "PHP 8.4+ can wrap BcMath\\Number with a one-line adapter implementing Pixiaoka\\Orm\\Cast\\Decimal",
+        "ext-pdo_pgsql": "For PostgreSQL connections (INSERT ... RETURNING is used to refill generated keys)",
+        "ext-pdo_mysql": "For MySQL connections (generated keys are refilled via lastInsertId)"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

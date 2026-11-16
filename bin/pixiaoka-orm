@@ -1,0 +1,141 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Pixiaoka\Orm\ModelGenerator;
+
+$autoloads = [
+    __DIR__ . '/../vendor/autoload.php',
+    __DIR__ . '/../../../autoload.php',
+];
+foreach ($autoloads as $autoload) {
+    if (is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+if (!class_exists(ModelGenerator::class)) {
+    fwrite(STDERR, "pixiaoka-orm: 未找到 Composer autoload，请先运行 composer install。\n");
+    exit(1);
+}
+
+$usage = <<<TEXT
+Usage:
+  pixiaoka-orm generate --dsn=DSN --dir=DIR --namespace=NAMESPACE [--user=USER] [--password=PASSWORD] [--prefix=PREFIX] [--force] [tables...]
+
+Options:
+  --dsn         PDO DSN，支持 sqlite、mysql、pgsql（必填）
+  --user        数据库用户名；也可用 ORM_DB_USER
+  --password    数据库密码；也可用 ORM_DB_PASSWORD（优先级低于参数）
+  --dir         明确的模型输出目录（必填）
+  --namespace   模型 PHP 命名空间，例如 App\\Model（必填）
+  --prefix      仅从生成类名剥离的表名前缀
+  --force       覆盖已存在的模型文件
+  -h, --help    显示帮助
+
+Examples:
+  pixiaoka-orm generate --dsn='sqlite:/tmp/app.sqlite' --dir='/tmp/models' --namespace='App\\Model'
+  pixiaoka-orm generate --dsn='mysql:host=127.0.0.1;dbname=app' --user=app --dir='./models' --namespace='App\\Model' user user_item
+TEXT;
+
+/** @return array{options: array<string, string|bool>, tables: list<string>}|null */
+function parseGenerateArguments(array $arguments): ?array
+{
+    $options = [];
+    $tables = [];
+    $positional = false;
+    $count = count($arguments);
+    for ($index = 0; $index < $count; $index++) {
+        $argument = $arguments[$index];
+        if (!$positional && $argument === '--') {
+            $positional = true;
+            continue;
+        }
+        if (!$positional && in_array($argument, ['-h', '--help'], true)) {
+            return null;
+        }
+        if (!$positional && $argument === '--force') {
+            $options['force'] = true;
+            continue;
+        }
+        if (!$positional && str_starts_with($argument, '--')) {
+            $option = substr($argument, 2);
+            $equals = strpos($option, '=');
+            $name = $equals === false ? $option : substr($option, 0, $equals);
+            if (!in_array($name, ['dsn', 'user', 'password', 'dir', 'namespace', 'prefix'], true)) {
+                throw new InvalidArgumentException("未知选项: --$name");
+            }
+            if (array_key_exists($name, $options)) {
+                throw new InvalidArgumentException("选项重复: --$name");
+            }
+            if ($equals !== false) {
+                $options[$name] = substr($option, $equals + 1);
+            } else {
+                $value = $arguments[$index + 1] ?? null;
+                if ($value === null || str_starts_with($value, '--')) {
+                    throw new InvalidArgumentException("选项 --$name 缺少值");
+                }
+                $options[$name] = $value;
+                $index++;
+            }
+            continue;
+        }
+        $tables[] = $argument;
+    }
+
+    return ['options' => $options, 'tables' => $tables];
+}
+
+try {
+    $arguments = $_SERVER['argv'];
+    array_shift($arguments);
+    $command = array_shift($arguments);
+    if ($command === null || in_array($command, ['-h', '--help', 'help'], true)) {
+        fwrite(STDOUT, $usage . PHP_EOL);
+        exit($command === null ? 1 : 0);
+    }
+    if ($command !== 'generate') {
+        throw new InvalidArgumentException("未知命令: {$command}；仅支持 generate");
+    }
+    $parsed = parseGenerateArguments($arguments);
+    if ($parsed === null) {
+        fwrite(STDOUT, $usage . PHP_EOL);
+        exit(0);
+    }
+    $options = $parsed['options'];
+    foreach (['dsn', 'dir', 'namespace'] as $required) {
+        if (!isset($options[$required]) || $options[$required] === '') {
+            throw new InvalidArgumentException("缺少必填选项: --$required");
+        }
+    }
+
+    $user = $options['user'] ?? getenv('ORM_DB_USER');
+    $password = $options['password'] ?? getenv('ORM_DB_PASSWORD');
+    $pdo = new PDO(
+        (string) $options['dsn'],
+        $user === false ? null : (string) $user,
+        $password === false ? null : (string) $password,
+        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],
+    );
+    $result = (new ModelGenerator($pdo))->generate(
+        directory: (string) $options['dir'],
+        namespace: (string) $options['namespace'],
+        prefix: (string) ($options['prefix'] ?? ''),
+        force: (bool) ($options['force'] ?? false),
+        tables: $parsed['tables'],
+    );
+    foreach ($result['generated'] as $table => $file) {
+        fwrite(STDOUT, "Generated $table -> $file" . PHP_EOL);
+    }
+    foreach ($result['skipped'] as $table => $file) {
+        fwrite(STDOUT, "Skipped $table (exists, use --force): $file" . PHP_EOL);
+    }
+    fwrite(STDOUT, sprintf('Done: %d generated, %d skipped.', count($result['generated']), count($result['skipped'])) . PHP_EOL);
+    exit(0);
+} catch (Throwable $error) {
+    fwrite(STDERR, 'pixiaoka-orm: ' . $error->getMessage() . PHP_EOL);
+    fwrite(STDERR, "Run pixiaoka-orm --help for usage." . PHP_EOL);
+    exit(1);
+}
