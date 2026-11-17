@@ -43,9 +43,7 @@ final class MetadataReader
         $declaration = 0;
 
         foreach ($reflection->getProperties() as $property) {
-            /**
-             * @var \ReflectionAttribute<Column[]> $columnAttr
-             */
+            /** @var list<\ReflectionAttribute<Column>> $columnAttr */
             $columnAttr = $property->getAttributes(Column::class);
             if (empty($columnAttr)) {
                 continue;

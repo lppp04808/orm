@@ -52,6 +52,7 @@ final class RowCache
      * P2-4：key 已存在时先从 LRU 队列移除旧位置再追加，
      * 保证重复 set 不稀释淘汰顺序、不撑大 keys 数组。
      */
+    /** @param array<string, int|float|string|bool|null> $identity */
     public function set(Entity $entity, array $identity): void
     {
         $key = $this->makeKey($entity::class, $identity);

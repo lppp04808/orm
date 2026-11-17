@@ -1,0 +1,47 @@
+parameters:
+    level: 5
+    paths:
+        - src
+        - bin
+    treatPhpDocTypesAsCertain: false
+    reportUnmatchedIgnoredErrors: true
+    ignoreErrors:
+        # PDO 返回类型依赖运行时驱动，保留防御性检查。
+        -
+            identifier: identical.alwaysFalse
+            path: src/Gateway/PdoConnection.php
+        # 公共输入的运行时校验不应因 PHPDoc 中已声明约束而移除。
+        -
+            identifier: function.alreadyNarrowedType
+            path: src/Query/Builder.php
+        -
+            identifier: nullsafe.neverNull
+            path: src/Metadata/MetadataReader.php
+        -
+            identifier: nullCoalesce.property
+            path: src/Query/Builder.php
+        -
+            identifier: return.unusedType
+            path: src/Query/Builder.php
+        -
+            identifier: method.unused
+            path: src/Query/Builder.php
+        -
+            identifier: variable.undefined
+            path: src/Query/Builder.php
+        # 构造函数已校验驱动；保留 match 的穷举表达，不引入静默驱动回退。
+        -
+            identifier: match.unhandled
+            path: src/Schema/SchemaInspector.php
+        -
+            identifier: notIdentical.alwaysFalse
+            path: src/Gateway/EntityGateway.php
+        -
+            identifier: identical.alwaysFalse
+            path: src/Gateway/EntityGateway.php
+        -
+            identifier: booleanAnd.alwaysFalse
+            path: src/Gateway/EntityGateway.php
+        -
+            identifier: booleanNot.alwaysTrue
+            path: src/Query/Builder.php

@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: PHP ${{ matrix.php }} / SQLite / PHPStan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4', '8.5']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo, pdo_sqlite
+          coverage: none
+      - uses: ramsey/composer-install@v3
+      - run: composer validate --strict --no-check-lock
+      - run: composer analyse
+      - run: composer test
+      - run: |
+          git ls-files '*.php' | while IFS= read -r file; do php -l "$file" || exit 1; done
+
+  databases:
+    name: PHP 8.3 / MySQL 8.4 / PostgreSQL 16
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: local-only-password
+          MYSQL_DATABASE: orm_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -plocal-only-password"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: local-only-password
+          POSTGRES_DB: orm_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready -U postgres -d orm_test"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo, pdo_sqlite, pdo_mysql, pdo_pgsql
+          coverage: none
+      - uses: ramsey/composer-install@v3
+      - env:
+          PIXIAOKA_ORM_LIVE_MYSQL_DSN: mysql:host=127.0.0.1;port=3306;dbname=orm_test;charset=utf8mb4
+          PIXIAOKA_ORM_LIVE_MYSQL_USER: root
+          PIXIAOKA_ORM_LIVE_MYSQL_PASSWORD: local-only-password
+          PIXIAOKA_ORM_LIVE_PGSQL_DSN: pgsql:host=127.0.0.1;port=5432;dbname=orm_test
+          PIXIAOKA_ORM_LIVE_PGSQL_USER: postgres
+          PIXIAOKA_ORM_LIVE_PGSQL_PASSWORD: local-only-password
+          DB_MYSQL_HOST: 127.0.0.1
+          DB_MYSQL_PORT: 3306
+          DB_MYSQL_NAME: orm_test
+          DB_MYSQL_USER: root
+          DB_MYSQL_PASSWORD: local-only-password
+          DB_PGSQL_HOST: 127.0.0.1
+          DB_PGSQL_PORT: 5432
+          DB_PGSQL_NAME: orm_test
+          DB_PGSQL_USER: postgres
+          DB_PGSQL_PASSWORD: local-only-password
+        run: composer test
+      - env:
+          DB_MYSQL_HOST: 127.0.0.1
+          DB_MYSQL_PORT: 3306
+          DB_MYSQL_NAME: orm_test
+          DB_MYSQL_USER: root
+          DB_MYSQL_PASSWORD: local-only-password
+          DB_PGSQL_HOST: 127.0.0.1
+          DB_PGSQL_PORT: 5432
+          DB_PGSQL_NAME: orm_test
+          DB_PGSQL_USER: postgres
+          DB_PGSQL_PASSWORD: local-only-password
+        run: php tests/orm_live_verify.php

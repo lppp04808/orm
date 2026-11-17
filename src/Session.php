@@ -4,139 +4,195 @@ declare(strict_types=1);
 
 namespace Pixiaoka\Orm;
 
+use Pixiaoka\Orm\Gateway\Connection;
 use Pixiaoka\Orm\Gateway\EntityGateway;
+use LogicException;
 use WeakMap;
 
 /**
  * Active Record 的数据库入口。
- * 多进程模式和协程模式通过 context() 取得当前 Session。
+ *
+ * 核心库不绑定框架、不拥有 PDO，也不强制连接池。应用或适配器负责连接生命周期，
+ * Session 只负责当前执行上下文内的连接所有权。
  */
 final class Session
 {
-    /** P1-1：Fiber => Session。Fiber 回收后条目自动释放，不再泄漏。 */
-    private static ?WeakMap $fiberSessions = null;
+    /** @var WeakMap<Context, self>|null */
+    private static ?WeakMap $contextSessions = null;
 
-    /** 非协程兜底（同步 / 多进程 worker 模式下共享的根 Session）。 */
+    /** @var WeakMap<Connection, Context>|null 一个连接同时只能被一个事务上下文持有。 */
+    private static ?WeakMap $connectionContexts = null;
+
     private static ?self $mainSession = null;
 
-    /** @var array<int, self> Swoole/Swow 协程 id => Session */
-    private static array $coroutineSessions = [];
+    private static bool $strict = false;
 
     public function __construct(
         public readonly EntityGateway $gateway,
     ) {
     }
 
-    /**
-     * 登记当前请求的网关。多进程里在 onWorkerStart / onMessage 调用；
-     * 协程里每个上下文调一次。
-     */
+    /** 为当前上下文登记独立连接对应的网关。 */
     public static function use(EntityGateway $gateway): self
     {
-        // Swoole/Swow 协程：协程 id 做键存数组（协程退出时由 discard 或下次复用覆盖）
-        if (self::inCoroutine()) {
-            $self = new self($gateway);
-            self::$coroutineSessions[self::coroutineKey()] = $self;
+        $session = new self($gateway);
+        self::install($session);
 
-            return $self;
-        }
-
-        // Fiber：WeakMap 键随 Fiber 回收自动释放，不泄漏
-        $fiber = \Fiber::getCurrent();
-        if ($fiber !== null) {
-            self::$fiberSessions ??= new WeakMap();
-            $self = new self($gateway);
-            self::$fiberSessions[$fiber] = $self;
-
-            return $self;
-        }
-
-        // 非协程兜底
-        return self::$mainSession = new self($gateway);
-    }
-
-    /** 取当前请求的 Session。协程安全：按上下文隔离。 */
-    public static function get(): self
-    {
-        if (self::inCoroutine()) {
-            return self::$coroutineSessions[self::coroutineKey()]
-                ?? throw new \LogicException('还没有 Pixiaoka\Orm\Session::use()');
-        }
-
-        $fiber = \Fiber::getCurrent();
-        if ($fiber !== null && self::$fiberSessions !== null) {
-            $session = self::$fiberSessions[$fiber] ?? null;
-            if ($session !== null) {
-                return $session;
-            }
-        }
-
-        return self::$mainSession ?? throw new \LogicException('还没有 Pixiaoka\Orm\Session::use()');
-    }
-
-    /** 逃离协程时清理上下文。 */
-    public static function discard(): void
-    {
-        if (self::inCoroutine()) {
-            unset(self::$coroutineSessions[self::coroutineKey()]);
-
-            return;
-        }
-
-        $fiber = \Fiber::getCurrent();
-        if ($fiber !== null && self::$fiberSessions !== null) {
-            unset(self::$fiberSessions[$fiber]);
-
-            return;
-        }
-
-        self::$mainSession = null;
+        return $session;
     }
 
     /**
-     * P0-4：暴露给 EntityGateway 做事务状态隔离的上下文 id。
-     * Swoole/Swow 协程返回协程 id；Fiber 用 spl_object_id；非协程返回 0。
+     * 在当前上下文开启可自动恢复的作用域。
+     *
+     * @template T
+     * @param (callable(): T)|null $operation 省略时返回手动关闭的作用域
+     * @return ($operation is null ? SessionScope : T)
      */
-    public static function contextId(): int
+    public static function scope(EntityGateway $gateway, ?callable $operation = null): mixed
     {
-        return self::contextKey();
-    }
+        $context = self::currentContext();
+        $previous = self::lookup($context);
+        $scope = new SessionScope($context, static function () use ($previous): void {
+            try {
+                self::discard();
+            } finally {
+                if ($previous !== null) {
+                    self::install($previous);
+                }
+            }
+        });
+        self::use($gateway);
 
-    private static function inCoroutine(): bool
-    {
-        if (class_exists('Swoole\Coroutine') && \Swoole\Coroutine::getCid() > 0) {
-            return true;
+        if ($operation === null) {
+            return $scope;
         }
 
-        return class_exists('Swow\Coroutine') && \Swow\Coroutine::getCurrent() !== null;
+        try {
+            return $operation();
+        } finally {
+            $scope->close();
+        }
     }
 
-    private static function coroutineKey(): int
+    /**
+     * 严格模式下 Fiber/协程不得隐式使用根 Session。
+     * 默认关闭以保持旧应用兼容；常驻进程和并发应用建议开启。
+     */
+    public static function strict(bool $enabled = true): void
+    {
+        self::$strict = $enabled;
+    }
+
+    public static function isStrict(): bool
+    {
+        return self::$strict;
+    }
+
+    public static function get(): self
+    {
+        $context = self::currentContext();
+        $session = self::lookup($context);
+        if ($session !== null) {
+            return $session;
+        }
+
+        if (self::$strict && (\Fiber::getCurrent() !== null || self::runtimeCoroutine() !== null)) {
+            throw new LogicException('当前 Fiber/协程还没有 Pixiaoka\Orm\Session::use()；严格模式禁止回退根连接');
+        }
+
+        return self::$mainSession ?? throw new LogicException('还没有 Pixiaoka\Orm\Session::use()');
+    }
+
+    /**
+     * 清理当前上下文。存在未结束事务时先回滚，防止把事务中的连接归还应用或连接池。
+     * 即使连接已断开，也继续解除 Session 与网关事务状态，并保留原始异常。
+     */
+    public static function discard(): void
+    {
+        $context = self::currentContext();
+        $session = self::lookup($context);
+        try {
+            $session?->gateway->releaseContext($context);
+        } finally {
+            if (self::$contextSessions !== null) {
+                unset(self::$contextSessions[$context]);
+            }
+            if ($context === Context::root()) {
+                self::$mainSession = null;
+            }
+        }
+    }
+
+    /** @internal 网关事务状态按对象身份隔离，不使用可复用的 Fiber/协程数字 ID。 */
+    public static function context(): Context
+    {
+        return self::currentContext();
+    }
+
+    /** @internal SessionScope 跨上下文关闭保护。 */
+    public static function currentContext(): Context
+    {
+        $runtime = self::runtimeCoroutine();
+        if ($runtime !== null) {
+            return Context::coroutine($runtime);
+        }
+        $fiber = \Fiber::getCurrent();
+
+        return $fiber === null ? Context::root() : Context::fiber($fiber);
+    }
+
+    /** @internal 同一网关被用于另一个并发事务时立即拒绝，不混淆连接事务所有权。 */
+    public static function claimConnection(EntityGateway $gateway, Context $context): void
+    {
+        self::$connectionContexts ??= new WeakMap();
+        $connection = $gateway->connection();
+        $owner = self::$connectionContexts[$connection] ?? null;
+        if ($owner !== null && $owner !== $context) {
+            throw new LogicException('同一连接已被另一个 Fiber/协程事务持有，请为并发事务提供独立连接');
+        }
+        self::$connectionContexts[$connection] = $context;
+    }
+
+    /** @internal */
+    public static function releaseConnection(EntityGateway $gateway, Context $context): void
+    {
+        if (self::$connectionContexts === null) {
+            return;
+        }
+        $connection = $gateway->connection();
+        if ((self::$connectionContexts[$connection] ?? null) === $context) {
+            unset(self::$connectionContexts[$connection]);
+        }
+    }
+
+    private static function install(self $session): void
+    {
+        $context = self::currentContext();
+        self::$contextSessions ??= new WeakMap();
+        self::$contextSessions[$context] = $session;
+        if ($context === Context::root()) {
+            self::$mainSession = $session;
+        }
+    }
+
+    private static function lookup(Context $context): ?self
+    {
+        return self::$contextSessions === null ? null : (self::$contextSessions[$context] ?? null);
+    }
+
+    /** Swoole 使用其 Context 对象，Swow 使用 Coroutine 对象作为弱引用身份。 */
+    private static function runtimeCoroutine(): ?object
     {
         if (class_exists('Swoole\Coroutine') && \Swoole\Coroutine::getCid() > 0) {
-            return \Swoole\Coroutine::getCid();
+            $context = \Swoole\Coroutine::getContext();
+            if (is_object($context)) {
+                return $context;
+            }
         }
         if (class_exists('Swow\Coroutine') && \Swow\Coroutine::getCurrent() !== null) {
-            return \Swow\Coroutine::getCurrent()->getId();
+            return \Swow\Coroutine::getCurrent();
         }
 
-        return 0;
-    }
-
-    private static function contextKey(): int
-    {
-        // 协程模式：Swoole/Swow 返回协程 id
-        if (class_exists('Swoole\Coroutine') && \Swoole\Coroutine::getCid() > 0) {
-            return \Swoole\Coroutine::getCid();
-        }
-        if (class_exists('Swow\Coroutine') && \Swow\Coroutine::getCurrent() !== null) {
-            return \Swow\Coroutine::getCurrent()->getId();
-        }
-        // webman + revolt: Fiber 模式下用 spl_object_id
-        if (class_exists('Fiber') && \Fiber::getCurrent() !== null) {
-            return spl_object_id(\Fiber::getCurrent());
-        }
-
-        return 0;
+        return null;
     }
 }

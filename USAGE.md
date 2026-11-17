@@ -4,7 +4,7 @@
 
 ## 1. 初始化
 
-在每个请求（或协程）开头登记 Session。多进程/协程安全——内部按上下文 ID 隔离。**每个 Fiber 也必须显式登记**；未登记的 Fiber 会回退到根 Session，可能共享 PDO，不能直接用于并发事务。
+ORM 不依赖 webman，也不拥有 PDO 或强制连接池。普通 PHP-FPM 可在请求开始时登记 Session，并在 `finally` 中调用 `Session::discard()`。常驻进程和并发 Fiber/协程建议使用严格模式与作用域：
 
 ```php
 use Pixiaoka\Orm\Gateway\EntityGateway;
@@ -14,14 +14,23 @@ use Pixiaoka\Orm\Session;
 $pdo = new \PDO('mysql:host=...;dbname=...', 'user', 'pass');
 $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
 
-Session::use(new EntityGateway(
-    connection: new PdoConnection($pdo),
-));
+Session::use(new EntityGateway(new PdoConnection($pdo)));
+try {
+    // 业务操作
+} finally {
+    Session::discard();
+}
+
+// 每个 Fiber/协程使用自己的连接；连接可由应用或可选连接池提供。
+Session::strict();
+Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
+    // 正常返回、异常均自动恢复此前的 Session。
+});
 ```
 
-**在 webman 中**：可以在中间件或 `onWorkerStart` 里创建 PDO 连接并登记，利用 webman 的常驻进程特性复用连接。
+作用域不关闭 PDO，应用负责创建、重连、健康检查及归还。`Session::discard()` 会回滚当前上下文遗留的外层事务并解除绑定；`Session::scope()` 关闭时先执行同样的清理，再恢复此前的 Session，即使回滚失败也会恢复绑定并透传异常。事务回调内清理 Session 后不能继续提交。同一个 `EntityGateway` 被多个 Fiber/协程同时用于事务会被提前拒绝。
 
-请求结束时（如中间件 `__destruct`）调用 `Session::discard()` 清理。协程环境下离开协程也会自动隔离。
+**webman 只是可选适配方式**，可在应用中间件中为每个请求调用上述作用域；不要把根 PDO 隐式共享给所有 Fiber。嵌套上下文必须显式选择连接。Session 与事务状态按 Fiber/运行时协程对象弱引用隔离，不依赖可复用的数字 ID。Swoole/Swow 仍应在真实扩展环境验证，不能仅以 Fiber 测试替代。
 
 ## 2. 定义模型
 

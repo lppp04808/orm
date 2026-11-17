@@ -1,0 +1,49 @@
+name: Release package
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo, pdo_sqlite
+          coverage: none
+      - run: composer validate --strict --no-check-lock
+      - run: composer install --no-interaction --prefer-dist
+      - run: composer test
+      - run: composer archive --format=zip --dir=build
+      - shell: bash
+        run: |
+          mkdir package-smoke
+          cd package-smoke
+          composer init --name=pixiaoka/package-smoke --no-interaction
+          composer config repositories.packagist.org composer https://repo.packagist.org
+          VERSION="${GITHUB_REF_NAME#v}"
+          available=false
+          for attempt in {1..12}; do
+            if composer show pixiaoka/orm "$VERSION" --all --no-interaction >/dev/null 2>&1; then
+              available=true
+              break
+            fi
+            if [ "$attempt" -lt 12 ]; then
+              echo "Packagist has not published $VERSION yet (attempt $attempt/12); retrying in 10 seconds."
+              sleep 10
+            fi
+          done
+          if [ "$available" != true ]; then
+            echo "::error::Packagist did not publish pixiaoka/orm $VERSION within the retry window."
+            exit 1
+          fi
+          composer require pixiaoka/orm:"$VERSION" --no-interaction --prefer-dist
+          # shellcheck disable=SC2016 # 单引号内为 PHP 代码，不需要 shell 展开。
+          php -r 'require "vendor/autoload.php"; foreach ([Pixiaoka\Orm\Entity::class, Pixiaoka\Orm\ModelGenerator::class, Pixiaoka\Orm\SessionScope::class] as $class) { if (!class_exists($class)) { throw new RuntimeException($class); } } echo "Package autoload OK\n";'
+          php vendor/bin/pixiaoka-orm --help

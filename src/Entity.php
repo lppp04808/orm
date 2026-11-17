@@ -108,6 +108,7 @@ abstract class Entity
      */
     public static function find(array $key): ?static
     {
+        /** @var static|null */
         return Session::get()->gateway->find(static::class, $key);
     }
 

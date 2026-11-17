@@ -3,6 +3,9 @@
 /phpunit.result.cache
 /.phpunit.result.cache
 /.phpunit.cache/
+/.qa-tools/
+/build/
+/.phpstan.cache/
 .php-cs-fixer.cache
 .idea/
 .vscode/

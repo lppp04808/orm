@@ -309,15 +309,17 @@ final class OrmSqlBehaviorTest extends TestCase
             });
         });
 
-        // A 开事务后挂起；B 在共享的单 PDO 连接上再开事务被拒绝——
-        // 锁定该已知边界：单连接网关不支持跨 Fiber 并发事务，需要连接池才能并发
+        // A 开事务后挂起；B 复用同一网关时由 ORM 提前拒绝，不依赖 PDO 驱动错误。
         $fiberA->start();
         try {
             $fiberB->start();
             $this->fail('共享单连接下并发事务应被拒绝');
-        } catch (\PDOException $e) {
-            self::assertStringContainsString('already an active transaction', $e->getMessage());
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('独立连接', $e->getMessage());
         }
+        Session::discard();
+        $fiberA->resume();
+        self::assertTrue($fiberA->isTerminated());
     }
 
     public function testFiberSessionIsolationWithoutDbTxn(): void

@@ -25,10 +25,22 @@ $pdo = new PDO('pgsql:host=...;port=5432;dbname=...', 'user', 'pass', [
     PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
 ]);
 
-// 每个请求（或协程）开头登记一次
+// 普通 PHP-FPM：请求开始登记，请求结束清理。
 Session::use(new EntityGateway(
     connection: new PdoConnection($pdo),
 ));
+try {
+    // 业务操作
+} finally {
+    Session::discard();
+}
+
+// 常驻进程、Fiber/协程：显式作用域，异常时也自动恢复或清理。
+Session::strict();
+$result = Session::scope(new EntityGateway(new PdoConnection($pdo)), function () {
+    // 当前上下文独占此连接；连接可由应用或可选连接池提供。
+    return 'done';
+});
 ```
 
 ### Define a model
@@ -296,21 +308,26 @@ final class BcNumber implements Pixiaoka\Orm\Cast\Decimal
 
 ## Coroutine safety
 
-`Session` 按 Swoole / Swow 协程 id 或 `WeakMap<Fiber, Session>` 隔离；
-`EntityGateway` 的事务状态按 `Session::contextId()` 隔离，多 Fiber 各自独立事务。
-每个 Fiber/请求必须显式调用 `Session::use()`；未登记的 Fiber 会回退到根 Session，可能共享同一 PDO。单一 PDO 连接不支持跨 Fiber **并发**事务（第二个 `beginTransaction` 会失败），需要并发事务时请提供每上下文独立连接（连接池）。
+`Session` 使用 `WeakMap` 关联 Fiber 或运行时协程对象，不依赖可能被复用的数字 ID；事务上下文同样按对象身份隔离。`Session::strict()` 禁止未登记的 Fiber/协程隐式回退到根 Session，默认关闭以保持向后兼容。`Session::scope()` 在正常返回或异常时恢复先前 Session；也可省略回调并手动调用返回对象的 `close()`。
+
+`Session::discard()` 会回滚当前网关在该上下文遗留的外层事务，然后解除上下文绑定；`Session::scope()` 关闭时先执行同样的清理，再恢复此前的 Session，即使回滚失败也会恢复绑定并透传异常。事务回调内清理 Session 后不得继续提交。同一个 `EntityGateway` 被两个 Fiber/协程同时用于事务会提前抛出 `LogicException`，避免把共享 PDO 误认为独立连接。
+
+**核心库不绑定 webman、不创建或关闭 PDO，也不强制连接池。** PHP-FPM 每请求单连接无需池化；常驻进程和并发 Fiber/协程由应用或可选适配器负责租借、健康检查、重连及归还连接。嵌套 Fiber/协程必须明确调用 `Session::use()` 或 `Session::scope()` 选择自己的连接，不隐式继承父上下文事务。`SessionScope` 不允许跨上下文关闭。
+
+SQLite 不允许多个未提交写事务并行；独立 PDO 的 Fiber 测试验证生命周期，不代表 SQLite 支持多个同时写事务。Swoole/Swow 的运行时对象适配仍需相应扩展环境验收，Fiber 测试不替代这些运行时的真实并发验证。
 
 ## Testing
 
 ```bash
 composer install
-vendor/bin/phpunit          # 191 tests / 669 assertions；2 项外部 DSN 测试默认跳过
+composer analyse            # PHPStan 生产代码静态分析
+composer test               # 211 tests / 730 assertions；2 项外部 DSN 测试默认跳过
 
 # 实连脚本：进程环境变量覆盖 .env；两个真实库均不可达时自动 SQLite 兜底
 php -d extension=pdo_sqlite -d extension=pdo_pgsql -d extension=pdo_mysql tests/orm_live_verify.php
 ```
 
-本次验收结果：默认 SQLite 套件 191 tests / 669 assertions（含生成器和真实 CLI smoke，2 项显式 DSN 测试跳过）；配置专用 MySQL 8.4、PostgreSQL 16（alpine）后完整套件 191 tests / 717 assertions，零跳过。此前复杂查询内核独立实连验收：SQLite 55 项、MySQL 54 项、PostgreSQL 57 项，均通过。
+本次验收结果：默认 SQLite 套件 211 tests / 730 assertions（含生成器、生命周期与真实 CLI smoke，2 项显式 DSN 测试跳过）；配置专用 MySQL 8.4、PostgreSQL 16（alpine）后完整套件 211 tests / 778 assertions，零跳过；独立实连脚本 MySQL 54 项、PostgreSQL 57 项，均通过。PHPStan 生产代码分析零告警；CI 配置 PHP 8.3/8.4/8.5 与双库服务测试。
 
 ### Docker 复验
 

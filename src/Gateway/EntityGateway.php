@@ -7,6 +7,7 @@ namespace Pixiaoka\Orm\Gateway;
 use BackedEnum;
 use DateTimeImmutable;
 use Pixiaoka\Orm\Cache\RowCache;
+use Pixiaoka\Orm\Context;
 use Pixiaoka\Orm\Cast\Caster;
 use Pixiaoka\Orm\Cast\Decimal;
 use Pixiaoka\Orm\Entity;
@@ -23,11 +24,11 @@ final class EntityGateway
 {
     private readonly RowCache $cache;
 
-    /** P0-4：事务状态按上下文（协程/Fiber）隔离，互不串扰。 */
-    private array $inTransactionByContext = [];
+    /** @var \WeakMap<Context, bool> 对象身份避免 Fiber 销毁后的数字 ID 重用。 */
+    private \WeakMap $inTransactionByContext;
 
-    /** P1-3：事务期间 cacheSet 写入的 key，按上下文记录，回滚时只清这些。 */
-    private array $txnCacheKeysByContext = [];
+    /** @var \WeakMap<Context, list<string>> 回滚只清当前上下文事务内写入的 key。 */
+    private \WeakMap $txnCacheKeysByContext;
 
     public function __construct(
         private readonly Connection $connection,
@@ -35,6 +36,8 @@ final class EntityGateway
         private readonly Caster $caster = new Caster(),
     ) {
         $this->cache = new RowCache();
+        $this->inTransactionByContext = new \WeakMap();
+        $this->txnCacheKeysByContext = new \WeakMap();
     }
 
     public function connection(): Connection { return $this->connection; }
@@ -862,7 +865,7 @@ final class EntityGateway
                 $createdAt,
             ));
             $updateColumns = array_values(array_diff($updateColumns, $createdAt));
-            if ($updateColumns !== null && $updateColumns !== []) {
+            if ($updateColumns !== []) {
                 $updateColumns = array_map(
                     static fn (string $column): string => $resolve($column)->column,
                     $updateColumns,
@@ -931,42 +934,74 @@ final class EntityGateway
 
     public function transaction(callable $func): mixed
     {
-        // P0-4：事务状态按上下文（协程/Fiber）隔离，互不串扰
-        $ctx = Session::contextId();
+        $ctx = Session::context();
         $outer = $this->inTransactionByContext[$ctx] ?? false;
         $this->inTransactionByContext[$ctx] = true;
         if (!$outer) {
-            // P1-3：只在最外层开始收集本事务写进缓存的 key
             $this->txnCacheKeysByContext[$ctx] = [];
         }
 
         $begun = false;
         try {
             if (!$outer) {
-                $this->connection->beginTransaction();
-                $begun = true;
+                try {
+                    Session::claimConnection($this, $ctx);
+                    $this->connection->beginTransaction();
+                    $begun = true;
+                } catch (\Throwable $e) {
+                    Session::releaseConnection($this, $ctx);
+                    throw $e;
+                }
             }
 
             $result = $func();
+            if (Session::currentContext() !== $ctx) {
+                throw new \LogicException('事务回调不能切换 Fiber/协程上下文后提交');
+            }
+            if (!$outer && !isset($this->inTransactionByContext[$ctx])) {
+                throw new \LogicException('事务期间 Session 已被清理，操作已回滚，不能继续提交');
+            }
             if (!$outer) {
                 $this->connection->commit();
             }
 
             return $result;
         } catch (\Throwable $e) {
-            // $begun 为 false 时（beginTransaction 本身失败）不能回滚别人的事务
-            if ($begun) {
-                $this->connection->rollback();
-                // P1-3：只清事务期间写入缓存的 key，不再 flush 全部
-                foreach ($this->txnCacheKeysByContext[$ctx] ?? [] as $key) {
-                    $this->cache->clearKey($key);
+            if ($begun && isset($this->inTransactionByContext[$ctx])) {
+                try {
+                    $this->connection->rollback();
+                } finally {
+                    $this->clearTransactionCache($ctx);
                 }
             }
             throw $e;
         } finally {
             if (!$outer) {
+                Session::releaseConnection($this, $ctx);
                 unset($this->inTransactionByContext[$ctx], $this->txnCacheKeysByContext[$ctx]);
             }
+        }
+    }
+
+    /** @internal 由 Session::discard() 调用，回滚并解除当前上下文的事务所有权。 */
+    public function releaseContext(Context $context): void
+    {
+        $active = $this->inTransactionByContext[$context] ?? false;
+        try {
+            if ($active) {
+                $this->connection->rollback();
+            }
+        } finally {
+            $this->clearTransactionCache($context);
+            Session::releaseConnection($this, $context);
+            unset($this->inTransactionByContext[$context], $this->txnCacheKeysByContext[$context]);
+        }
+    }
+
+    private function clearTransactionCache(Context $context): void
+    {
+        foreach ($this->txnCacheKeysByContext[$context] ?? [] as $key) {
+            $this->cache->clearKey($key);
         }
     }
 
@@ -1158,7 +1193,7 @@ final class EntityGateway
         $this->cache->set($entity, $parts);
 
         // P1-3：事务期间写入的 key 记下来，回滚时精确清除
-        $ctx = Session::contextId();
+        $ctx = Session::context();
         if ($this->inTransactionByContext[$ctx] ?? false) {
             $this->txnCacheKeysByContext[$ctx][] = $key;
         }

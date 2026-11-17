@@ -1,0 +1,429 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Pixiaoka\Orm;
+
+use PDO;
+use PHPUnit\Framework\TestCase;
+use Pixiaoka\Orm\Annotation\Column;
+use Pixiaoka\Orm\Annotation\PrimaryKey;
+use Pixiaoka\Orm\Entity;
+use Pixiaoka\Orm\Gateway\Connection;
+use Pixiaoka\Orm\Gateway\EntityGateway;
+use Pixiaoka\Orm\Gateway\PdoConnection;
+use Pixiaoka\Orm\Session;
+use Pixiaoka\Orm\SessionScope;
+
+final class SessionLifecycleTest extends TestCase
+{
+    private EntityGateway $rootGateway;
+
+    protected function setUp(): void
+    {
+        Session::discard();
+        Session::strict(false);
+        $this->rootGateway = self::gateway(':memory:');
+    }
+
+    protected function tearDown(): void
+    {
+        Session::strict(false);
+        Session::discard();
+    }
+
+    public function testStrictFiberMustOwnSessionInsteadOfUsingRoot(): void
+    {
+        Session::use($this->rootGateway);
+        Session::strict();
+        $fiber = new \Fiber(static fn (): string => Session::get()->gateway::class);
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('严格模式禁止回退根连接');
+        $fiber->start();
+    }
+
+    public function testStrictModePreservesExplicitFiberAndRootUsage(): void
+    {
+        Session::use($this->rootGateway);
+        Session::strict();
+        $fiber = new \Fiber(function (): void {
+            $gateway = self::gateway(':memory:');
+            Session::use($gateway);
+            self::assertSame($gateway, Session::get()->gateway);
+        });
+        $fiber->start();
+        self::assertTrue($fiber->isTerminated());
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+    }
+
+    public function testScopeRestoresPreviousSessionAndReturnsCallbackValue(): void
+    {
+        Session::use($this->rootGateway);
+        $gateway = self::gateway(':memory:');
+        $result = Session::scope($gateway, static function () use ($gateway): string {
+            self::assertSame($gateway, Session::get()->gateway);
+
+            return 'result';
+        });
+        self::assertSame('result', $result);
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+    }
+
+    public function testNestedScopeRestoresCorrectSessionAfterException(): void
+    {
+        Session::use($this->rootGateway);
+        $first = self::gateway(':memory:');
+        $second = self::gateway(':memory:');
+        try {
+            Session::scope($first, function () use ($first, $second): void {
+                Session::scope($second, static function () use ($second): void {
+                    self::assertSame($second, Session::get()->gateway);
+                    throw new \RuntimeException('scope failure');
+                });
+            });
+            self::fail('应透传业务异常');
+        } catch (\RuntimeException $e) {
+            self::assertSame('scope failure', $e->getMessage());
+        }
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+
+        Session::scope($first, static function () use ($first, $second): void {
+            Session::scope($second, static fn (): null => null);
+            self::assertSame($first, Session::get()->gateway);
+        });
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+    }
+
+    public function testManualScopeDestructorAndIdempotentClose(): void
+    {
+        $scope = Session::scope($this->rootGateway);
+        self::assertInstanceOf(SessionScope::class, $scope);
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+        $scope->close();
+        $scope->close();
+        $this->expectException(\LogicException::class);
+        Session::get();
+    }
+
+    public function testManualScopeDestructorRestoresPreviousSession(): void
+    {
+        Session::use($this->rootGateway);
+        $scope = Session::scope(self::gateway(':memory:'));
+        unset($scope);
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+    }
+
+    public function testScopeCannotCloseInAnotherFiber(): void
+    {
+        $scope = Session::scope($this->rootGateway);
+        $fiber = new \Fiber(static fn () => $scope->close());
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('创建它的 Fiber');
+        $fiber->start();
+    }
+
+    public function testDiscardRollsBackUnfinishedOuterTransaction(): void
+    {
+        $path = self::databasePath();
+        $gateway = self::gateway($path);
+        $connection = new RecordingLifecycleConnection($gateway->connection());
+        $recordingGateway = new EntityGateway($connection);
+        Session::use($recordingGateway);
+        try {
+            LifecycleRecord::transaction(static function (): void {
+                $row = new LifecycleRecord();
+                $row->id = 1;
+                $row->name = 'rollback';
+                $row->save();
+                Session::discard();
+            });
+            self::fail('清理事务 Session 后必须拒绝提交');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('不能继续提交', $e->getMessage());
+        }
+        self::assertSame(1, $connection->rollbacks);
+        self::assertSame([], self::databaseRows($path));
+        @unlink($path);
+        @unlink($path . '-wal');
+        @unlink($path . '-shm');
+    }
+
+    public function testDiscardRollsBackTransactionAfterCallbackThrowsDuringFiberExit(): void
+    {
+        $path = self::databasePath();
+        $gateway = self::gateway($path);
+        $fiber = new \Fiber(static function () use ($gateway): void {
+            Session::use($gateway);
+            LifecycleRecord::transaction(static function (): void {
+                $row = new LifecycleRecord();
+                $row->id = 2;
+                $row->name = 'unfinished';
+                $row->save();
+                \Fiber::suspend();
+            });
+        });
+        $fiber->start();
+        unset($fiber);
+        gc_collect_cycles();
+
+        self::assertSame([], self::databaseRows($path));
+        @unlink($path);
+        @unlink($path . '-wal');
+        @unlink($path . '-shm');
+    }
+
+    public function testScopeCloseRollsBackTransactionAndRestoresPreviousSession(): void
+    {
+        $path = self::databasePath();
+        $gateway = self::gateway($path);
+        $connection = new RecordingLifecycleConnection($gateway->connection());
+        Session::use($this->rootGateway);
+        $scope = Session::scope(new EntityGateway($connection));
+        try {
+            LifecycleRecord::transaction(static function () use ($scope): void {
+                LifecycleRecord::executeRaw('INSERT INTO lifecycle_record (id, name) VALUES (:id, :name)', ['id' => 3, 'name' => 'scope-rollback']);
+                $scope->close();
+            });
+            self::fail('作用域清理事务后必须拒绝提交');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('不能继续提交', $e->getMessage());
+        }
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+        self::assertSame(1, $connection->rollbacks);
+        self::assertSame([], self::databaseRows($path));
+        @unlink($path);
+        @unlink($path . '-wal');
+        @unlink($path . '-shm');
+    }
+
+    public function testScopeRestoresPreviousSessionWhenRollbackFails(): void
+    {
+        $gateway = self::gateway(':memory:');
+        $connection = new RecordingLifecycleConnection($gateway->connection());
+        $connection->failRollback = true;
+        Session::use($this->rootGateway);
+        $scope = Session::scope(new EntityGateway($connection));
+        try {
+            LifecycleRecord::transaction(static function () use ($scope): void {
+                $scope->close();
+            });
+            self::fail('必须透传连接回滚异常');
+        } catch (\RuntimeException $e) {
+            self::assertSame('rollback failure', $e->getMessage());
+        }
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+        self::assertSame(1, $connection->rollbacks);
+    }
+
+    public function testDifferentFibersCommitIndependentConnectionsWhileSuspended(): void
+    {
+        $makeFiber = static function (array &$states): \Fiber {
+            return new \Fiber(static function () use (&$states): void {
+                $connection = new IndependentLifecycleConnection();
+                Session::use(new EntityGateway($connection));
+                Session::strict();
+                $connection->onSuspend = static function (): void {
+                    \Fiber::suspend();
+                };
+                LifecycleRecord::transaction(static function (): void {});
+                $states[] = $connection->operations;
+            });
+        };
+        $states = [];
+        $first = $makeFiber($states);
+        $second = $makeFiber($states);
+        $first->start();
+        $second->start();
+        $first->resume();
+        $second->resume();
+
+        self::assertTrue($first->isTerminated());
+        self::assertTrue($second->isTerminated());
+        self::assertSame([
+            ['begin', 'commit'],
+            ['begin', 'commit'],
+        ], $states);
+    }
+
+    public function testDistinctPdoConnectionsCommitInterleavedFiberTransactions(): void
+    {
+        $path = self::databasePath();
+        $first = new \Fiber(static function () use ($path): void {
+            Session::use(self::gateway($path));
+            LifecycleRecord::transaction(static function (): void {
+                LifecycleRecord::executeRaw('INSERT INTO lifecycle_record (id, name) VALUES (:id, :name)', ['id' => 10, 'name' => 'fiber-10']);
+                \Fiber::suspend();
+            });
+        });
+        $first->start();
+        self::assertFalse($first->isTerminated());
+        self::assertSame([], self::databaseRows($path));
+        $first->resume();
+
+        $second = new \Fiber(static function () use ($path): void {
+            Session::use(self::gateway($path));
+            LifecycleRecord::transaction(static function (): void {
+                LifecycleRecord::executeRaw('INSERT INTO lifecycle_record (id, name) VALUES (:id, :name)', ['id' => 11, 'name' => 'fiber-11']);
+                \Fiber::suspend();
+            });
+        });
+        $second->start();
+        self::assertFalse($second->isTerminated());
+        self::assertSame([['id' => 10, 'name' => 'fiber-10']], self::databaseRows($path));
+        $second->resume();
+
+        self::assertTrue($first->isTerminated());
+        self::assertTrue($second->isTerminated());
+        self::assertSame([
+            ['id' => 10, 'name' => 'fiber-10'],
+            ['id' => 11, 'name' => 'fiber-11'],
+        ], self::databaseRows($path));
+        @unlink($path);
+        @unlink($path . '-wal');
+        @unlink($path . '-shm');
+    }
+
+    public function testDestroyedFiberDoesNotReuseTransactionContext(): void
+    {
+        $fiber = new \Fiber(function (): int {
+            Session::use($this->rootGateway);
+            $id = spl_object_id(\Fiber::getCurrent());
+            LifecycleRecord::transaction(static fn (): null => null);
+
+            return $id;
+        });
+        $fiber->start();
+        $oldId = $fiber->getReturn();
+        unset($fiber);
+        gc_collect_cycles();
+
+        $replacement = new \Fiber(function (): int {
+            Session::use($this->rootGateway);
+            $id = spl_object_id(\Fiber::getCurrent());
+            LifecycleRecord::transaction(static fn (): null => null);
+
+            return $id;
+        });
+        $replacement->start();
+        self::assertTrue($replacement->isTerminated());
+        self::assertSame($oldId, $replacement->getReturn(), 'PHP 应复用已销毁 Fiber 的数字 ID，以覆盖对象身份防护');
+    }
+
+    public function testLegacyFiberRootFallbackRemainsOptInCompatible(): void
+    {
+        Session::use($this->rootGateway);
+        $fiber = new \Fiber(static fn (): EntityGateway => Session::get()->gateway);
+        $fiber->start();
+        self::assertSame($this->rootGateway, $fiber->getReturn());
+    }
+
+    private static function gateway(string $path): EntityGateway
+    {
+        static $initialized = [];
+        $pdo = new PDO('sqlite:' . $path);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        if ($path !== ':memory:') {
+            $pdo->exec('PRAGMA journal_mode=DELETE');
+            $pdo->exec('PRAGMA busy_timeout=2000');
+        }
+        if ($path === ':memory:' || !isset($initialized[$path])) {
+            $pdo->exec('CREATE TABLE IF NOT EXISTS lifecycle_record (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
+            $initialized[$path] = true;
+        }
+
+        return new EntityGateway(new PdoConnection($pdo));
+    }
+
+    private static function databasePath(): string
+    {
+        $path = tempnam(sys_get_temp_dir(), 'pixiaoka-session-');
+        self::assertIsString($path);
+
+        return $path;
+    }
+
+    /** @return list<array{id: int, name: string}> */
+    private static function databaseRows(string $path): array
+    {
+        $pdo = new PDO('sqlite:' . $path);
+
+        return $pdo->query('SELECT id, name FROM lifecycle_record ORDER BY id')->fetchAll(PDO::FETCH_ASSOC);
+    }
+}
+
+final class LifecycleRecord extends Entity
+{
+    #[Column]
+    #[PrimaryKey]
+    public int $id;
+
+    #[Column]
+    public string $name;
+
+    public static function table(): string
+    {
+        return 'lifecycle_record';
+    }
+}
+
+final class RecordingLifecycleConnection implements Connection
+{
+    public int $rollbacks = 0;
+
+    public bool $failRollback = false;
+
+    public function __construct(private readonly Connection $inner)
+    {
+    }
+
+    public function execute(string $sql, array $params): int { return $this->inner->execute($sql, $params); }
+    public function queryOne(string $sql, array $params): ?array { return $this->inner->queryOne($sql, $params); }
+    public function queryAll(string $sql, array $params): array { return $this->inner->queryAll($sql, $params); }
+    public function lastInsertId(): string { return $this->inner->lastInsertId(); }
+    public function quoteIdentifier(string $identifier): string { return $this->inner->quoteIdentifier($identifier); }
+    public function supportsReturning(): bool { return $this->inner->supportsReturning(); }
+    public function beginTransaction(): bool { return $this->inner->beginTransaction(); }
+    public function commit(): bool { return $this->inner->commit(); }
+    public function rollback(): bool
+    {
+        $this->rollbacks++;
+        if ($this->failRollback) {
+            throw new \RuntimeException('rollback failure');
+        }
+
+        return $this->inner->rollback();
+    }
+}
+
+final class IndependentLifecycleConnection implements Connection
+{
+    /** @var list<string> */
+    public array $operations = [];
+    public ?\Closure $onSuspend = null;
+
+    public function execute(string $sql, array $params): int { return 0; }
+    public function queryOne(string $sql, array $params): ?array { return null; }
+    public function queryAll(string $sql, array $params): array { return []; }
+    public function lastInsertId(): string { return ''; }
+    public function quoteIdentifier(string $identifier): string { return '"' . $identifier . '"'; }
+    public function supportsReturning(): bool { return true; }
+    public function beginTransaction(): bool
+    {
+        $this->operations[] = 'begin';
+        ($this->onSuspend)();
+
+        return true;
+    }
+    public function commit(): bool
+    {
+        $this->operations[] = 'commit';
+
+        return true;
+    }
+    public function rollback(): bool
+    {
+        $this->operations[] = 'rollback';
+
+        return true;
+    }
+}
