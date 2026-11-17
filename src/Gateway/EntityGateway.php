@@ -12,10 +12,20 @@ use Pixiaoka\Orm\Cast\Caster;
 use Pixiaoka\Orm\Cast\Decimal;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Exception\IdentityException;
+use Pixiaoka\Orm\Exception\OptimisticLockException;
+use Pixiaoka\Orm\Exception\TransactionException;
 use Pixiaoka\Orm\Identity\Identity;
 use Pixiaoka\Orm\Metadata\FieldMeta;
 use Pixiaoka\Orm\Metadata\MetadataReader;
 use Pixiaoka\Orm\Metadata\ModelMeta;
+use Pixiaoka\Orm\Observability\Clock;
+use Pixiaoka\Orm\Observability\ContextInfo;
+use Pixiaoka\Orm\Observability\EventDispatcher;
+use Pixiaoka\Orm\Observability\EventListener;
+use Pixiaoka\Orm\Observability\SqlEvent;
+use Pixiaoka\Orm\Observability\SystemClock;
+use Pixiaoka\Orm\Observability\TransactionEvent;
+use Pixiaoka\Orm\Observability\SessionEvent;
 use Pixiaoka\Orm\Query\Builder;
 use Pixiaoka\Orm\Query\Expression;
 use Pixiaoka\Orm\Session;
@@ -27,17 +37,70 @@ final class EntityGateway
     /** @var \WeakMap<Context, bool> 对象身份避免 Fiber 销毁后的数字 ID 重用。 */
     private \WeakMap $inTransactionByContext;
 
-    /** @var \WeakMap<Context, list<string>> 回滚只清当前上下文事务内写入的 key。 */
-    private \WeakMap $txnCacheKeysByContext;
+    /** @var \WeakMap<Context, \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}>> */
+    private \WeakMap $txnStatesByContext;
+
+    /** @var \WeakMap<Context, array<string, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}>> 同主键共享最外层基线，禁止中途状态覆盖。 */
+    private \WeakMap $txnIdentityStates;
+
+    /** @var \WeakMap<Context, array<string, list<array{new: bool, original: array<string, mixed>, values: array<string, mixed>}|null>>> 同身份插入历史，回滚后按删除关系决定保留或失效。 */
+    private \WeakMap $txnNewIdentities;
+
+    /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}>|null 插入前身份不完整时的对象快照。 */
+    private ?\WeakMap $pendingInsertStates = null;
+
+    /** @var \WeakMap<Context, array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, keys: list<string>, entities: list<Entity>}> */
+    private \WeakMap $txnCacheSnapshots;
+
+    /** @var \WeakMap<Context, bool>|null discard 返回后读取的回滚确认，下一次事务前清理。 */
+    private ?\WeakMap $confirmedRollbacks = null;
+
+    /** @var \WeakMap<Context, float> 仅用于物理事务开始事件的耗时。 */
+    private \WeakMap $txnStartedAt;
+
+    private readonly EventDispatcher $events;
+
+    private readonly Clock $clock;
+
+    /** @var \WeakMap<Connection, string> 开始、提交或回滚结果未知后，连接及所有 Gateway 都不可复用。 */
+    private static ?\WeakMap $failedConnections = null;
+
+    /** @var \WeakMap<Connection, int> 观测回调不是查询或业务写入入口，嵌套事件保留外层保护。 */
+    private static ?\WeakMap $observingConnections = null;
 
     public function __construct(
         private readonly Connection $connection,
         private readonly MetadataReader $metadata = new MetadataReader(),
         private readonly Caster $caster = new Caster(),
+        ?Clock $clock = null,
     ) {
         $this->cache = new RowCache();
         $this->inTransactionByContext = new \WeakMap();
-        $this->txnCacheKeysByContext = new \WeakMap();
+        $this->txnStatesByContext = new \WeakMap();
+        $this->txnIdentityStates = new \WeakMap();
+        $this->txnNewIdentities = new \WeakMap();
+        $this->pendingInsertStates ??= new \WeakMap();
+        $this->txnCacheSnapshots = new \WeakMap();
+        $this->txnStartedAt = new \WeakMap();
+        $this->events = new EventDispatcher();
+        $this->clock = $clock ?? new SystemClock();
+    }
+
+    /** 无监听器时只保留一次空列表判断；返回的闭包可幂等取消订阅。 */
+    public function subscribe(EventListener|callable $listener): \Closure
+    {
+        return $this->events->subscribe($listener);
+    }
+
+    /** @internal 不公开 Context，避免把进程内身份变成持久化或分布式追踪协议。 */
+    public function observeSession(string $action, Context $context, ?\Throwable $exception = null): void
+    {
+        $this->dispatchObserved(fn () => $this->events->dispatch(new SessionEvent(
+            $action,
+            new ContextInfo($context->type(), spl_object_id($context)),
+            $exception === null,
+            $exception === null ? null : $exception::class,
+        )));
     }
 
     public function connection(): Connection { return $this->connection; }
@@ -75,8 +138,10 @@ final class EntityGateway
     {
         $meta = $this->metadata->read($entity::class);
         $generated = $meta->generatedField();
+        $this->rememberEntity($entity);
         $this->fillTimestamp($entity, $meta, 'created_at');
         $this->fillTimestamp($entity, $meta, 'updated_at');
+        $this->fillVersion($entity, $meta);
         $entity->beforeSave();
         $entity->beforeInsert();
         $params = [];
@@ -92,6 +157,10 @@ final class EntityGateway
                 throw new IdentityException($meta->class . '::' . $field->property . ' 插入前必须有值');
             }
             $params[$field->column] = $this->caster->toDb($meta->class, $field, $entity->{$field->property});
+        }
+        $version = $meta->versionField();
+        if ($version !== null) {
+            $this->versionValue($meta, $version, $entity->{$version->property});
         }
 
         if ($meta->identityKind === 'natural') {
@@ -109,13 +178,14 @@ final class EntityGateway
         // P0-3：pg/sqlite 走 INSERT ... RETURNING，直接取回生成列，
         // 不依赖 lastInsertId（PG 下无序列名时 lastInsertId 不可靠）。
         if ($generated !== null && $this->connection->supportsReturning()) {
-            $row = $this->connection->queryOne(
+            $row = $this->runQueryOne(
                 $sql . ' RETURNING ' . $this->quote($generated->column),
                 $params,
+                $meta->class,
             );
             $id = $row === null ? '' : (string) ($row[$generated->column] ?? '');
         } else {
-            $this->connection->execute($sql, $params);
+            $this->runExecute($sql, $params, $meta->class);
             $id = $generated === null ? '' : $this->connection->lastInsertId();
         }
 
@@ -123,7 +193,8 @@ final class EntityGateway
             $entity->markPersisted();
             $entity->afterSave();
             $entity->afterInsert();
-            $this->cacheSet($entity);
+            $this->rememberEntity($entity);
+            $this->cacheSet($entity, true);
 
             return;
         }
@@ -136,7 +207,8 @@ final class EntityGateway
         $entity->markPersisted();
         $entity->afterSave();
         $entity->afterInsert();
-        $this->cacheSet($entity);
+        $this->rememberEntity($entity);
+        $this->cacheSet($entity, true);
     }
 
     /**
@@ -194,6 +266,7 @@ final class EntityGateway
         $rowIndex = 0;
         foreach ($rows as $row) {
             if ($row instanceof Entity) {
+                $this->rememberEntity($row);
                 if ($generated !== null && !$row->propSet($generated->property)) {
                     $id = $generatedIds[$rowIndex] ?? null;
                     if ($id !== null && $id !== '' && $id !== '0') {
@@ -203,7 +276,7 @@ final class EntityGateway
                 $row->markPersisted();
                 $row->afterSave();
                 $row->afterInsert();
-                $this->cacheSet($row);
+                $this->cacheSet($row, true);
             }
             $rowIndex++;
         }
@@ -224,6 +297,7 @@ final class EntityGateway
     ): array {
         $columns = array_map(fn (FieldMeta $f): string => $this->quote($f->column), $fieldList);
         $now = time();
+        $version = $meta->versionField();
         $paramIndex = 0;
         $valueGroups = [];
         $params = [];
@@ -231,6 +305,8 @@ final class EntityGateway
         foreach ($chunk as $row) {
             $isEntity = $row instanceof Entity;
             if ($isEntity) {
+                $this->rememberEntity($row);
+                $this->fillVersion($row, $meta);
                 $row->beforeSave();
                 $row->beforeInsert();
             }
@@ -238,12 +314,12 @@ final class EntityGateway
             foreach ($fieldList as $field) {
                 $column = $field->column;
                 $isTimestamp = in_array($field->property, $meta->timestamps, true);
+                $isVersion = $field->property === $meta->version;
                 $has = $isEntity
                     ? $row->propSet($field->property)
                     : (array_key_exists($column, $row) || array_key_exists($field->property, $row));
-                if ($isTimestamp && !$has) {
-                    // P1-2：时间戳只在未提供时才填充，显式给值的不覆盖
-                    $value = $this->currentTimestamp($field, $now);
+                if (($isTimestamp || $isVersion) && !$has) {
+                    $value = $isVersion ? 1 : $this->currentTimestamp($field, $now);
                 } elseif ($has) {
                     $value = $isEntity
                         ? $row->{$field->property}
@@ -254,8 +330,19 @@ final class EntityGateway
                 $p = ':b' . $paramIndex++;
                 $placeholders[] = $p;
                 $params[substr($p, 1)] = $this->toDbValue($meta, $field, $value);
+                if ($isVersion && $isEntity && !$has) {
+                    $row->{$field->property} = $value;
+                }
             }
             $valueGroups[] = '(' . implode(', ', $placeholders) . ')';
+        }
+        if ($version !== null) {
+            foreach ($chunk as $row) {
+                $value = $row instanceof Entity
+                    ? ($row->propSet($version->property) ? $row->{$version->property} : null)
+                    : ($row[$version->column] ?? $row[$version->property] ?? 1);
+                $this->versionValue($meta, $version, $this->caster->toPhp($meta->class, $version, $value));
+            }
         }
 
         $sql = sprintf(
@@ -267,9 +354,10 @@ final class EntityGateway
 
         if ($generated !== null && $this->connection->supportsReturning()) {
             // P0-3：RETURNING 拿回本块全部生成列值，行序即结果序
-            $returned = $this->connection->queryAll(
+            $returned = $this->runQueryAll(
                 $sql . ' RETURNING ' . $this->quote($generated->column),
                 $params,
+                $meta->class,
             );
 
             return array_map(
@@ -279,7 +367,7 @@ final class EntityGateway
         }
 
         // 不支持 RETURNING：多行带生成列已在入口拒绝；单行用 lastInsertId 兜底
-        $this->connection->execute($sql, $params);
+        $this->runExecute($sql, $params, $meta->class);
         $ids = array_fill(0, count($chunk), null);
         if ($generated !== null && count($chunk) === 1) {
             $id = $this->connection->lastInsertId();
@@ -314,16 +402,18 @@ final class EntityGateway
     {
         $meta = $this->metadata->read($entity::class);
         $identity = $this->identityOf($entity, $meta);
+        $this->rememberEntity($entity);
         $entity->beforeSave();
         $entity->beforeUpdate();
 
         $original = $entity->takeOriginal();
+        $expectedVersion = $this->expectedVersion($entity, $meta, $original);
         $this->fillUpdatedAt($entity, $meta, $original);
         $sets = [];
         $params = [];
 
         foreach ($meta->fields as $field) {
-            if ($field->primary) {
+            if ($field->primary || $field->property === $meta->version) {
                 continue;
             }
             if (!$entity->propSet($field->property)) {
@@ -339,21 +429,39 @@ final class EntityGateway
         }
 
         if ($sets === []) {
+            if ($expectedVersion !== null) {
+                $entity->{$meta->version} = $expectedVersion;
+            }
             $entity->markPersisted();
 
             return;
         }
 
+        if ($expectedVersion !== null) {
+            $version = $meta->versionField() ?? throw new \LogicException('版本元数据不一致');
+            $sets[] = $this->quote($version->column) . ' = ' . $this->quote($version->column) . ' + 1';
+        }
         $sql = sprintf(
             'UPDATE %s SET %s WHERE %s',
             $this->quote($meta->table),
             implode(', ', $sets),
             $this->where($meta, $params, $identity),
         );
-        $this->connection->execute($sql, $params);
+        if ($expectedVersion !== null) {
+            $sql .= ' AND ' . $this->quote($meta->versionField()->column) . ' = :orm_version';
+            $params['orm_version'] = $expectedVersion;
+        }
+        $affected = $this->runExecute($sql, $params, $meta->class);
+        if ($expectedVersion !== null && $affected !== 1) {
+            throw new OptimisticLockException($meta->class, 'UPDATE', $expectedVersion);
+        }
+        if ($expectedVersion !== null) {
+            $entity->{$meta->version} = $expectedVersion + 1;
+        }
         $entity->markPersisted();
         $entity->afterSave();
         $entity->afterUpdate();
+        $this->rememberEntity($entity);
         $this->cacheSet($entity);
     }
 
@@ -363,16 +471,44 @@ final class EntityGateway
     {
         $meta = $this->metadata->read($entity::class);
         $identity = $this->identityOf($entity, $meta);
+        $this->rememberEntity($entity);
         $entity->beforeDelete();
+        $original = $entity->takeOriginal();
+        $expectedVersion = $this->expectedVersion($entity, $meta, $original);
         $params = [];
         $sql = sprintf(
             'DELETE FROM %s WHERE %s',
             $this->quote($meta->table),
             $this->where($meta, $params, $identity),
         );
-        $affected = $this->connection->execute($sql, $params);
-        if ($affected !== 1) {
+        if ($expectedVersion !== null) {
+            $version = $meta->versionField() ?? throw new \LogicException('版本元数据不一致');
+            $sql .= ' AND ' . $this->quote($version->column) . ' = :orm_version';
+            $params['orm_version'] = $expectedVersion;
+        }
+        $affected = $this->runExecute($sql, $params, $meta->class);
+        if ($expectedVersion !== null && $affected !== 1) {
+            throw new OptimisticLockException($meta->class, 'DELETE', $expectedVersion);
+        }
+        if ($expectedVersion === null && $affected !== 1) {
             throw new IdentityException($meta->class . ' 删除没有命中恰好一行');
+        }
+        $context = Session::context();
+        if ($this->inTransactionByContext[$context] ?? false) {
+            $key = $entity::class . ':' . serialize($identity->parts);
+            $history = $this->txnNewIdentities[$context] ?? [];
+            if (isset($history[$key])) {
+                $baseline = array_pop($history[$key]);
+                if ($history[$key] === []) {
+                    unset($history[$key]);
+                }
+                $this->txnNewIdentities[$context] = $history;
+                if ($baseline !== null) {
+                    $identities = $this->txnIdentityStates[$context] ?? [];
+                    $identities[$key] ??= $baseline;
+                    $this->txnIdentityStates[$context] = $identities;
+                }
+            }
         }
         $entity->markDeleted();
         $entity->afterDelete();
@@ -401,12 +537,13 @@ final class EntityGateway
             $this->quote($meta->table),
             $this->where($meta, $params, $identity),
         );
-        $row = $this->connection->queryOne($sql, $params);
+        $row = $this->runQueryOne($sql, $params, $meta->class);
         if ($row === null) {
             return null;
         }
 
         $entity = $this->hydrate($meta, $row);
+        $this->rememberEntity($entity);
         $this->cacheSet($entity);
 
         return $entity;
@@ -434,6 +571,7 @@ final class EntityGateway
     {
         $meta = $this->metadata->read($entity::class);
         $identity = $this->identityOf($entity, $meta);
+        $this->rememberEntity($entity);
         $params = [];
         $columns = array_map(
             fn (FieldMeta $field): string => $this->quote($field->column),
@@ -445,7 +583,7 @@ final class EntityGateway
             $this->quote($meta->table),
             $this->where($meta, $params, $identity),
         );
-        $row = $this->connection->queryOne($sql, $params);
+        $row = $this->runQueryOne($sql, $params, $meta->class);
         if ($row === null) {
             throw new IdentityException($meta->class . ' 行不存在，无法刷新');
         }
@@ -457,6 +595,7 @@ final class EntityGateway
             $entity->{$field->property} = $this->caster->toPhp($meta->class, $field, $row[$field->column]);
         }
         $entity->markPersisted();
+        $this->rememberEntity($entity);
         $this->cacheSet($entity);
     }
 
@@ -517,14 +656,14 @@ final class EntityGateway
     {
         $this->assertLockSupported($query['sql']);
 
-        return $this->connection->queryAll($query['sql'], $query['params']);
+        return $this->runQueryAll($query['sql'], $query['params'], $class);
     }
 
     public function executeRow(string $class, array $query): ?array
     {
         $this->assertLockSupported($query['sql']);
 
-        return $this->connection->queryOne($query['sql'], $query['params']);
+        return $this->runQueryOne($query['sql'], $query['params'], $class);
     }
 
     public function executeValue(string $class, array $query, ?string $column = null): mixed
@@ -548,7 +687,7 @@ final class EntityGateway
     public function executeCountQuery(array $query): int
     {
         $this->assertLockSupported($query['sql']);
-        $row = $this->connection->queryOne($query['sql'], $query['params']);
+        $row = $this->runQueryOne($query['sql'], $query['params']);
         if ($row === null) {
             return 0;
         }
@@ -561,8 +700,9 @@ final class EntityGateway
 
     public function executeUpdate(Builder $builder, array $values): int
     {
+        $this->assertVersionWrite($this->metadata->read($builder->modelClass()), '批量条件 UPDATE');
         $query = $builder->buildUpdate($values);
-        $affected = $this->connection->execute($query['sql'], $query['params']);
+        $affected = $this->runExecute($query['sql'], $query['params'], $builder->modelClass());
         $this->cache->clearClass($this->metadata->read($builder->modelClass())->class);
 
         return $affected;
@@ -571,6 +711,7 @@ final class EntityGateway
     public function executeDelete(Builder $builder): int
     {
         $meta = $this->metadata->read($builder->modelClass());
+        $this->assertVersionWrite($meta, '批量条件 DELETE');
         $class = $meta->class;
         $query = $builder->buildDelete();
         if ($this->connection->supportsReturning()) {
@@ -578,7 +719,7 @@ final class EntityGateway
                 $this->quote(...),
                 $meta->primaryColumns(),
             ));
-            $deleted = $this->connection->queryAll($sql, $query['params']);
+            $deleted = $this->runQueryAll($sql, $query['params'], $class);
             $this->cache->clearDeleted($class, $this->normalizeIdentities($meta, $deleted));
 
             return count($deleted);
@@ -589,8 +730,8 @@ final class EntityGateway
         $candidates = $this->deletedIdentityQuery($meta, $builder);
         $deleted = $candidates === null
             ? []
-            : $this->connection->queryAll($candidates['sql'], $candidates['params']);
-        $affected = $this->connection->execute($query['sql'], $query['params']);
+            : $this->runQueryAll($candidates['sql'], $candidates['params'], $class);
+        $affected = $this->runExecute($query['sql'], $query['params'], $class);
         if ($affected > 0) {
             $this->cache->clearDeleted($class, $this->normalizeIdentities($meta, $deleted));
         }
@@ -652,14 +793,14 @@ final class EntityGateway
     {
         $query = $this->rawQuery($sql, $params);
 
-        return $this->connection->queryAll($query['sql'], $query['params']);
+        return $this->runQueryAll($query['sql'], $query['params']);
     }
 
     public function selectOneRaw(string|Expression $sql, array $params = []): ?array
     {
         $query = $this->rawQuery($sql, $params);
 
-        return $this->connection->queryOne($query['sql'], $query['params']);
+        return $this->runQueryOne($query['sql'], $query['params']);
     }
 
     /** 原生 INSERT/UPDATE/DELETE/DDL；SELECT 请使用 selectRaw() 以获取结果。 */
@@ -667,7 +808,7 @@ final class EntityGateway
     {
         $query = $this->rawQuery($sql, $params);
 
-        return $this->connection->execute($query['sql'], $query['params']);
+        return $this->runExecute($query['sql'], $query['params']);
     }
 
     /** @return array{sql: string, params: array<string, mixed>} */
@@ -804,6 +945,7 @@ final class EntityGateway
     public function upsert(string $class, array $values, ?array $updateColumns = null, ?array $conflictColumns = null): int
     {
         $meta = $this->metadata->read($class);
+        $this->assertVersionWrite($meta, 'UPSERT');
         if ($values === []) {
             throw new \InvalidArgumentException('UPSERT 至少需要一个字段');
         }
@@ -926,82 +1068,373 @@ final class EntityGateway
                 $sql .= ' DO UPDATE SET ' . implode(', ', $sets);
             }
         }
-        $affected = $this->connection->execute($sql, $params);
+        $affected = $this->runExecute($sql, $params, $meta->class);
         $this->cache->clearClass($class);
 
         return $affected;
     }
 
+    /** @throws \Throwable */
     public function transaction(callable $func): mixed
     {
+        $this->assertConnectionUsable();
         $ctx = Session::context();
-        $outer = $this->inTransactionByContext[$ctx] ?? false;
-        $this->inTransactionByContext[$ctx] = true;
-        if (!$outer) {
-            $this->txnCacheKeysByContext[$ctx] = [];
+        if ($this->inTransactionByContext[$ctx] ?? false) {
+            return $func();
         }
 
+        Session::clearRollbackStatus($ctx);
+        if ($this->confirmedRollbacks !== null) {
+            unset($this->confirmedRollbacks[$ctx]);
+        }
+        $this->inTransactionByContext[$ctx] = true;
+        if (!isset($this->txnCacheSnapshots[$ctx])) {
+            $this->txnCacheSnapshots[$ctx] = $this->captureTransactionCache();
+        }
+        $this->txnStatesByContext[$ctx] = $this->txnStatesByContext[$ctx] ?? $this->newTransactionStates();
+        $this->txnIdentityStates[$ctx] = $this->txnIdentityStates[$ctx] ?? [];
+        $this->txnNewIdentities[$ctx] = [];
+        foreach ($this->txnCacheSnapshots[$ctx]['entities'] as $entity) {
+            $this->rememberEntity($entity);
+        }
+        $startedAt = $this->clock->now();
+        $this->txnStartedAt[$ctx] = $startedAt;
         $begun = false;
+        $committed = false;
+        $rolledBack = false;
+        $discardConfirmed = false;
+        $failure = null;
+        $transactionFailure = null;
+        $rollbackFailure = null;
+        $rollbackAttempted = false;
+        $discardAttempted = false;
+        $commitAttempted = false;
+        $result = null;
         try {
-            if (!$outer) {
-                try {
-                    Session::claimConnection($this, $ctx);
-                    $this->connection->beginTransaction();
-                    $begun = true;
-                } catch (\Throwable $e) {
-                    Session::releaseConnection($this, $ctx);
+            try {
+                Session::claimConnection($this, $ctx);
+            try {
+                if (!$this->connection->beginTransaction()) {
+                    throw new \RuntimeException('数据库事务开始失败');
+                }
+                $begun = true;
+            } catch (\Throwable $e) {
+                $failure = $e;
+                $this->invalidateConnection();
+                $transactionFailure = new TransactionException('开始', null, $e);
+                $this->observeTransaction('begin', $ctx, $startedAt, $transactionFailure);
+                throw $transactionFailure;
+            }
+            $this->observeTransaction('begin', $ctx, $startedAt);
+            } catch (\Throwable $e) {
+                Session::releaseConnection($this, $ctx);
+                if ($e instanceof TransactionException) {
                     throw $e;
                 }
+                throw $e;
             }
 
-            $result = $func();
-            if (Session::currentContext() !== $ctx) {
-                throw new \LogicException('事务回调不能切换 Fiber/协程上下文后提交');
-            }
-            if (!$outer && !isset($this->inTransactionByContext[$ctx])) {
-                throw new \LogicException('事务期间 Session 已被清理，操作已回滚，不能继续提交');
-            }
-            if (!$outer) {
-                $this->connection->commit();
-            }
-
-            return $result;
-        } catch (\Throwable $e) {
-            if ($begun && isset($this->inTransactionByContext[$ctx])) {
-                try {
-                    $this->connection->rollback();
-                } finally {
-                    $this->clearTransactionCache($ctx);
+            try {
+                $result = $func();
+                $this->rememberCachedEntities();
+                if (Session::currentContext() !== $ctx) {
+                    throw new \LogicException('事务回调不能切换 Fiber/协程上下文后提交');
                 }
+                if (!isset($this->inTransactionByContext[$ctx])) {
+                    if (!Session::rollbackConfirmed($ctx)) {
+                        $this->invalidateConnection();
+                        throw new \LogicException('事务期间 Session 已被清理，不能继续提交；该连接已禁止复用');
+                    }
+                    $discardConfirmed = true;
+                    throw new \LogicException('事务期间 Session 已被清理，操作已回滚，不能继续提交');
+                }
+                $commitAttempted = true;
+                if (!$this->connection->commit()) {
+                    throw new \RuntimeException('数据库事务提交失败');
+                }
+                $committed = true;
+            } catch (\Throwable $e) {
+                $failure = $e;
+                if ($e instanceof TransactionException && !isset($this->inTransactionByContext[$ctx])) {
+                    $rollbackAttempted = true;
+                    $discardAttempted = true;
+                    $rollbackFailure = $e;
+                    throw $e;
+                }
+                if ($commitAttempted) {
+                    $this->observeTransaction('commit', $ctx, $startedAt, $e);
+                }
+                $discardAttempted = Session::rollbackAttempted($ctx);
+                if (isset($this->inTransactionByContext[$ctx]) && !$discardAttempted) {
+                    $rollbackAttempted = true;
+                    try {
+                        if (!$this->connection->rollback()) {
+                            throw new \RuntimeException('数据库事务回滚失败');
+                        }
+                        $rolledBack = true;
+                        if (!$commitAttempted) {
+                            $this->restoreTransaction($ctx);
+                        }
+                    } catch (\Throwable $rollbackError) {
+                        $rollbackFailure = $rollbackError;
+                        $this->invalidateConnection();
+                    }
+                }
+                if (($rolledBack || $discardConfirmed) && !$commitAttempted) {
+                    throw $failure;
+                }
+                $this->invalidateConnection();
+                $transactionFailure = new TransactionException(
+                    $commitAttempted ? '提交' : '回滚',
+                    $commitAttempted ? null : $failure,
+                    !$commitAttempted && $rollbackFailure !== null ? $rollbackFailure : $failure,
+                );
+                if ($rollbackAttempted) {
+                    $rollbackFailure = $transactionFailure;
+                }
+                throw $transactionFailure;
             }
-            throw $e;
         } finally {
-            if (!$outer) {
-                Session::releaseConnection($this, $ctx);
-                unset($this->inTransactionByContext[$ctx], $this->txnCacheKeysByContext[$ctx]);
+            if ($begun && !$committed && !$rolledBack && !$discardConfirmed) {
+                $this->invalidateConnection();
+            }
+            if (!$begun && $failure !== null) {
+                $this->invalidateConnection();
+                $this->cache->forgetKnown();
+            }
+            if ($begun && !$committed && $rollbackAttempted && !$discardAttempted) {
+                $this->observeTransaction('rollback', $ctx, $startedAt, $rolledBack ? null : $rollbackFailure);
+            }
+            Session::releaseConnection($this, $ctx);
+            $this->clearTransaction($ctx);
+            if ($committed) {
+                $this->observeTransaction('commit', $ctx, $startedAt);
             }
         }
+
+        return $result;
     }
 
     /** @internal 由 Session::discard() 调用，回滚并解除当前上下文的事务所有权。 */
     public function releaseContext(Context $context): void
     {
         $active = $this->inTransactionByContext[$context] ?? false;
+        $startedAt = $active
+            ? ($this->txnStartedAt[$context] ?? $this->clock->now())
+            : $this->clock->now();
+        $failure = null;
+        $transactionFailure = null;
         try {
             if ($active) {
-                $this->connection->rollback();
+                if (!$this->connection->rollback()) {
+                    throw new \RuntimeException('数据库事务回滚失败');
+                }
+                $this->restoreTransaction($context);
+                $this->confirmedRollbacks ??= new \WeakMap();
+                $this->confirmedRollbacks[$context] = true;
             }
+        } catch (\Throwable $e) {
+            $failure = $e;
+            $transactionFailure = new TransactionException('回滚', null, $e);
         } finally {
-            $this->clearTransactionCache($context);
+            if ($transactionFailure !== null) {
+                $this->invalidateConnection();
+            }
+            $this->clearTransaction($context);
+            if ($active) {
+                $this->observeTransaction('rollback', $context, $startedAt, $transactionFailure);
+            }
             Session::releaseConnection($this, $context);
-            unset($this->inTransactionByContext[$context], $this->txnCacheKeysByContext[$context]);
+        }
+        if ($transactionFailure !== null) {
+            throw $transactionFailure;
         }
     }
 
-    private function clearTransactionCache(Context $context): void
+    /** @internal Session 在清理事务状态之后读取一次确认标记。 */
+    public function rollbackWasConfirmed(Context $context): bool
     {
-        foreach ($this->txnCacheKeysByContext[$context] ?? [] as $key) {
-            $this->cache->clearKey($key);
+        return $this->confirmedRollbacks !== null && isset($this->confirmedRollbacks[$context]);
+    }
+
+    /** @internal Session::use() 也必须拒绝复用提交结果未知的连接。 */
+    public function assertSessionUsable(): void
+    {
+        $this->assertConnectionUsable();
+    }
+
+    /** @internal 隐式换绑不能代替调用方决定未结束事务的回滚与失败处理。 */
+    public function assertSessionReplaceable(Context $context): void
+    {
+        if ($this->inTransactionByContext[$context] ?? false) {
+            throw new \LogicException('当前 Session 存在未结束事务，禁止换绑；请先显式 discard 并处理回滚结果');
+        }
+    }
+
+    /** @internal discard() 应继续清理失败 Session，但禁止监听器重入清理。 */
+    public function assertObservationBoundary(): void
+    {
+        if (self::$observingConnections !== null && isset(self::$observingConnections[$this->connection])) {
+            throw new \LogicException('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期');
+        }
+    }
+
+    /** 每个 SQL 入口统一检查，包含 MySQL 条件 DELETE 的预查和原生 SQL。 */
+    private function assertConnectionUsable(): void
+    {
+        if (self::$failedConnections !== null && isset(self::$failedConnections[$this->connection])) {
+            throw new \LogicException(self::$failedConnections[$this->connection]);
+        }
+        if (self::$observingConnections !== null && isset(self::$observingConnections[$this->connection])) {
+            throw new \LogicException('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期');
+        }
+    }
+
+    private function invalidateConnection(): void
+    {
+        self::$failedConnections ??= new \WeakMap();
+        self::$failedConnections[$this->connection] = '数据库开始、提交或回滚结果未知，禁止复用当前连接；请丢弃该连接、Gateway 和关联实体';
+        $this->cache->flush();
+        $this->cache->forgetKnown();
+    }
+
+    private function clearTransaction(Context $context): void
+    {
+        unset(
+            $this->inTransactionByContext[$context],
+            $this->txnStatesByContext[$context],
+            $this->txnIdentityStates[$context],
+            $this->txnNewIdentities[$context],
+            $this->txnCacheSnapshots[$context],
+            $this->txnStartedAt[$context],
+        );
+    }
+
+    private function restoreTransaction(Context $context): void
+    {
+        foreach ($this->cache->known() as $entity) {
+            $this->rememberEntity($entity, $context);
+        }
+        foreach ($this->txnStatesByContext[$context] ?? [] as $entity => $state) {
+            /**
+             * @var $entity Entity
+             */
+            $entity->restoreState($state, $this->metadata->read($entity::class));
+        }
+        $snapshot = $this->txnCacheSnapshots[$context] ?? null;
+        if ($snapshot !== null) {
+            $this->cache->restoreSnapshot($snapshot);
+        }
+        $cachedKeys = $snapshot === null ? [] : array_fill_keys(array_keys($snapshot['items']), true);
+        foreach ($this->txnStatesByContext[$context] ?? [] as $entity => $state) {
+            if ($state['new']) {
+                continue;
+            }
+            $meta = $this->metadata->read($entity::class);
+            $parts = [];
+            foreach ($meta->primaryKey as $field) {
+                $parts[$field->column] = $this->caster->toDb($meta->class, $field, $entity->{$field->property});
+            }
+            if (!isset($cachedKeys[$this->cache->setKey($entity, $parts)])) {
+                $this->cache->set($entity, $parts);
+            }
+        }
+    }
+
+    private function rememberCachedEntities(): void
+    {
+        foreach ($this->cache->snapshot() as $entity) {
+            $this->rememberEntity($entity);
+        }
+    }
+
+    /** @return array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, keys: list<string>, entities: list<Entity>} */
+    private function captureTransactionCache(): array
+    {
+        /** @var array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, keys: list<string>, entities: list<Entity>} $snapshot */
+        $snapshot = $this->cache->transactionSnapshot();
+        $snapshot['entities'] = array_values(array_merge($snapshot['items'], $this->cache->known()));
+
+        return $snapshot;
+    }
+
+    /** @return \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}> */
+    private function newTransactionStates(): \WeakMap
+    {
+        /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}> $states */
+        $states = new \WeakMap();
+
+        return $states;
+    }
+
+    private function rememberEntity(Entity $entity, ?Context $transactionContext = null): void
+    {
+        $context = $transactionContext ?? Session::context();
+        if (!($this->inTransactionByContext[$context] ?? false)) {
+            return;
+        }
+        /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}> $states */
+        $states = $this->txnStatesByContext[$context] ?? $this->newTransactionStates();
+        if (isset($states[$entity])) {
+            if ($entity->isNew()) {
+                $this->pendingInsertStates ??= new \WeakMap();
+                $this->pendingInsertStates[$entity] = $states[$entity];
+            }
+
+            return;
+        }
+        $meta = $this->metadata->read($entity::class);
+        $pending = $this->txnNewIdentities[$context] ?? [];
+        $identities = $this->txnIdentityStates[$context] ?? [];
+        $key = $this->identityComplete($entity)
+            ? $entity::class . ':' . serialize($this->identityOf($entity, $meta)->parts)
+            : null;
+        if ($entity->isNew() || $key === null || !isset($pending[$key])) {
+            if (!$entity->isNew()) {
+                $identities[$key] ??= $entity->captureState($meta);
+                $this->txnIdentityStates[$context] = $identities;
+                $states[$entity] = $identities[$key];
+            } else {
+                $states[$entity] = $entity->captureState($meta);
+                $this->pendingInsertStates ??= new \WeakMap();
+                $this->pendingInsertStates[$entity] = $states[$entity];
+            }
+            $this->txnStatesByContext[$context] = $states;
+
+            return;
+        }
+        $states[$entity] = $identities[$key] ?? ['new' => true, 'original' => [], 'values' => $entity->captureState($meta)['values']];
+        $this->txnStatesByContext[$context] = $states;
+    }
+
+    private function observeTransaction(string $phase, Context $context, float $started, ?\Throwable $exception = null): void
+    {
+        $this->dispatchObserved(fn () => $this->events->dispatch(new TransactionEvent(
+            $phase,
+            $this->contextInfo($context),
+            max(0.0, $this->clock->now() - $started),
+            $exception === null,
+            $exception === null ? null : $exception::class,
+        )));
+    }
+
+    /** 事件同步发送，但连接级隔离禁止监听器重入 ORM；监听器异常仍由 Dispatcher 隔离。 */
+    private function dispatchObserved(callable $dispatch): void
+    {
+        if (!$this->events->hasListeners()) {
+            return;
+        }
+        self::$observingConnections ??= new \WeakMap();
+        $depth = (self::$observingConnections[$this->connection] ?? 0) + 1;
+        self::$observingConnections[$this->connection] = $depth;
+        try {
+            Session::observe($dispatch);
+        } finally {
+            if ($depth === 1) {
+                unset(self::$observingConnections[$this->connection]);
+            } else {
+                self::$observingConnections[$this->connection] = $depth - 1;
+            }
         }
     }
 
@@ -1012,10 +1445,11 @@ final class EntityGateway
     {
         $this->assertLockSupported($query['sql']);
         $meta = $this->metadata->read($class);
-        $rows = $this->connection->queryAll($query['sql'], $query['params']);
+        $rows = $this->runQueryAll($query['sql'], $query['params'], $class);
         $entities = [];
         foreach ($rows as $row) {
             $entity = $this->hydrate($meta, $row);
+            $this->rememberEntity($entity);
             $this->cacheSet($entity);
             $entities[] = $entity;
         }
@@ -1028,12 +1462,13 @@ final class EntityGateway
     {
         $this->assertLockSupported($query['sql']);
         $meta = $this->metadata->read($class);
-        $row = $this->connection->queryOne($query['sql'], $query['params']);
+        $row = $this->runQueryOne($query['sql'], $query['params'], $class);
         if ($row === null) {
             return null;
         }
 
         $entity = $this->hydrate($meta, $row);
+        $this->rememberEntity($entity);
         $this->cacheSet($entity);
 
         return $entity;
@@ -1053,7 +1488,7 @@ final class EntityGateway
         if ($column !== '*') {
             $sql = preg_replace('/COUNT\(\*\)/', 'COUNT(' . $this->quote($column) . ')', $sql, 1) ?? $sql;
         }
-        $row = $this->connection->queryOne($sql, $query['params']);
+        $row = $this->runQueryOne($sql, $query['params'], $class);
         if ($row === null) {
             return 0;
         }
@@ -1139,6 +1574,51 @@ final class EntityGateway
     }
 
     /** 创建时间仅在未设置时填充，显式提供的值不被覆盖。 */
+    private function fillVersion(Entity $entity, ModelMeta $meta): void
+    {
+        $field = $meta->versionField();
+        if ($field !== null && !$entity->propSet($field->property)) {
+            $entity->{$field->property} = 1;
+        }
+    }
+
+    private function versionValue(ModelMeta $meta, FieldMeta $field, mixed $value): int
+    {
+        if (!is_int($value) || $value < 0 || $value === PHP_INT_MAX) {
+            throw new IdentityException($meta->class . '::' . $field->property . ' 版本必须是大于等于 0 且可递增的 int');
+        }
+
+        return $value;
+    }
+
+    /** @param array<string, mixed> $original */
+    private function expectedVersion(Entity $entity, ModelMeta $meta, array $original): ?int
+    {
+        $field = $meta->versionField();
+        if ($field === null) {
+            return null;
+        }
+        $value = $original[$field->property] ?? null;
+        if ($entity->propSet($field->property)
+            && array_key_exists($field->property, $original)
+            && $entity->{$field->property} !== $value) {
+            throw new IdentityException($meta->class . '::' . $field->property . ' 是 ORM 托管的版本字段，不能直接修改；请使用 refresh');
+        }
+        if (!is_int($value) || $value < 0 || $value === PHP_INT_MAX) {
+            throw new IdentityException($meta->class . '::' . $field->property . ' 缺少有效持久化版本，请 refresh 后重试');
+        }
+
+        return $value;
+    }
+
+    private function assertVersionWrite(ModelMeta $meta, string $operation): void
+    {
+        if ($meta->version !== null) {
+            throw new \LogicException($meta->class . " 使用乐观锁，$operation 无法保留逐实体版本语义；请逐实体 save/delete");
+        }
+    }
+
+    /** 创建时间仅在未设置时填充，显式提供的值不被覆盖。 */
     private function fillTimestamp(Entity $entity, ModelMeta $meta, string $role): void
     {
         $field = $meta->timestampField($role);
@@ -1176,7 +1656,7 @@ final class EntityGateway
         return (new DateTimeImmutable('@' . ($now ?? time())))->setTimezone(new \DateTimeZone('UTC'));
     }
 
-    private function cacheSet(Entity $entity): void
+    private function cacheSet(Entity $entity, bool $inserted = false): void
     {
         $meta = $this->metadata->read($entity::class);
         $parts = [];
@@ -1189,14 +1669,20 @@ final class EntityGateway
             return;
         }
 
-        $key = $this->cache->setKey($entity, $parts);
-        $this->cache->set($entity, $parts);
-
-        // P1-3：事务期间写入的 key 记下来，回滚时精确清除
-        $ctx = Session::context();
-        if ($this->inTransactionByContext[$ctx] ?? false) {
-            $this->txnCacheKeysByContext[$ctx][] = $key;
+        $this->rememberEntity($entity);
+        $context = Session::context();
+        if ($inserted && ($this->inTransactionByContext[$context] ?? false)) {
+            $key = $entity::class . ':' . serialize($parts);
+            $baseline = $this->txnIdentityStates[$context][$key] ?? null;
+            $states = $this->txnStatesByContext[$context] ?? $this->newTransactionStates();
+            $states[$entity] = $baseline ?? ($this->pendingInsertStates[$entity] ?? $entity->captureState($meta));
+            $this->txnStatesByContext[$context] = $states;
+            $new = $this->txnNewIdentities[$context] ?? [];
+            $new[$key] ??= [];
+            $new[$key][] = $baseline;
+            $this->txnNewIdentities[$context] = $new;
         }
+        $this->cache->set($entity, $parts);
     }
 
     private function cacheClear(Entity $entity, Identity $identity): void
@@ -1207,5 +1693,96 @@ final class EntityGateway
     private function quote(string $identifier): string
     {
         return $this->connection->quoteIdentifier($identifier);
+    }
+
+    private function contextInfo(Context $context): ContextInfo
+    {
+        return new ContextInfo(
+            $context->type(),
+            spl_object_id($context),
+        );
+    }
+
+    /** @return list<string> 只收集键名，不读取、复制或序列化任何参数值。 */
+    private function parameterNames(array $params): array
+    {
+        return array_map(
+            static fn (int|string $name): string => is_int($name) ? (string) ($name + 1) : ltrim($name, ':'),
+            array_keys($params),
+        );
+    }
+
+    private function runExecute(string $sql, array $params, ?string $model = null): int
+    {
+        $this->assertConnectionUsable();
+        $started = $this->clock->now();
+        try {
+            $affected = $this->connection->execute($sql, $params);
+            $this->observeSql($sql, $params, $model, $started, $affected, null);
+
+            return $affected;
+        } catch (\Throwable $e) {
+            $this->observeSql($sql, $params, $model, $started, null, null, $e);
+            throw $e;
+        }
+    }
+
+    /** @return list<array<string, mixed>> */
+    private function runQueryAll(string $sql, array $params, ?string $model = null): array
+    {
+        $this->assertConnectionUsable();
+        $started = $this->clock->now();
+        try {
+            $rows = $this->connection->queryAll($sql, $params);
+            $this->observeSql($sql, $params, $model, $started, null, count($rows));
+
+            return $rows;
+        } catch (\Throwable $e) {
+            $this->observeSql($sql, $params, $model, $started, null, null, $e);
+            throw $e;
+        }
+    }
+
+    /** @return array<string, mixed>|null */
+    private function runQueryOne(string $sql, array $params, ?string $model = null): ?array
+    {
+        $this->assertConnectionUsable();
+        $started = $this->clock->now();
+        try {
+            $row = $this->connection->queryOne($sql, $params);
+            $this->observeSql($sql, $params, $model, $started, null, $row === null ? 0 : 1);
+
+            return $row;
+        } catch (\Throwable $e) {
+            $this->observeSql($sql, $params, $model, $started, null, null, $e);
+            throw $e;
+        }
+    }
+
+    private function observeSql(
+        string $sql,
+        array $params,
+        ?string $model,
+        float $started,
+        ?int $affected,
+        ?int $rows,
+        ?\Throwable $exception = null,
+    ): void {
+        if (!$this->events->hasListeners()) {
+            return;
+        }
+        $operation = strtoupper(strtok(ltrim($sql), " \t\r\n(") ?: 'SQL');
+        $this->dispatchObserved(fn () => $this->events->dispatch(new SqlEvent(
+            $sql,
+            $operation,
+            $model,
+            $this->contextInfo(Session::context()),
+            max(0.0, $this->clock->now() - $started),
+            $exception === null,
+            $this->parameterNames($params),
+            $affected,
+            $rows,
+            $exception === null ? null : $exception::class,
+        )));
     }
 }

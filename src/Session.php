@@ -27,6 +27,15 @@ final class Session
 
     private static bool $strict = false;
 
+    /** @var \WeakMap<Context, array{rolledBack: bool, failed: bool}>|null discard 结束时的事务结果。 */
+    private static ?\WeakMap $confirmedRollbacks = null;
+
+    /** @var \WeakMap<Context, true>|null discard 执行期间禁止观测回调重入清理。 */
+    private static ?\WeakMap $discardingContexts = null;
+
+    /** @var \WeakMap<Context, int>|null 当前上下文的嵌套观测事件深度。 */
+    private static ?\WeakMap $observingContexts = null;
+
     public function __construct(
         public readonly EntityGateway $gateway,
     ) {
@@ -35,8 +44,17 @@ final class Session
     /** 为当前上下文登记独立连接对应的网关。 */
     public static function use(EntityGateway $gateway): self
     {
+        self::assertObservationBoundary();
+        self::clearRollbackStatus(self::currentContext());
+        $gateway->assertSessionUsable();
+        $context = self::currentContext();
         $session = new self($gateway);
+        $previous = self::lookup($context);
+        if ($previous !== null) {
+            $previous->gateway->assertSessionReplaceable($context);
+        }
         self::install($session);
+        $gateway->observeSession('bind', self::currentContext());
 
         return $session;
     }
@@ -50,18 +68,28 @@ final class Session
      */
     public static function scope(EntityGateway $gateway, ?callable $operation = null): mixed
     {
+        self::assertObservationBoundary();
         $context = self::currentContext();
         $previous = self::lookup($context);
-        $scope = new SessionScope($context, static function () use ($previous): void {
+        if ($previous !== null) {
+            $previous->gateway->assertSessionReplaceable($context);
+        }
+        $scope = new SessionScope($context, static function () use ($previous, $context): void {
             try {
                 self::discard();
             } finally {
                 if ($previous !== null) {
                     self::install($previous);
+                    $previous->gateway->observeSession('restore', $context);
                 }
             }
         });
-        self::use($gateway);
+        try {
+            self::use($gateway);
+        } catch (\Throwable $e) {
+            $scope->abandon();
+            throw $e;
+        }
 
         if ($operation === null) {
             return $scope;
@@ -111,8 +139,29 @@ final class Session
     {
         $context = self::currentContext();
         $session = self::lookup($context);
+        if ($session !== null && ((self::$discardingContexts !== null && isset(self::$discardingContexts[$context]))
+            || (self::$observingContexts !== null && isset(self::$observingContexts[$context])))) {
+            throw new LogicException('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期');
+        }
+        if ($session === null) {
+            self::clearRollbackStatus($context);
+            return;
+        }
+        self::$discardingContexts ??= new WeakMap();
+        self::$discardingContexts[$context] = true;
+        $exception = null;
         try {
-            $session?->gateway->releaseContext($context);
+            $session->gateway->assertObservationBoundary();
+            $session->gateway->releaseContext($context);
+            if ($session->gateway->rollbackWasConfirmed($context)) {
+                self::$confirmedRollbacks ??= new WeakMap();
+                self::$confirmedRollbacks[$context] = ['rolledBack' => true, 'failed' => false];
+            }
+        } catch (\Throwable $e) {
+            $exception = $e;
+            self::$confirmedRollbacks ??= new WeakMap();
+            self::$confirmedRollbacks[$context] = ['rolledBack' => false, 'failed' => true];
+            throw $e;
         } finally {
             if (self::$contextSessions !== null) {
                 unset(self::$contextSessions[$context]);
@@ -120,6 +169,54 @@ final class Session
             if ($context === Context::root()) {
                 self::$mainSession = null;
             }
+            $session->gateway->observeSession('discard', $context, $exception);
+            unset(self::$discardingContexts[$context]);
+        }
+    }
+
+    /** @internal 仅由事务边界确认 discard 是否已经完成数据库回滚。 */
+    public static function rollbackConfirmed(Context $context): bool
+    {
+        return (self::$confirmedRollbacks[$context]['rolledBack'] ?? false) === true;
+    }
+
+    /** @internal 已尝试 discard 但回滚失败，外层事务不得重复回滚或伪造业务异常。 */
+    public static function rollbackAttempted(Context $context): bool
+    {
+        return self::$confirmedRollbacks !== null && isset(self::$confirmedRollbacks[$context]);
+    }
+
+    /** @internal 新物理事务不得继承上次 discard 的结果。 */
+    public static function clearRollbackStatus(Context $context): void
+    {
+        if (self::$confirmedRollbacks !== null) {
+            unset(self::$confirmedRollbacks[$context]);
+        }
+    }
+
+    /** @internal 独立连接可执行观测 SQL，但不能改变当前上下文的 Session 生命周期。 */
+    public static function observe(callable $dispatch): void
+    {
+        $context = self::currentContext();
+        self::$observingContexts ??= new WeakMap();
+        $depth = (self::$observingContexts[$context] ?? 0) + 1;
+        self::$observingContexts[$context] = $depth;
+        try {
+            $dispatch();
+        } finally {
+            if ($depth === 1) {
+                unset(self::$observingContexts[$context]);
+            } else {
+                self::$observingContexts[$context] = $depth - 1;
+            }
+        }
+    }
+
+    private static function assertObservationBoundary(): void
+    {
+        $context = self::currentContext();
+        if (self::$observingContexts !== null && isset(self::$observingContexts[$context])) {
+            throw new LogicException('观测监听器不得切换或清理当前上下文的 Session');
         }
     }
 

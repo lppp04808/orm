@@ -77,11 +77,52 @@ final class RowCache
         return $this->makeKey($entity::class, $identity);
     }
 
+    /** @return array<string, Entity> 当前 LRU 中的存活对象，供最外层事务保存状态。 */
+    public function snapshot(): array
+    {
+        return $this->items;
+    }
+
     /** 事务回滚时按 key 精确清除，不清整个缓存。 */
     public function clearKey(string $key): void
     {
-        $this->keys = array_values(array_diff($this->keys, [$key]));
+        $position = array_search($key, $this->keys, true);
+        if ($position !== false) {
+            array_splice($this->keys, $position, 1);
+        }
         unset($this->items[$key], $this->identities[$key]);
+    }
+
+    /** @return list<Entity> */
+    public function known(): array
+    {
+        $entities = [];
+        foreach ($this->knownIdentities ?? [] as $entity => $_identity) {
+            $entities[] = $entity;
+        }
+
+        return $entities;
+    }
+
+    /** @return array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, keys: list<string>} */
+    public function transactionSnapshot(): array
+    {
+        return ['items' => $this->items, 'identities' => $this->identities, 'keys' => $this->keys];
+    }
+
+    /** @param array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, keys: list<string>} $snapshot */
+    public function restoreSnapshot(array $snapshot): void
+    {
+        $known = $this->knownIdentities ?? new WeakMap();
+        $this->items = $snapshot['items'];
+        $this->keys = $snapshot['keys'];
+        $this->identities = $snapshot['identities'];
+        $this->knownIdentities = $known;
+        foreach ($snapshot['identities'] as $key => $identity) {
+            if (isset($snapshot['items'][$key])) {
+                $known[$snapshot['items'][$key]] = $identity;
+            }
+        }
     }
 
     public function clear(string $class, array $identity): void
@@ -146,6 +187,12 @@ final class RowCache
         $this->items = [];
         $this->keys = [];
         $this->identities = [];
+    }
+
+    /** 事务结果未知时，旧对象身份不能再参与条件 DELETE 预查。 */
+    public function forgetKnown(): void
+    {
+        $this->knownIdentities = new WeakMap();
     }
 
     private function makeKey(string $class, array $identity): string

@@ -9,6 +9,7 @@ use PHPUnit\Framework\TestCase;
 use Pixiaoka\Orm\Annotation\Column;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
 use Pixiaoka\Orm\Entity;
+use Pixiaoka\Orm\Exception\TransactionException;
 use Pixiaoka\Orm\Gateway\Connection;
 use Pixiaoka\Orm\Gateway\EntityGateway;
 use Pixiaoka\Orm\Gateway\PdoConnection;
@@ -207,12 +208,115 @@ final class SessionLifecycleTest extends TestCase
             LifecycleRecord::transaction(static function () use ($scope): void {
                 $scope->close();
             });
-            self::fail('必须透传连接回滚异常');
-        } catch (\RuntimeException $e) {
-            self::assertSame('rollback failure', $e->getMessage());
+            self::fail('必须优先报告事务回滚结果未知');
+        } catch (TransactionException $e) {
+            self::assertSame('回滚', $e->operation);
+            self::assertNull($e->businessException);
+            self::assertSame('rollback failure', $e->getPrevious()?->getMessage());
         }
         self::assertSame($this->rootGateway, Session::get()->gateway);
         self::assertSame(1, $connection->rollbacks);
+    }
+
+    public function testUseRejectsReplacingActiveTransactionWithoutTouchingConnection(): void
+    {
+        $path = self::databasePath();
+        $gateway = self::gateway($path);
+        $connection = new RecordingLifecycleConnection($gateway->connection());
+        $recordingGateway = new EntityGateway($connection);
+        Session::use($recordingGateway);
+        try {
+            LifecycleRecord::transaction(function () use ($path, $connection, $recordingGateway): void {
+                LifecycleRecord::executeRaw('INSERT INTO lifecycle_record (id, name) VALUES (:id, :name)', ['id' => 4, 'name' => 'preserve-session']);
+                $replacement = self::gateway($path);
+                try {
+                    Session::use($replacement);
+                    self::fail('隐式换绑不得代替调用方回滚未结束事务');
+                } catch (\LogicException $e) {
+                    self::assertStringContainsString('禁止换绑', $e->getMessage());
+                }
+                self::assertSame(0, $connection->rollbacks);
+                self::assertSame($recordingGateway, Session::get()->gateway);
+                throw new \DomainException('business rollback');
+            });
+            self::fail('业务异常应在确认回滚后透传');
+        } catch (\DomainException $e) {
+            self::assertSame('business rollback', $e->getMessage());
+        }
+        self::assertSame(1, $connection->rollbacks);
+        self::assertSame([], self::databaseRows($path));
+        @unlink($path);
+        @unlink($path . '-wal');
+        @unlink($path . '-shm');
+    }
+
+    public function testScopeRejectsReplacingActiveTransactionAndPreservesSession(): void
+    {
+        Session::use($this->rootGateway);
+        try {
+            LifecycleRecord::transaction(function (): void {
+                $scope = Session::scope(self::gateway(':memory:'));
+                self::fail('作用域创建不得静默回滚旧 Session 的事务');
+            });
+            self::fail('换绑拒绝应在事务内保留业务异常语义');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('禁止换绑', $e->getMessage());
+        }
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+    }
+
+    public function testSameGatewayUseAndScopeCannotDiscardActiveTransaction(): void
+    {
+        Session::use($this->rootGateway);
+        foreach (['use', 'scope'] as $operation) {
+            try {
+                LifecycleRecord::transaction(function () use ($operation): void {
+                    if ($operation === 'use') {
+                        Session::use($this->rootGateway);
+                    } else {
+                        Session::scope($this->rootGateway, static fn (): null => null);
+                    }
+                });
+                self::fail('同 Gateway 的作用域或重新绑定也不能回滚当前事务');
+            } catch (\LogicException $e) {
+                self::assertStringContainsString('禁止换绑', $e->getMessage());
+            }
+            self::assertSame($this->rootGateway, Session::get()->gateway);
+        }
+    }
+
+    public function testUseRejectsReplacingActiveTransactionEvenWhenRollbackWouldFail(): void
+    {
+        $path = self::databasePath();
+        $gateway = self::gateway($path);
+        $connection = new RecordingLifecycleConnection($gateway->connection());
+        $recordingGateway = new EntityGateway($connection);
+        Session::use($recordingGateway);
+        try {
+            LifecycleRecord::transaction(function () use ($path, $connection, $recordingGateway): void {
+                LifecycleRecord::executeRaw('INSERT INTO lifecycle_record (id, name) VALUES (:id, :name)', ['id' => 5, 'name' => 'no-early-rollback']);
+                $connection->failRollback = true;
+                try {
+                    Session::use(self::gateway($path));
+                    self::fail('换绑不得吞掉回滚失败或伪装业务异常');
+                } catch (\LogicException $e) {
+                    self::assertStringContainsString('禁止换绑', $e->getMessage());
+                    self::assertNotInstanceOf(TransactionException::class, $e);
+                }
+                self::assertSame(0, $connection->rollbacks);
+                self::assertSame($recordingGateway, Session::get()->gateway);
+                throw new \DomainException('business rollback');
+            });
+            self::fail('外层回滚失败必须报告事务结果未知');
+        } catch (TransactionException $e) {
+            self::assertSame('回滚', $e->operation);
+            self::assertSame('business rollback', $e->businessException?->getMessage());
+            self::assertSame('rollback failure', $e->getPrevious()?->getMessage());
+        }
+        self::assertSame(1, $connection->rollbacks);
+        @unlink($path);
+        @unlink($path . '-wal');
+        @unlink($path . '-shm');
     }
 
     public function testDifferentFibersCommitIndependentConnectionsWhileSuspended(): void

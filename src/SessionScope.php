@@ -40,6 +40,15 @@ final class SessionScope
         ($this->restore)();
     }
 
+    /** @internal 创建作用域失败时尚无可清理的新 Session，禁止析构回滚旧事务。 */
+    public function abandon(): void
+    {
+        if (Session::currentContext() !== $this->owner) {
+            throw new LogicException('SessionScope 必须在创建它的 Fiber/协程上下文中关闭');
+        }
+        $this->active = false;
+    }
+
     public function __destruct()
     {
         if ($this->active) {

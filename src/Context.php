@@ -25,26 +25,33 @@ final class Context
     /** @var WeakMap<object, self>|null */
     private static ?WeakMap $runtime = null;
 
-    private function __construct()
+    private function __construct(
+        private readonly string $type,
+    ) {
+    }
+
+    /** @return 'root'|'fiber'|'coroutine' */
+    public function type(): string
     {
+        return $this->type;
     }
 
     public static function root(): self
     {
-        return self::$main ??= new self();
+        return self::$main ??= new self('root');
     }
 
     public static function fiber(Fiber $fiber): self
     {
         self::$fibers ??= new WeakMap();
 
-        return self::$fibers[$fiber] ??= new self();
+        return self::$fibers[$fiber] ??= new self('fiber');
     }
 
     public static function coroutine(object $coroutine): self
     {
         self::$runtime ??= new WeakMap();
 
-        return self::$runtime[$coroutine] ??= new self();
+        return self::$runtime[$coroutine] ??= new self('coroutine');
     }
 }

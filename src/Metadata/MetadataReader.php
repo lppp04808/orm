@@ -10,6 +10,7 @@ use Pixiaoka\Orm\Annotation\UpdatedAt;
 use Pixiaoka\Orm\Cast\Decimal;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
 use Pixiaoka\Orm\Annotation\Temporal;
+use Pixiaoka\Orm\Annotation\Version;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Exception\MetadataException;
 use ReflectionClass;
@@ -83,6 +84,7 @@ final class MetadataReader
         foreach ($fields as $field) {
             $byProperty[$field->property] = $field;
         }
+        $timestamps = $this->timestamps($class, $reflection, $byProperty);
 
         return $this->cache[$class] = new ModelMeta(
             $class,
@@ -90,7 +92,8 @@ final class MetadataReader
             $byProperty,
             $primary,
             $generated === [] ? 'natural' : 'surrogate',
-            $this->timestamps($class, $reflection, $byProperty),
+            $timestamps,
+            $this->version($class, $reflection, $byProperty, $timestamps),
         );
     }
 
@@ -145,6 +148,39 @@ final class MetadataReader
         }
 
         return $ts;
+    }
+
+    /**
+     * @param class-string<Entity> $class
+     * @param ReflectionClass<Entity> $reflection
+     * @param array<string, FieldMeta> $fields
+     * @param array{created_at?: string, updated_at?: string} $timestamps
+     */
+    private function version(string $class, ReflectionClass $reflection, array $fields, array $timestamps): ?string
+    {
+        $version = null;
+        foreach ($reflection->getProperties() as $property) {
+            if ($property->getAttributes(Version::class) === []) {
+                continue;
+            }
+            $name = $property->getName();
+            $field = $fields[$name] ?? throw new MetadataException("$class::$name 版本字段必须同时声明 #[Column]");
+            if ($version !== null) {
+                throw new MetadataException("$class::$name 一个模型只能声明一个版本字段，$version 已声明");
+            }
+            if ($field->primary || $field->generated) {
+                throw new MetadataException("$class::$name 版本字段不能兼任主键或生成列");
+            }
+            if (in_array($name, $timestamps, true)) {
+                throw new MetadataException("$class::$name 版本字段不能兼任自动时间字段");
+            }
+            if ($field->typeName() !== 'int' || $field->nullable()) {
+                throw new MetadataException("$class::$name 版本字段必须是非空 int");
+            }
+            $version = $name;
+        }
+
+        return $version;
     }
 
     private function field(string $class, ReflectionProperty $property, Column $column, int $declaration): FieldMeta

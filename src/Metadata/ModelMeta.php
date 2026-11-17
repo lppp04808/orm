@@ -12,10 +12,13 @@ namespace Pixiaoka\Orm\Metadata;
 final readonly class ModelMeta
 {
     /**
+     * @param string $class
+     * @param string $table
      * @param array<string, FieldMeta> $fields 属性名 => 字段
      * @param list<FieldMeta> $primaryKey 有序主键列
      * @param 'surrogate'|'natural' $identityKind
      * @param array{created_at?: string, updated_at?: string} $timestamps 时间角色 => 属性名
+     * @param string|null $version
      */
     public function __construct(
         public string $class,
@@ -24,6 +27,7 @@ final readonly class ModelMeta
         public array $primaryKey,
         public string $identityKind,
         public array $timestamps,
+        public ?string $version = null,
     ) {
     }
 
@@ -41,6 +45,11 @@ final readonly class ModelMeta
     public function primaryColumns(): array
     {
         return array_map(static fn (FieldMeta $field): string => $field->column, $this->primaryKey);
+    }
+
+    public function versionField(): ?FieldMeta
+    {
+        return $this->version === null ? null : $this->field($this->version);
     }
 
     public function generatedField(): ?FieldMeta

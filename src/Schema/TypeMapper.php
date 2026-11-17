@@ -8,6 +8,7 @@ use DateTimeImmutable;
 use Pixiaoka\Orm\Annotation\CreatedAt;
 use Pixiaoka\Orm\Annotation\Temporal;
 use Pixiaoka\Orm\Annotation\UpdatedAt;
+use Pixiaoka\Orm\Annotation\Version;
 use Pixiaoka\Orm\Cast\BcDecimal;
 
 /** 将数据库列映射为 ORM 支持的 PHP 类型，并仅渲染静态合法默认值。 */
@@ -71,6 +72,9 @@ final class TypeMapper
         }
         if ($type === DateTimeImmutable::class) {
             $imports[] = Temporal::class;
+        }
+        if (!$column->primary() && !$column->nullable && $column->name === 'version' && $type === 'int') {
+            $imports[] = Version::class;
         }
         if (in_array($type, ['int', DateTimeImmutable::class], true)) {
             if ($column->name === 'created_at') {

@@ -31,9 +31,11 @@ if (is_file($libAutoload)) {
 use Pixiaoka\Orm\Annotation\Column;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
 use Pixiaoka\Orm\Annotation\Temporal;
+use Pixiaoka\Orm\Annotation\Version;
 use Pixiaoka\Orm\Cast\BcDecimal;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Exception\IdentityException;
+use Pixiaoka\Orm\Exception\OptimisticLockException;
 use Pixiaoka\Orm\Gateway\Connection;
 use Pixiaoka\Orm\Gateway\EntityGateway;
 use Pixiaoka\Orm\Gateway\PdoConnection;
@@ -232,6 +234,28 @@ final class VerifyTag extends Entity
     }
 }
 
+/** 独立乐观锁模型，使用与生成器自动识别列 version 不同的 revision 属性/列名。 */
+final class VerifyVersionRecord extends Entity
+{
+    public static string $tableName = 'orm_verify_version';
+
+    #[Column]
+    #[PrimaryKey(generated: true)]
+    public int $id;
+
+    #[Column]
+    public string $body;
+
+    #[Column]
+    #[Version]
+    public int $revision;
+
+    public static function table(): string
+    {
+        return self::$tableName;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // 验证结果收集
 // ----------------------------------------------------------------------------
@@ -282,6 +306,7 @@ function createTables(PDO $pdo, string $driver): void
     global $ownedTables;
     $item = VerifyItem::table();
     $tag = VerifyTag::table();
+    $version = VerifyVersionRecord::table();
 
     if ($driver === 'mysql') {
         $pdo->exec("CREATE TABLE {$item} (
@@ -343,16 +368,25 @@ function createTables(PDO $pdo, string $driver): void
         )");
         $ownedTables[] = $tag;
     }
+
+    $versionId = $driver === 'mysql' ? 'INT AUTO_INCREMENT PRIMARY KEY' : ($driver === 'pgsql' ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT');
+    $versionBody = $driver === 'sqlite' ? 'TEXT' : 'VARCHAR(255)';
+    $pdo->exec("CREATE TABLE {$version} (
+        id {$versionId},
+        body {$versionBody} NOT NULL,
+        revision INT NOT NULL
+    )");
+    $ownedTables[] = $version;
 }
 
-/** 只清理本次登记过的表：tag 先（外键/依赖方向），item 后。 */
+/** 只清理本次登记过的表：version/tag 先，item 后。 */
 function dropOwnedTables(PDO $pdo): void
 {
     global $ownedTables;
     $item = VerifyItem::table();
     $tag = VerifyTag::table();
-    // drop 顺序：tag 后 item（先删子表/标签表，再删主表）
-    foreach ([$tag, $item] as $table) {
+    $version = VerifyVersionRecord::table();
+    foreach ([$version, $tag, $item] as $table) {
         if (in_array($table, $ownedTables, true)) {
             $pdo->exec("DROP TABLE IF EXISTS {$table}");
         }
@@ -1027,6 +1061,186 @@ function runComplexScenarios(string $driver, PDO $pdo, RecordingConnection $rec,
 }
 
 // ----------------------------------------------------------------------------
+// 场景 r：#[Version] 双连接并发冲突、refresh 重试与事务回滚状态恢复
+// ----------------------------------------------------------------------------
+
+function runVersionScenarios(string $driver, string $dsn, string $user, string $pass, Check $check, ?EntityGateway $leftGateway = null): void
+{
+    $leftGateway ??= Session::get()->gateway;
+    try {
+        $rightPdo = new PDO($dsn, $user, $pass, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_TIMEOUT => 10,
+        ]);
+        $rightConnection = new PdoConnection($rightPdo);
+        $rightGateway = new EntityGateway($rightConnection);
+        $leftConnection = $leftGateway->connection();
+        $check->assert($rightConnection !== $leftConnection, 'r0. ' . $driver . ' 乐观锁使用两个独立 PDO/EntityGateway');
+
+        // r1~r8：两个连接读取同一行；左侧提交后，右侧旧快照不能 UPDATE 或 DELETE。
+        Session::use($leftGateway);
+        $left = new VerifyVersionRecord();
+        $left->body = 'initial';
+        $left->save();
+        $id = $left->id;
+        $check->assert($left->revision === 1, 'r1. Version 首次保存默认 revision=1', 'revision=' . $left->revision);
+
+        Session::use($rightGateway);
+        $right = VerifyVersionRecord::find(['id' => $id]);
+        $check->assert($right !== null && $right !== $left && $right->revision === 1, 'r2. 右连接独立读取同一行 revision=1');
+        if ($right === null) {
+            return;
+        }
+
+        Session::use($leftGateway);
+        $left->body = 'left-winner';
+        $left->save();
+        $check->assert($left->revision === 2 && $left->takeOriginal()['revision'] === 2, 'r3. 左连接保存使 revision 从 1 增至 2');
+
+        Session::use($rightGateway);
+        $right->body = 'stale-update';
+        $staleOriginal = $right->takeOriginal();
+        try {
+            $right->save();
+            $check->no('r4. 右连接陈旧 UPDATE 必须抛 OptimisticLockException', '没有抛出异常');
+        } catch (OptimisticLockException $e) {
+            $check->assert($e->operation === 'UPDATE' && $e->expectedVersion === 1, 'r4. 右连接陈旧 UPDATE 抛 OptimisticLockException', $e->getMessage());
+        }
+        $check->assert(
+            $right->revision === 1 && $right->body === 'stale-update' && $right->takeOriginal() === $staleOriginal && !$right->isNew(),
+            'r5. 陈旧 UPDATE 后内存 revision/字段/original/isNew 不提前推进',
+            json_encode(['body' => $right->body, 'revision' => $right->revision, 'original' => $right->takeOriginal(), 'isNew' => $right->isNew()], JSON_UNESCAPED_UNICODE),
+        );
+
+        try {
+            $right->delete();
+            $check->no('r6. 右连接陈旧 DELETE 必须抛 OptimisticLockException', '没有抛出异常');
+        } catch (OptimisticLockException $e) {
+            $check->assert($e->operation === 'DELETE' && $e->expectedVersion === 1, 'r6. 右连接陈旧 DELETE 抛 OptimisticLockException', $e->getMessage());
+        }
+        $check->assert(
+            $right->revision === 1 && $right->takeOriginal() === $staleOriginal && !$right->isNew()
+                && VerifyVersionRecord::find(['id' => $id]) === $right,
+            'r7. 陈旧 DELETE 后版本/快照/持久化身份及缓存对象保持不变',
+        );
+
+        $right->refresh();
+        $check->assert(
+            $right->body === 'left-winner' && $right->revision === 2
+                && $right->takeOriginal() === ['body' => 'left-winner', 'revision' => 2],
+            'r8. refresh 读取左连接新值并替换 original 快照',
+            json_encode($right->toArray(), JSON_UNESCAPED_UNICODE),
+        );
+        $right->body = 'refreshed-update';
+        $right->save();
+        $check->assert($right->revision === 3 && $right->takeOriginal()['revision'] === 3, 'r9. refresh 后 UPDATE 成功且 revision=3');
+        $right->delete();
+        $gone = VerifyVersionRecord::query()->where('id', $id)->row();
+        $check->assert($right->isNew() && $right->takeOriginal() === [] && $gone === null, 'r10. refresh 后 DELETE 成功且清空持久化快照');
+
+        // r11~r22：已有行多次保存、新建行、事务内首次读取后修改，全部回滚并恢复。
+        Session::use($leftGateway);
+        $record = new VerifyVersionRecord();
+        $record->body = 'committed';
+        $record->save();
+        $recordId = $record->id;
+        $recordOriginal = $record->takeOriginal();
+
+        $readBefore = new VerifyVersionRecord();
+        $readBefore->body = 'read-before';
+        $readBefore->save();
+        $readId = $readBefore->id;
+        $leftGateway->clearCache(VerifyVersionRecord::class); // 强制事务内读取真实数据库
+
+        $fresh = new VerifyVersionRecord();
+        $fresh->body = 'new-row';
+        $readInTransaction = null;
+        $freshId = null;
+        try {
+            VerifyVersionRecord::transaction(function () use ($record, $fresh, $readId, &$readInTransaction, &$freshId, $check): void {
+                $record->body = 'first-transient';
+                $record->save();
+                $record->body = 'second-transient';
+                $record->save();
+                $check->assert($record->revision === 3, 'r11. 事务内多次保存连续递增到 revision=3');
+
+                $fresh->save();
+                $freshId = $fresh->id;
+                $check->assert(!$fresh->isNew() && $fresh->revision === 1, 'r12. 事务内新建实体获得 id 与 revision=1');
+
+                $readInTransaction = VerifyVersionRecord::query()->where('id', $readId)->first();
+                $check->assert($readInTransaction !== null && $readInTransaction->revision === 1, 'r13. 事务内从数据库读出独立实体');
+                if ($readInTransaction !== null) {
+                    $readInTransaction->body = 'read-transient';
+                    $readInTransaction->save();
+                    $check->assert($readInTransaction->revision === 2, 'r14. 事务内读取后修改使 revision=2');
+                }
+                throw new RuntimeException('version rollback');
+            });
+            $check->no('r15. 乐观锁事务回滚异常传播', '事务没有抛出异常');
+        } catch (RuntimeException $e) {
+            $check->assert($e->getMessage() === 'version rollback', 'r15. 乐观锁事务回滚异常传播', $e->getMessage());
+        }
+
+        $check->assert(
+            $record->body === 'committed' && $record->revision === 1 && !$record->isNew()
+                && $record->takeOriginal() === $recordOriginal && $record->id === $recordId,
+            'r16. 回滚恢复已有实体字段/revision/original/isNew',
+            json_encode(['values' => $record->toArray(), 'original' => $record->takeOriginal(), 'isNew' => $record->isNew()], JSON_UNESCAPED_UNICODE),
+        );
+        $cachedRecord = VerifyVersionRecord::find(['id' => $recordId]);
+        $check->assert($cachedRecord === $record, 'r17. 回滚恢复已有实体缓存对象身份', json_encode([
+            'expectedObjectId' => spl_object_id($record),
+            'cachedObjectId' => $cachedRecord === null ? null : spl_object_id($cachedRecord),
+            'expected' => $record->toArray(),
+            'cached' => $cachedRecord?->toArray(),
+        ], JSON_UNESCAPED_UNICODE));
+        $check->assert(
+            $fresh->isNew() && !$fresh->propSet('id') && !$fresh->propSet('revision') && $fresh->body === 'new-row',
+            'r18. 回滚恢复事务内新建实体的未入库及未初始化生成字段状态',
+        );
+        $cachedRead = $readInTransaction === null ? null : VerifyVersionRecord::find(['id' => $readId]);
+        $check->assert(
+            $readInTransaction !== null && $readInTransaction->body === 'read-before'
+                && $readInTransaction->revision === 1 && !$readInTransaction->isNew()
+                && $readInTransaction->takeOriginal() === ['body' => 'read-before', 'revision' => 1]
+                && $cachedRead === $readInTransaction,
+            'r19. 回滚恢复事务内读取后修改实体及其缓存身份',
+            $readInTransaction === null ? '事务内没有读到实体' : json_encode([
+                'expectedObjectId' => spl_object_id($readInTransaction),
+                'cachedObjectId' => $cachedRead === null ? null : spl_object_id($cachedRead),
+                'expected' => $readInTransaction->toArray(),
+                'expectedOriginal' => $readInTransaction->takeOriginal(),
+                'expectedIsNew' => $readInTransaction->isNew(),
+                'cached' => $cachedRead?->toArray(),
+            ], JSON_UNESCAPED_UNICODE),
+        );
+
+        $committedRow = VerifyVersionRecord::query()->where('id', $recordId)->row();
+        $readRow = VerifyVersionRecord::query()->where('id', $readId)->row();
+        $freshRow = $freshId === null ? null : VerifyVersionRecord::query()->where('id', $freshId)->row();
+        $check->assert(
+            $committedRow !== null && $committedRow['body'] === 'committed' && (int) $committedRow['revision'] === 1
+                && $readRow !== null && $readRow['body'] === 'read-before' && (int) $readRow['revision'] === 1
+                && $freshRow === null,
+            'r20. 数据库确认已有行及事务内读取行回滚、新建行未残留',
+            json_encode(['committed' => $committedRow, 'read' => $readRow, 'fresh' => $freshRow], JSON_UNESCAPED_UNICODE),
+        );
+
+        $record->body = 'after-rollback';
+        $record->save();
+        $check->assert($record->revision === 2 && $record->body === 'after-rollback', 'r21. 回滚后的已有实体可从原版本重试 UPDATE');
+        $fresh->save();
+        $retryRow = VerifyVersionRecord::query()->where('id', $fresh->id)->row();
+        $check->assert(!$fresh->isNew() && $fresh->revision === 1 && $retryRow !== null, 'r22. 回滚后的新建实体可重试 INSERT');
+    } catch (Throwable $e) {
+        $check->no('r. Version 实连场景执行意外中断', $e::class . ': ' . $e->getMessage());
+    } finally {
+        Session::use($leftGateway);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // 单库验证全流程（连接 + 建表 + 场景 + 清理）
 // ----------------------------------------------------------------------------
 
@@ -1057,9 +1271,9 @@ function verifyOn(string $label, string $dsn, string $user, string $pass): Check
 
     try {
         createTables($pdo, $driver);
-        $check->ok('建表 ' . VerifyItem::table() . ' / ' . VerifyTag::table());
+        $check->ok('建表 ' . VerifyItem::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyVersionRecord::table());
     } catch (PDOException $e) {
-        $check->no('建表 ' . VerifyItem::table() . ' / ' . VerifyTag::table(), $e->getMessage());
+        $check->no('建表 ' . VerifyItem::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyVersionRecord::table(), $e->getMessage());
         try {
             dropOwnedTables($pdo);
         } catch (PDOException) {
@@ -1083,11 +1297,12 @@ function verifyOn(string $label, string $dsn, string $user, string $pass): Check
     } catch (Throwable $e) {
         $check->no('复杂场景执行意外中断', $e->getMessage());
     }
+    runVersionScenarios($driver, $dsn, $user, $pass, $check);
 
-    // 清理：只删本次自己创建的表，tag 先 item 后
+    // 清理：只删本次自己创建的表，version/tag 先 item 后
     try {
         dropOwnedTables($pdo);
-        $check->ok('清理：' . VerifyTag::table() . ' / ' . VerifyItem::table() . ' 已 DROP（仅本次创建）');
+        $check->ok('清理：' . VerifyVersionRecord::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyItem::table() . ' 已 DROP（仅本次创建）');
     } catch (PDOException $e) {
         $check->no('清理 DROP TABLE', $e->getMessage());
     }
@@ -1106,6 +1321,18 @@ function verifyOn(string $label, string $dsn, string $user, string $pass): Check
 // SQLite 兜底（两个库都连不上时，证明脚本断言逻辑正确）
 // ----------------------------------------------------------------------------
 
+/** 独立文件库支持两个 PDO；函数返回后两侧连接均释放，再删除本次临时文件。 */
+function runSqliteVersionScenarios(string $path, Check $check): void
+{
+    $pdo = new PDO('sqlite:' . $path);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $gateway = new EntityGateway(new PdoConnection($pdo));
+    Session::use($gateway);
+    createTables($pdo, 'sqlite');
+    runVersionScenarios('sqlite', 'sqlite:' . $path, '', '', $check, $gateway);
+    dropOwnedTables($pdo);
+}
+
 function verifySqliteFull(): Check
 {
     echo "==== SQLite 全量场景兜底（证明脚本逻辑正确；RETURNING 路径与 PG 同构）====\n";
@@ -1117,7 +1344,7 @@ function verifySqliteFull(): Check
         $check->assert((string) $one === '1', 'a. 连接 + SELECT 1');
 
         createTables($pdo, 'sqlite');
-        $check->ok('建表 ' . VerifyItem::table() . ' / ' . VerifyTag::table());
+        $check->ok('建表 ' . VerifyItem::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyVersionRecord::table());
 
         $rec = new RecordingConnection(new PdoConnection($pdo));
         $gateway = new EntityGateway($rec);
@@ -1125,9 +1352,23 @@ function verifySqliteFull(): Check
 
         runScenarios('sqlite', $pdo, $rec, $check);
         runComplexScenarios('sqlite', $pdo, $rec, $check);
+        $sqlitePath = tempnam(sys_get_temp_dir(), 'pixiaoka-orm-version-');
+        if (!is_string($sqlitePath)) {
+            $check->no('r. SQLite 双连接临时数据库', '无法创建临时文件');
+        } else {
+            try {
+                // 两个独立 PDO 必须连接同一个临时文件，不能用内存库作为其中一侧。
+                runSqliteVersionScenarios($sqlitePath, $check);
+            } finally {
+                Session::use($gateway);
+                gc_collect_cycles();
+                $check->assert(@unlink($sqlitePath), 'r23. 释放双连接后仅删除自己的 SQLite 临时文件');
+                $ownedTables = [VerifyItem::table(), VerifyTag::table(), VerifyVersionRecord::table()];
+            }
+        }
 
         dropOwnedTables($pdo);
-        $check->ok('清理：' . VerifyTag::table() . ' / ' . VerifyItem::table() . ' 已 DROP（仅本次创建）');
+        $check->ok('清理：' . VerifyVersionRecord::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyItem::table() . ' 已 DROP（仅本次创建）');
 
         echo "\n---- SQLite ORM 生成的 SQL 清单（去重）----\n";
         foreach ($rec->sqlList() as $sql) {
@@ -1149,7 +1390,8 @@ function verifySqliteFull(): Check
 $suffix = strtolower(bin2hex(random_bytes(4))); // 8 位十六进制
 VerifyItem::$tableName = 'orm_verify_item_' . $suffix;
 VerifyTag::$tableName = 'orm_verify_tag_' . $suffix;
-echo '本次验证表名: ' . VerifyItem::table() . ' / ' . VerifyTag::table() . "\n";
+VerifyVersionRecord::$tableName = 'orm_verify_version_' . $suffix;
+echo '本次验证表名: ' . VerifyItem::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyVersionRecord::table() . "\n";
 
 // .env 依序探测：库根 → webman 主项目（作为库在主项目内开发时复用其连接配置）
 $envCandidates = [

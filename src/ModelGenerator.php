@@ -8,6 +8,7 @@ use InvalidArgumentException;
 use Pixiaoka\Orm\Annotation\Column;
 use Pixiaoka\Orm\Annotation\CreatedAt;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
+use Pixiaoka\Orm\Annotation\Version;
 use Pixiaoka\Orm\Schema\SchemaInspector;
 use Pixiaoka\Orm\Schema\TableSchema;
 use Pixiaoka\Orm\Schema\TypeMapper;
@@ -125,6 +126,9 @@ final readonly class ModelGenerator
             }
             if ($this->types->phpType($column) === \DateTimeImmutable::class) {
                 $body .= "    #[Temporal]\n";
+            }
+            if (!$column->primary() && !$column->nullable && $column->name === 'version' && $this->types->phpType($column) === 'int') {
+                $body .= "    #[Version]\n";
             }
             if (!$column->primary() && in_array($this->types->phpType($column), ['int', \DateTimeImmutable::class], true)) {
                 if ($column->name === 'created_at') {

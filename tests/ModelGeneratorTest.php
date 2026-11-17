@@ -115,6 +115,52 @@ final class ModelGeneratorTest extends TestCase
         self::assertSame('updated_at', $meta->timestampField('updated_at')?->property);
     }
 
+    public function testNonNullableIntegerVersionGetsAnnotationAndImport(): void
+    {
+        $pdo = $this->sqlite();
+        $pdo->exec('CREATE TABLE versioned_item (id INTEGER PRIMARY KEY, body TEXT NOT NULL, version INTEGER NOT NULL)');
+        $table = (new SchemaInspector($pdo))->table('versioned_item');
+        $code = (new ModelGenerator($pdo))->render($table, 'GeneratedVersion\\Model');
+
+        self::assertStringContainsString('use Pixiaoka\\Orm\\Annotation\\Version;', $code);
+        self::assertSame(1, substr_count($code, '#[Version]'));
+        self::assertStringContainsString("#[Version]\n    public int \$version = 0;", $code);
+        $file = (new ModelGenerator($pdo))->generate($this->directory, 'GeneratedVersion\\Model', tables: ['versioned_item'])['generated']['versioned_item'];
+        $this->lint($file);
+        require $file;
+        $meta = (new MetadataReader())->read(\GeneratedVersion\Model\VersionedItem::class);
+        self::assertSame('version', $meta->versionField()?->property);
+        self::assertSame('version', $meta->versionField()?->column);
+    }
+
+    public function testOnlyEligibleVersionColumnIsAnnotatedAndImported(): void
+    {
+        $cases = [
+            'ordinary_revision' => [
+                'CREATE TABLE ordinary_revision (id INTEGER PRIMARY KEY, body TEXT NOT NULL, revision INTEGER NOT NULL)',
+                'public int $revision = 0;',
+            ],
+            'nullable_version' => [
+                'CREATE TABLE nullable_version (id INTEGER PRIMARY KEY, body TEXT NOT NULL, version INTEGER NULL)',
+                'public ?int $version;',
+            ],
+            'text_version' => [
+                'CREATE TABLE text_version (id INTEGER PRIMARY KEY, body TEXT NOT NULL, version TEXT NOT NULL)',
+                "public string \$version = '';",
+            ],
+        ];
+
+        foreach ($cases as $tableName => [$ddl, $property]) {
+            $pdo = $this->sqlite();
+            $pdo->exec($ddl);
+            $table = (new SchemaInspector($pdo))->table($tableName);
+            $code = (new ModelGenerator($pdo))->render($table, 'GeneratedVersion\\Model', 'IneligibleVersion');
+            self::assertStringContainsString($property, $code, $tableName);
+            self::assertStringNotContainsString('#[Version]', $code, $tableName . ' 不应自动声明乐观锁');
+            self::assertStringNotContainsString('use Pixiaoka\\Orm\\Annotation\\Version;', $code, $tableName . ' 不应导入 Version');
+        }
+    }
+
     public function testCompositePrimaryKeyKeepsConstraintOrderAndDefaults(): void
     {
         $pdo = $this->sqlite();

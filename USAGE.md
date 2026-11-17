@@ -158,6 +158,28 @@ public DateTimeImmutable $updated_unix; // DateTimeImmutable 也可存 Unix 秒
 
 模型生成器会为传统的 `created_at` / `updated_at` 自动附加时间角色注解，但仅当它们映射为 `int` 或可无损读取的 `DateTimeImmutable` 时；其他列名需自行添加上述注解。
 
+### 乐观锁：#[Version]
+
+```php
+use Pixiaoka\Orm\Annotation\Version;
+use Pixiaoka\Orm\Exception\OptimisticLockException;
+
+#[Column]
+#[Version]
+public int $revision;
+
+try {
+    $order->save(); // UPDATE 同时带完整主键与旧版本条件，数据库执行 revision = revision + 1
+} catch (OptimisticLockException $e) {
+    // 可读取 model / operation / expectedVersion；不会自动刷新、覆盖或重试。
+    $order->refresh();
+}
+```
+
+版本字段必须同时声明 `#[Column]`，类型是非空 `int`，每模型仅一个，不能兼任主键、生成列或自动时间字段。插入默认版本 `1`，显式 `0` 保留；负数与 `PHP_INT_MAX` 拒绝。删除同样带版本条件。影响行数不是 `1` 时抛异常，内存版本、快照和缓存不提前推进；无业务变化时不执行无意义的版本递增 UPDATE。不能手改版本属性绕过检查。
+
+带 `#[Version]` 的模型不支持 Builder 条件 UPDATE/DELETE 或 UPSERT（包括冲突忽略），这些操作缺少逐实体旧版本快照。`executeRaw()` 不自动加版本条件或处理冲突，需由调用方控制 SQL、影响行数以及 `refresh()` / `flushCache()`。生成器只对非空、非主键、列名恰为 `version` 的 `int` 字段自动添加 `#[Version]`，其他字段名请显式添加。
+
 ## 3. Active Record
 
 ### save() —— 智能插入/更新
@@ -493,6 +515,16 @@ User::transaction(function () {
 });
 ```
 
+最外层事务回滚会恢复当前 Gateway 已交付且仍存活实体的持久化字段、未初始化状态、`isNew()`、原始快照、版本与缓存身份，包括事务内首次从数据库读取的对象。同主键的多个对象恢复事务开始前的共同基线，缓存优先保留事务开始前的 canonical 对象，后查询副本不覆盖它。回滚后旧对象可直接保存，新插入对象可重新插入。
+
+新插入行的重复查询副本在回滚后也会失效，不能利用已读取的生成主键绕过插入保护。删除旧行后重插：若数据库复用旧主键，重插对象和查询副本恢复旧行基线；若分配新主键，则按事务新增行失效。非 `#[Column]` 业务属性和钩子的外部副作用不在恢复范围。
+
+只有数据库确认回滚成功，才恢复内存并透传业务异常。begin 返回 `false` 或抛异常、commit 失败、rollback 失败都按结果未知处理，抛 `TransactionException`；不能假定物理事务没有开始或提交。异常公开 `operation`（`开始` / `提交` / `回滚`）、`businessException` 和 `previous`。commit 失败不会被后续 rollback 失败覆盖；commit 已尝试后即使 rollback 成功也不恢复内存。
+
+事务结果未知后，禁止在原 `Connection` 上继续查询、写入、事务或通过另一个 Gateway/`Session::use()` 复用。必须丢弃连接、Gateway 和关联实体；`Session::discard()` 仍允许解除失败 Session。驱动 begin 之前的连接所有权冲突是确定的 `LogicException`，不会毒化连接。
+
+当前上下文有未结束事务时，`Session::use()` / `Session::scope()` 的隐式换绑会直接抛 `LogicException`，即使传入同一个 Gateway 也一样；不执行回滚、不清理事务状态、不释放连接所有权，原 Session 保持不变。必须先显式 `Session::discard()` 并处理回滚结果，不能把换绑当成静默清理事务的方式。
+
 ## 9. 生命周期钩子
 
 在 Entity 子类中覆盖钩子方法，实现业务逻辑：
@@ -546,7 +578,7 @@ $b = Asset::find(['user_id' => 1, 'key' => 'x']);
 
 - 查询结果也会写入缓存（`Builder::get()` 返回的实体）
 - `delete()` 后自动清退缓存
-- 事务回滚只清理由本事务写入的缓存 key
+- 事务回滚恢复事务开始时的 LRU 快照和 canonical 对象，再补齐缺失身份
 - 缓存在进程内有效，不跨进程
 
 ## 11. 脏跟踪
@@ -663,10 +695,40 @@ webman 的 `orm:gen` 只负责读取框架配置并调用同一库内 API，不�
 
 默认值边界详见 [README](README.md#generate-models-from-a-database)：PHP 8.3 不生成对象属性初始化；PostgreSQL 的 Unicode 转义按码点生成 UTF-8，原始高位字节按服务器编码转换。非 UTF-8 混合转义、SQL_ASCII、未知编码和非法序列均不猜测数据库默认值，而采用安全的 PHP 兜底值。
 
-## 14. 测试与真实数据库验收
+## 14. 可观测性
+
+```php
+use Pixiaoka\Orm\Observability\Event;
+use Pixiaoka\Orm\Observability\SqlEvent;
+use Pixiaoka\Orm\Observability\TransactionEvent;
+use Pixiaoka\Orm\Observability\SessionEvent;
+
+$unsubscribe = $gateway->subscribe(function (Event $event): void {
+    if ($event instanceof SqlEvent) {
+        // SQL、operation、model、durationMs、successful、parameterNames、
+        // affectedRows/resultRows、exceptionClass、context。
+    }
+    if ($event instanceof TransactionEvent) {
+        // 物理 begin/commit/rollback；嵌套事务不重复发出。
+    }
+    if ($event instanceof SessionEvent) {
+        // bind/discard/restore；successful 表示清理结果。
+    }
+});
+```
+
+也可传入实现 `EventListener::onEvent(Event $event): void` 的对象。返回的闭包可幂等取消订阅。监听器异常不会改变 SQL 或事务结果，默认不输出日志；同一 Dispatcher 重入时丢弃嵌套事件。无监听器时跳过事件构造和执行计时。
+
+观测回调不得重入同一连接执行 ORM 操作，也不得通过 `Session::use()`、`Session::scope()` 或 `Session::discard()` 换绑或清理当前业务 Session。独立连接的嵌套事件保留外层保护，不会提前放开这些限制。
+
+可以用完全独立的 Gateway/Connection 直接写观测库；独立写入不加入业务事务，也不保证与业务事务原子提交。直接调用 PDO/Connection 不属于 ORM 重入保护范围。`rollback successful=true` 仅表示回滚清理 API 成功，不证明之前失败的 commit 没有生效。
+
+`ContextInfo::$type` 为 root/fiber/coroutine，`$id` 是进程内上下文对象 `spl_object_id()`，不是跨请求或分布式追踪 ID。事件不包含参数值、查询结果、实体、连接、原异常对象、消息或堆栈；SQL 原文仍可能含手写字面量秘密，不能视为完全脱敏。只覆盖经过 Gateway 的 SQL、事务与 Session 操作，应用直接调用 PDO/Connection、SchemaInspector 不在范围内。可选 `Clock` 构造参数用于确定性计时测试。
+
+## 15. 测试与真实数据库验收
 
 ```bash
-# 库内完整测试：191 tests / 669 assertions（2 项显式 DSN 实连测试默认跳过）
+# PHP 8.3 完整测试：268 tests / 1356 assertions（2 项显式 DSN 实连测试默认跳过）
 vendor/bin/phpunit
 
 # SQLite / MySQL / PostgreSQL 实连；进程环境变量覆盖 .env
@@ -677,9 +739,9 @@ MySQL/PostgreSQL 推荐使用独立 Docker 测试实例，例如 `mysql:8.4`、`
 
 生成器另有 `tests/SchemaLiveTest.php`，只有显式设置 `PIXIAOKA_ORM_LIVE_MYSQL_DSN`、`PIXIAOKA_ORM_LIVE_PGSQL_DSN` 及对应 `_USER`、`_PASSWORD` 才连接外部数据库；默认跳过，不隐式读取本机服务或 `.env`。该测试使用原生预处理，覆盖主键、默认值、时间类型、生成文件 lint 和元数据，完整示例见 [README](README.md#模型生成器实连测试)。
 
-本次默认套件为 191 tests / 669 assertions；显式配置专用 MySQL/PostgreSQL 后为 191 tests / 717 assertions，零跳过。此前复杂查询内核已通过 SQLite 55 项、Docker MySQL 54 项、Docker PostgreSQL 57 项实连检查。
+本次 PHP 8.3 默认套件为 268 tests / 1356 assertions（2 项显式 DSN 实连测试跳过）；PHP 8.4/8.5 显式配置专用 MySQL/PostgreSQL 后均为 268 tests / 1404 assertions，零跳过。独立真实数据库脚本在 MySQL 8.4 通过 77 项、PostgreSQL 16 通过 80 项，合计 157 项，零失败，SQLite 兜底未执行。PHPStan 生产代码检查零错误；Swoole/Swow 真实扩展验收未执行。
 
-## 15. 项目集成示例
+## 16. 项目集成示例
 
 当前项目使用 PostgreSQL（见 `config/database.php`），一个典型的模型迁移：
 

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pixiaoka\Orm;
 
 use Pixiaoka\Orm\Exception\IdentityException;
+use Pixiaoka\Orm\Metadata\ModelMeta;
 use Pixiaoka\Orm\Query\Builder;
 use Pixiaoka\Orm\Query\Expression;
 
@@ -52,6 +53,42 @@ abstract class Entity
     public function takeOriginal(): array
     {
         return $this->ormOriginal;
+    }
+
+    /**
+     * @internal 事务边界保存完整持久化状态，包含字段的未初始化状态。
+     * @return array{new: bool, original: array<string, mixed>, values: array<string, mixed>}
+     */
+    public function captureState(ModelMeta $meta): array
+    {
+        $values = [];
+        foreach ($meta->fields as $field) {
+            if ($this->propSet($field->property)) {
+                $values[$field->property] = $this->{$field->property};
+            }
+        }
+
+        return ['new' => $this->ormNew, 'original' => $this->ormOriginal, 'values' => $values];
+    }
+
+    /**
+     * @param array{new: bool, original: array<string, mixed>, values: array<string, mixed>} $state
+     * @param ModelMeta $meta
+     * @throws \ReflectionException
+     * @internal 只在物理事务回滚时恢复，不能用于普通业务赋值。
+     */
+    public function restoreState(array $state, ModelMeta $meta): void
+    {
+        foreach ($meta->fields as $field) {
+            $property = new \ReflectionProperty($this, $field->property);
+            if (array_key_exists($field->property, $state['values'])) {
+                $this->{$field->property} = $state['values'][$field->property];
+            } elseif ($property->isInitialized($this)) {
+                unset($this->{$field->property});
+            }
+        }
+        $this->ormNew = $state['new'];
+        $this->ormOriginal = $state['original'];
     }
 
     /** 只改过的字段才进入 UPDATE。 */
