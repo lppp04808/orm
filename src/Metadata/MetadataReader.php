@@ -11,9 +11,14 @@ use Pixiaoka\Orm\Cast\Decimal;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
 use Pixiaoka\Orm\Annotation\Temporal;
 use Pixiaoka\Orm\Annotation\Version;
+use Pixiaoka\Orm\Annotation\BelongsTo;
+use Pixiaoka\Orm\Annotation\HasMany;
+use Pixiaoka\Orm\Annotation\HasOne;
+use Pixiaoka\Orm\Annotation\Relation as RelationAnnotation;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Exception\MetadataException;
 use ReflectionClass;
+use ReflectionMethod;
 use ReflectionNamedType;
 use ReflectionProperty;
 
@@ -24,6 +29,12 @@ final class MetadataReader
 {
     /** @var array<class-string, ModelMeta> */
     private array $cache = [];
+
+    /** @var array<class-string, array<string, RelationMeta>> */
+    private array $relationCache = [];
+
+    /** @var array<class-string, true> 第一次使用关系时一次性校验全部声明。 */
+    private array $validatedRelations = [];
 
     /**
      * @param class-string<Entity> $class
@@ -95,6 +106,89 @@ final class MetadataReader
             $timestamps,
             $this->version($class, $reflection, $byProperty, $timestamps),
         );
+    }
+
+    /** @return array<string, RelationMeta> 只有显式加载或 Relation::get() 时才解析关系。 */
+    public function relations(string $class): array
+    {
+        if (isset($this->relationCache[$class])) {
+            return $this->relationCache[$class];
+        }
+        $this->read($class);
+        $reflection = new ReflectionClass($class);
+        $relations = [];
+        $kinds = [HasOne::class => 'hasOne', HasMany::class => 'hasMany', BelongsTo::class => 'belongsTo'];
+        foreach ($reflection->getMethods(ReflectionMethod::IS_PUBLIC) as $method) {
+            $found = [];
+            $name = $method->getName();
+            $declaredKinds = [];
+            foreach ($kinds as $annotation => $kind) {
+                $attributes = $method->getAttributes($annotation);
+                if ($attributes === []) {
+                    continue;
+                }
+                $declaredKinds[] = $kind;
+                if (count($attributes) > 1) {
+                    throw new MetadataException("$class::$name 不能重复声明关系 $kind");
+                }
+                $found[] = [$annotation, $kind, $attributes[0]];
+            }
+            if ($found === []) {
+                continue;
+            }
+            if (count($found) > 1) {
+                throw new MetadataException(
+                    "$class::$name 不能同时声明多种关系 " . implode('、', $declaredKinds),
+                );
+            }
+            if ($method->isStatic() || $method->getNumberOfRequiredParameters() > 0
+                || $method->getNumberOfParameters() > 0) {
+                throw new MetadataException("$class::$name 关系方法必须是无参数 public 实例方法");
+            }
+            $type = $method->getReturnType();
+            $expected = $kinds[$found[0][0]];
+            $relationClass = match ($expected) {
+                'hasOne' => \Pixiaoka\Orm\Relation\HasOne::class,
+                'hasMany' => \Pixiaoka\Orm\Relation\HasMany::class,
+                'belongsTo' => \Pixiaoka\Orm\Relation\BelongsTo::class,
+            };
+            if (!$type instanceof ReflectionNamedType || $type->getName() !== $relationClass) {
+                throw new MetadataException("$class::$name 返回类型必须声明为 $relationClass");
+            }
+            /** @var RelationAnnotation $annotation */
+            $annotation = $found[0][2]->newInstance();
+            if (!is_subclass_of($annotation->target, Entity::class)) {
+                throw new MetadataException("$class::$name target 必须继承 " . Entity::class);
+            }
+            $relations[$name] = RelationMeta::from(
+                $name,
+                $class,
+                $this->read($class),
+                $this->read($annotation->target),
+                $annotation,
+                $found[0][1],
+            );
+        }
+
+        return $this->relationCache[$class] = $relations;
+    }
+
+    /** 只有进入关系功能才扫描并验证所有关系声明，普通 CRUD 不付这笔成本。 */
+    public function assertRelational(string $class): void
+    {
+        if (isset($this->validatedRelations[$class])) {
+            return;
+        }
+        $this->relations($class);
+        $this->validatedRelations[$class] = true;
+    }
+
+    public function relation(string $class, string $name): RelationMeta
+    {
+        $this->assertRelational($class);
+
+        return $this->relationCache[$class][$name]
+            ?? throw new MetadataException($class . ' 未声明关系 ' . $name);
     }
 
     /**

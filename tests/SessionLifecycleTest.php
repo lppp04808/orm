@@ -15,6 +15,7 @@ use Pixiaoka\Orm\Gateway\EntityGateway;
 use Pixiaoka\Orm\Gateway\PdoConnection;
 use Pixiaoka\Orm\Session;
 use Pixiaoka\Orm\SessionScope;
+use Pixiaoka\Orm\Context;
 
 final class SessionLifecycleTest extends TestCase
 {
@@ -389,28 +390,40 @@ final class SessionLifecycleTest extends TestCase
 
     public function testDestroyedFiberDoesNotReuseTransactionContext(): void
     {
-        $fiber = new \Fiber(function (): int {
-            Session::use($this->rootGateway);
-            $id = spl_object_id(\Fiber::getCurrent());
-            LifecycleRecord::transaction(static fn (): null => null);
+        $gateway = $this->rootGateway;
+        $rootContext = Session::context();
+        // 每个 Fiber 在一个短生命周期局部闭包中创建并彻底释放，避免测试闭包捕获 $this 改变分配顺序。
+        $allocate = static function () use ($gateway): array {
+            $fiber = new \Fiber(static function () use ($gateway): array {
+                Session::use($gateway);
+                $context = Context::fiber(\Fiber::getCurrent());
+                $id = spl_object_id(\Fiber::getCurrent());
+                LifecycleRecord::transaction(static fn (): null => null);
 
-            return $id;
-        });
-        $fiber->start();
-        $oldId = $fiber->getReturn();
-        unset($fiber);
-        gc_collect_cycles();
+                return [$id, $context];
+            });
+            $fiber->start();
+            $result = $fiber->getReturn();
+            unset($fiber);
+            gc_collect_cycles();
 
-        $replacement = new \Fiber(function (): int {
-            Session::use($this->rootGateway);
-            $id = spl_object_id(\Fiber::getCurrent());
-            LifecycleRecord::transaction(static fn (): null => null);
+            return $result;
+        };
+        $numericIds = [];
+        $contexts = [];
+        for ($attempt = 0; $attempt < 128; $attempt++) {
+            [$id, $context] = $allocate();
+            self::assertFalse(in_array($context, $contexts, true), 'Context 必须按 Fiber 对象身份隔离');
+            if (isset($numericIds[$id])) {
+                self::assertNotSame($numericIds[$id], $context, '数字 ID 复用不得复用旧事务 Context');
+                self::assertSame($rootContext, Session::context(), '已完成 Fiber 不得改变根执行上下文');
 
-            return $id;
-        });
-        $replacement->start();
-        self::assertTrue($replacement->isTerminated());
-        self::assertSame($oldId, $replacement->getReturn(), 'PHP 应复用已销毁 Fiber 的数字 ID，以覆盖对象身份防护');
+                return;
+            }
+            $numericIds[$id] = $context;
+            $contexts[] = $context;
+        }
+        self::fail('128 次独立分配/释放后仍未覆盖 Fiber 数字 ID 复用，请检查测试前提');
     }
 
     public function testLegacyFiberRootFallbackRemainsOptInCompatible(): void

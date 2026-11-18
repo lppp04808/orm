@@ -193,6 +193,77 @@ try {
 
 结果未知时禁止复用该 `Connection`，包括通过另一个 Gateway、原生 SQL 或 `Session::use()` 再次使用；应丢弃连接、Gateway 和关联实体。`Session::discard()` 仍可解绑失败 Session。驱动 begin 之前的连接所有权冲突属于确定的 `LogicException`，不会毒化连接。
 
+### 只读关系与显式预加载
+
+在 public 无参数实例方法上用 `#[HasOne]`、`#[HasMany]` 或 `#[BelongsTo]` 声明关系，返回类型使用对应的 `Pixiaoka\Orm\Relation` 类。`localKey` 是当前模型键，`foreignKey` 是目标模型键；均可使用属性名或真实列名。省略时使用该侧主键，复合键按数组顺序一一对应，两侧的 PHP 类型及时间存储格式必须一致。
+
+```php
+use Pixiaoka\Orm\Annotation\BelongsTo;
+use Pixiaoka\Orm\Annotation\HasMany;
+use Pixiaoka\Orm\Relation\BelongsTo as BelongsToQuery;
+use Pixiaoka\Orm\Relation\HasMany as HasManyQuery;
+
+final class Customer extends Entity
+{
+    #[Column, PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public string $name;
+
+    public static function table(): string { return 'customer'; }
+
+    #[HasMany(target: Order::class, foreignKey: ['customer_id'])]
+    public function orders(): HasManyQuery { return $this->makeRelation(); }
+}
+
+final class Order extends Entity
+{
+    #[Column, PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public ?int $customer_id = null;
+
+    public static function table(): string { return 'order'; }
+
+    #[BelongsTo(target: Customer::class, localKey: ['customer_id'])]
+    public function customer(): BelongsToQuery { return $this->makeRelation(); }
+}
+
+// 显式关系查询；不会自动设置 customer 实体的已加载关系状态。
+$orders = $customer->orders()->get();
+$paid = $customer->orders()->query(
+    Order::query()->where('status', 'paid')->orderBy('amount', 'DESC'),
+)->get();
+$first = $customer->orders()->first(); // LIMIT 1；未指定排序时按目标主键升序选择
+
+// 每层每个关系使用独立批量 SELECT，不用 JOIN 水合实体。
+$customers = Customer::query()
+    ->with('profile', 'orders')
+    ->get();
+
+$customers = Customer::query()->with([
+    'orders' => fn ($query) => $query->where('status', 'paid'),
+    'orders.customer',
+])->get();
+
+// 已读实体可显式加载或重新加载关系。
+$customer->load('orders');
+$customer->relationLoaded('orders');      // 区分未加载、null 和空数组
+$orders = $customer->loadedRelation('orders'); // 未加载时抛异常，不隐式查库
+```
+
+关系约束只允许 WHERE/OR 和排序。显式关系查询保留用户排序优先级，并在尚未按目标主键排序时追加主键升序决胜条件；`hasOne` 多候选记录与 `belongsTo` 非唯一目标键由同一规则稳定选择，`first()` 仍只取第一行。预加载依次补齐目标关联键和目标主键，用户排序仍在前；与完整主键重叠的关联键不会重复追加排序。不按“每个父模型前 N 条”解释全局 LIMIT。预加载拒绝全局 `limit/offset`、投影、JOIN、GROUP/HAVING、UNION、派生表、DISTINCT、别名、行锁，以及约束闭包内再次 `with/load`。普通 `Builder::first()` 没有关系语义，不自动补主键排序。
+
+关联键未初始化会拒绝查询；任一键为 `null` 时返回 `null` 或空数组，不执行关系 SQL。空主结果也不执行预加载。复合键采用参数化 OR-of-AND 元组条件，按最多 1000 个关系参数分批，不会把不同租户错误组合。
+
+关系值不进入 `toArray()`，不参与字段 dirty tracking，也不会自动保存或删除。`save()` 保留已加载关系，`refresh()` 和 `delete()` 清空它们。当前只提供 `hasOne`、`hasMany`、`belongsTo`；不包含多对多、自动级联写入、`whereHas()`、`withCount()` 或隐式属性懒加载。
+
+预加载不是数据库原子快照；需要一致快照时应在数据库事务和相应隔离级别内读取。普通 `query()` 仍返回独立对象副本，不是全局 identity map；单次关系图按目标主键去重，嵌套反向关系可复用本次主查询对象。关系图成功后才统一发布缓存和关系状态，失败会恢复字段、原值、关系和缓存身份；事务回滚同样恢复关系状态。刷新已缓存目标时保留本地未保存字段，只更新未修改字段及持久化原值；依赖已变化持久化关联键的旧关系会精确失效，本图待安装的新关系在成功后替换它，未受影响的关系继续保留。
+
+实体首次进入 ORM 持久化/读取路径后，以弱引用记录其 `EntityGateway`。`discard()` 后重新登记同一个 Gateway，仍可继续 `save()`、`refresh()`、`delete()`、`load()` 和显式关系查询；切换到另一个 Gateway 则拒绝隐式跨连接，请在新连接上重新查询。实体数据库操作仍必须显式选择 Session；原 Gateway 已销毁后，数据库操作和 `toArray()` 明确报错，不会自动绑定新连接。静态模型查询和静态原生 SQL 由当前 Session 选择连接；`loadedRelation()` 只读已加载内存、不查询，无需 Session。
+
+弱归属不等于整个对象图立即释放：Gateway 的 `RowCache` 强持有 LRU 内的实体，已加载关系也持有相关实体。连接池每次借出需要完全隔离时，应创建新的 Gateway；归还前丢弃该 Gateway、清理其缓存及外部实体/关系图引用，不能只释放一个 Entity 变量。
+
 ### Active Record
 
 ```php
@@ -314,7 +385,15 @@ Asset::insertAll([
     ['user_id' => 1, 'key' => 'a', 'val' => 1],
     ['user_id' => 2, 'key' => 'b', 'val' => 2],
 ]);
+```
 
+`insertAll()` 可混合数组和 Entity，SQL 严格保留原始行序，并按最多 500 行及绑定参数上限分块。首条 INSERT 前会完成整批字段存在性、类型转换、版本值、实体新旧状态、模型和 Gateway 归属检查，以及 Entity 前置钩子与最终值物化；因此第 501 行等后续坏输入也不会让前一块先行写入。钩子可以补齐必填字段，每个 Entity 的前置钩子只执行一次。
+
+预检失败不会给尚未绑定的 Entity 留下 Gateway 归属，也不会标记 persisted、执行后置钩子或发布缓存；已经执行的前置钩子、自动时间/版本填值及其外部副作用不由预检失败隐式撤销。所有 SQL 成功后按原始行索引回填生成键并执行后置钩子。数据库约束冲突、SQL/连接错误、生成键回填或后置钩子失败不承诺自动原子撤销；需要整批原子性时请使用显式事务。事务回滚会恢复实体在前置钩子及自动填值之前的持久化字段、未初始化状态、生成键、版本和缓存身份，但不撤销非字段业务属性或外部副作用。
+
+MySQL 不支持 `INSERT ... RETURNING`，因此多行批次中只要含带生成键的 Entity，就会在运行钩子及 SQL 前拒绝，避免不可靠的批量 ID 回填；纯数组行仍可批量插入。
+
+```php
 // 事务：嵌套只在外层提交/回滚；协程上下文（Fiber/Swoole/Swow）事务状态互相隔离
 Asset::transaction(function (): void {
     // ...
@@ -402,13 +481,13 @@ SQLite 不允许多个未提交写事务并行；独立 PDO 的 Fiber 测试验�
 ```bash
 composer install
 composer analyse            # PHPStan 生产代码静态分析
-composer test               # PHP 8.3：268 tests / 1356 assertions；2 项外部 DSN 测试默认跳过
+composer test               # PHP 8.3：318 tests / 10654 assertions；2 项外部 DSN 测试默认跳过
 
 # 实连脚本：进程环境变量覆盖 .env；两个真实库均不可达时自动 SQLite 兜底
 php -d extension=pdo_sqlite -d extension=pdo_pgsql -d extension=pdo_mysql tests/orm_live_verify.php
 ```
 
-本次 PHP 8.3 验收：默认 SQLite 套件 268 tests / 1356 assertions（含生成器、生命周期、事务失败矩阵、乐观锁和观测边界，2 项显式 DSN 测试跳过）；PHPStan 生产代码分析零告警。PHP 8.4/8.5 显式配置专用 MySQL/PostgreSQL 后均为 268 tests / 1404 assertions，零跳过；独立实连脚本在 MySQL 8.4、PostgreSQL 16（alpine）中分别通过 77 项和 80 项，合计 157 项，零失败，SQLite 兜底未执行。CI 配置 PHP 8.3/8.4/8.5 与双库服务测试；Swoole/Swow 真实扩展验收未执行，Fiber 测试不代替这些运行时验证。
+本次只读关系阶段的本机 PHP 8.3 默认 SQLite 套件为 318 tests / 10654 assertions，2 项显式 DSN 测试跳过；独立 SQLite 实连通过 118 项、零失败，并验证 1001 个不同复合关系键分三批查询及测试表元数据清理。显式双库 DSN 下完整套件为 318 tests / 10702 assertions；MySQL 8.4.13 实连通过 96 项、PostgreSQL 16.16 通过 99 项，均零失败。Docker PHP 8.3.36、8.4.27、8.5.12 均完成同一默认套件。PHPStan 生产代码分析零告警。CI 继续核验 PHP 8.3/8.4/8.5、Composer、lint 与双库服务测试；Swoole/Swow 真实扩展验收未执行，Fiber 测试不代替这些运行时验证。
 
 ### Docker 复验
 
@@ -431,7 +510,7 @@ DB_MYSQL_NAME=orm_test DB_MYSQL_USER=root DB_MYSQL_PASSWORD=local-only-password 
 php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql tests/orm_live_verify.php
 ```
 
-脚本为每次运行创建带随机后缀的两张表，只删除本次登记的表。执行完成后请自行停止并删除上述专用容器；不要复用其他业务容器。SQLite 结果不能代替 MySQL/PostgreSQL 的真实执行结论。
+脚本为每次运行创建带随机后缀的独立测试表，按 PDO 登记并只删除该连接创建的表。执行完成后请自行停止并删除上述专用容器；不要复用其他业务容器。SQLite 结果不能代替 MySQL/PostgreSQL 的真实执行结论。
 
 ### 模型生成器实连测试
 

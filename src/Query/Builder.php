@@ -68,6 +68,8 @@ final class Builder
     private ?int $limit = null;
     private ?string $lockMode = null;
 
+    /** @var array<int|string, mixed> 显式只读关系预加载，不参与 SQL 生成。 */
+    private array $eagerRelations = [];
     /** 嵌套 UNION 作为另一复合查询的分支时，必须隔离分支边界和顶层排序分页。 */
     private bool $nestedUnion = false;
 
@@ -306,9 +308,17 @@ final class Builder
         return $this;
     }
 
-    /** @return $this */
-    public function whereRaw(string $sql, array $params = []): self
+    /** 接收由框架组件生成的命名参数表达式，或调用方显式 SQL 片段。 @return $this */
+    public function whereRaw(string|Expression $sql, array $params = []): self
     {
+        if ($sql instanceof Expression) {
+            if ($params !== []) {
+                throw new InvalidArgumentException('Expression 已携带参数，不要再传 $params');
+            }
+            $this->where[] = ['column' => '', 'operator' => 'RAW', 'value' => $sql];
+
+            return $this;
+        }
         $this->where[] = ['column' => '', 'operator' => 'RAW', 'value' => new Expression($sql, $params)];
 
         return $this;
@@ -462,6 +472,57 @@ final class Builder
         return $this;
     }
 
+    // ==================== 只读关系 ====================
+
+    /**
+     * 每个关系使用独立批量查询，不拼接 JOIN 到主查询。
+     * 支持 'orders'、'orders.customer'、['orders', 'customer'] 和 ['orders' => 约束闭包]。
+     * 约束仅允许 WHERE/OR 与排序；批量分页不是每父模型分页，明确拒绝。
+     *
+     * @param string|array<int|string, mixed> $relations
+     * @return $this
+     */
+    public function with(string|array $relations, string ...$more): self
+    {
+        $this->eagerRelations[] = $relations;
+        foreach ($more as $relation) {
+            $this->eagerRelations[] = $relation;
+        }
+
+        return $this;
+    }
+
+    /** @internal 关系子查询只在整棵关系图成功后发布，不能提前覆盖缓存身份。 @return list<T> */
+    public function withoutCache(): array
+    {
+        $this->assertHydratable();
+
+        return $this->gateway->executeQuery($this->class, $this->build(), cache: false);
+    }
+
+    /** @internal 关系 Loader 只读检查，不改变查询。 */
+    public function relationShape(): array
+    {
+        return [
+            'projection' => $this->projection !== [],
+            'joins' => $this->joins !== [],
+            'groupBy' => $this->groupBy !== [],
+            'having' => $this->having !== [],
+            'unions' => $this->unions !== [],
+            'derivedFrom' => $this->derivedFrom !== null,
+            'distinct' => $this->distinct,
+            'alias' => $this->tableAlias !== null,
+            'lock' => $this->lockMode !== null,
+            'limit' => $this->limit,
+            'offset' => $this->offset,
+            'order' => array_values(array_filter(array_map(
+                static fn (array $order): ?string => $order['kind'] === 'column' ? $order['column'] : null,
+                $this->orderBy,
+            ))),
+            'relations' => $this->eagerRelations,
+        ];
+    }
+
     // ==================== 执行 ====================
 
     /** @return list<T> */
@@ -469,7 +530,7 @@ final class Builder
     {
         $this->assertHydratable();
 
-        return $this->gateway->executeQuery($this->class, $this->build());
+        return $this->gateway->executeQuery($this->class, $this->build(), $this->eagerRelations);
     }
 
     /** @return T|null */
@@ -479,7 +540,7 @@ final class Builder
         $clone = clone $this;
         $clone->limit = 1;
 
-        return $this->gateway->executeQueryOne($this->class, $clone->build());
+        return $this->gateway->executeQueryOne($this->class, $clone->build(), $this->eagerRelations);
     }
 
     /**
@@ -489,12 +550,15 @@ final class Builder
      */
     public function rows(): array
     {
+        $this->assertNoEagerRelations('rows()');
+
         return $this->gateway->executeRows($this->class, $this->build());
     }
 
     /** 单行原始结果（强制 LIMIT 1 clone）。 */
     public function row(): ?array
     {
+        $this->assertNoEagerRelations('row()');
         $clone = clone $this;
         $clone->limit = 1;
 
@@ -504,6 +568,7 @@ final class Builder
     /** 标量值（COUNT/SUM/单值列）。$column 指定返回列，null 取首列。 */
     public function value(?string $column = null): mixed
     {
+        $this->assertNoEagerRelations('value()');
         $clone = clone $this;
         $clone->limit = 1;
 
@@ -512,6 +577,8 @@ final class Builder
 
     public function count(string $column = '*'): int
     {
+        $this->assertNoEagerRelations('count()');
+
         return $this->gateway->executeCountQuery($this->countSql($column));
     }
 
@@ -531,6 +598,12 @@ final class Builder
     public function modelClass(): string
     {
         return $this->class;
+    }
+
+    /** @internal 关系约束只能在同一个数据库连接上执行。 */
+    public function gateway(): EntityGateway
+    {
+        return $this->gateway;
     }
 
     // ==================== SQL 构建 ====================
@@ -1077,8 +1150,16 @@ final class Builder
         }
     }
 
+    private function assertNoEagerRelations(string $operation): void
+    {
+        if ($this->eagerRelations !== []) {
+            throw new InvalidArgumentException($operation . ' 不支持 with() 预加载；请使用实体 get()/first()');
+        }
+    }
+
     private function assertWritable(): void
     {
+        $this->assertNoEagerRelations('UPDATE/DELETE');
         if ($this->joins !== [] || $this->groupBy !== [] || $this->having !== []
             || $this->unions !== [] || $this->derivedFrom !== null || $this->tableAlias !== null
             || $this->projection !== [] || $this->distinct || $this->orderBy !== []

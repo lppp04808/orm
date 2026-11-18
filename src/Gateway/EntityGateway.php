@@ -18,6 +18,7 @@ use Pixiaoka\Orm\Identity\Identity;
 use Pixiaoka\Orm\Metadata\FieldMeta;
 use Pixiaoka\Orm\Metadata\MetadataReader;
 use Pixiaoka\Orm\Metadata\ModelMeta;
+use Pixiaoka\Orm\Metadata\RelationMeta;
 use Pixiaoka\Orm\Observability\Clock;
 use Pixiaoka\Orm\Observability\ContextInfo;
 use Pixiaoka\Orm\Observability\EventDispatcher;
@@ -28,6 +29,7 @@ use Pixiaoka\Orm\Observability\TransactionEvent;
 use Pixiaoka\Orm\Observability\SessionEvent;
 use Pixiaoka\Orm\Query\Builder;
 use Pixiaoka\Orm\Query\Expression;
+use Pixiaoka\Orm\Relation\Loader;
 use Pixiaoka\Orm\Session;
 
 final class EntityGateway
@@ -62,6 +64,8 @@ final class EntityGateway
 
     private readonly Clock $clock;
 
+    private readonly Loader $relations;
+
     /** @var \WeakMap<Connection, string> 开始、提交或回滚结果未知后，连接及所有 Gateway 都不可复用。 */
     private static ?\WeakMap $failedConnections = null;
 
@@ -84,6 +88,7 @@ final class EntityGateway
         $this->txnStartedAt = new \WeakMap();
         $this->events = new EventDispatcher();
         $this->clock = $clock ?? new SystemClock();
+        $this->relations = new Loader($this);
     }
 
     /** 无监听器时只保留一次空列表判断；返回的闭包可幂等取消订阅。 */
@@ -122,6 +127,136 @@ final class EntityGateway
         return $this->connection->quoteIdentifier($identifier);
     }
 
+    public function relation(string $class, string $name): RelationMeta
+    {
+        return $this->metadata->relation($class, $name);
+    }
+
+    /** @internal @return array<string, RelationMeta> */
+    public function relationDefinitions(string $class): array
+    {
+        return $this->metadata->relations($class);
+    }
+
+    /** @internal 禁止把一个 Gateway 的实体交给另一个连接隐式查询。 */
+    public function assertSame(EntityGateway $gateway, string $operation): void
+    {
+        if ($this !== $gateway) {
+            throw new \InvalidArgumentException($operation . '必须使用同一个 EntityGateway');
+        }
+    }
+
+    /** @internal 关系图优先复用本次主查询对象，其次复用 canonical 缓存对象。 */
+    public function relationTarget(string $class, array $identity): ?Entity
+    {
+        return $this->cache->get($class, $identity);
+    }
+
+    /** @internal 将 Loader 已按主键顺序转换的值映射为 RowCache 的列身份。 */
+    public function relationIdentity(string $class, array $values): array
+    {
+        $identity = [];
+        $primary = $this->meta($class)->primaryKey;
+        if (count($primary) !== count($values)) {
+            throw new \LogicException($class . ' 的关系目标主键不完整');
+        }
+        foreach ($primary as $index => $field) {
+            if (!array_key_exists($index, $values) || (!is_scalar($values[$index]) && $values[$index] !== null)) {
+                throw new \LogicException($class . ' 的关系目标主键必须是完整标量元组');
+            }
+            $identity[$field->column] = $values[$index];
+        }
+
+        return $identity;
+    }
+
+    /** @internal 只为失败恢复创建快照，不因此引入普通查询的 identity map。 */
+    public function relationCacheSnapshot(): array
+    {
+        return $this->cache->transactionSnapshot();
+    }
+
+    /** @internal 整棵关系树成功后才允许发布目标，子查询本身不修改缓存。 */
+    public function loadRelations(array $entities, string|array $relations): void
+    {
+        if ($entities !== []) {
+            $this->metadata->assertRelational($entities[0]::class);
+        }
+        foreach ($entities as $entity) {
+            $this->forEntity($entity);
+        }
+        $this->relations->load($entities, $relations);
+    }
+
+    /** @internal 在任何字段或关系合并前登记事务基线，而不是登记已经合并的新状态。 */
+    public function recordRelationState(Entity $entity): void
+    {
+        $this->rememberEntity($entity);
+    }
+
+    /** @internal 成功时登记旧状态供事务回滚，再把关系目标设为 canonical 缓存对象。 */
+    public function publishRelationTarget(Entity $entity): void
+    {
+        $this->rememberEntity($entity);
+        $this->cacheSet($entity);
+    }
+
+    /** @internal 首次接触实体时建立弱归属，后续禁止跨连接或过期隐式换绑。 */
+    public function forEntity(Entity $entity): self
+    {
+        if (!$entity->hasGatewayBinding()) {
+            $entity->bindGateway($this);
+        } else {
+            $bound = $entity->boundGateway()
+                ?? throw new \LogicException($entity::class . ' 原 Gateway 已销毁，请在新 Gateway 上显式重查');
+            $this->assertSame($bound, '实体操作');
+        }
+
+        return $this;
+    }
+
+    /** @internal 失败关系图只恢复快照，不能把查询失败的实体当成新数据发布。 */
+    public function restoreRelationCache(array $snapshot): void
+    {
+        $this->cache->restoreSnapshot($snapshot);
+    }
+
+    /** @internal 关系条件作为隔离 SQL 片段参与 Builder 的正常参数重编号。 */
+    public function constrainRelation(array $fields, array $values): Expression
+    {
+        if (count($fields) !== count($values)) {
+            throw new \LogicException('关系键和值数量不一致');
+        }
+        $parts = [];
+        $params = [];
+        foreach ($fields as $index => $field) {
+            $name = 'relation_' . $index;
+            $parts[] = $this->quote($field->column) . ' = :' . $name;
+            $params[$name] = $values[$index];
+        }
+
+        return new Expression(implode(' AND ', $parts), $params);
+    }
+
+    /** @internal 元组条件仅由受控列标识符和命名占位符组成。 */
+    public function constrainRelationTuples(array $fields, array $tuples): Expression
+    {
+        $params = [];
+        $groups = [];
+        $index = 0;
+        foreach ($tuples as $tuple) {
+            $parts = [];
+            foreach ($fields as $offset => $field) {
+                $name = 'relation_' . $index++;
+                $parts[] = $this->quote($field->column) . ' = :' . $name;
+                $params[$name] = $tuple[$offset];
+            }
+            $groups[] = '(' . implode(' AND ', $parts) . ')';
+        }
+
+        return new Expression('(' . implode(' OR ', $groups) . ')', $params);
+    }
+
     /** 只有方言相关操作才要求连接显式提供驱动，保持旧 Connection 装饰器兼容。 */
     public function driver(): string
     {
@@ -136,6 +271,7 @@ final class EntityGateway
 
     public function insert(Entity $entity): void
     {
+        $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
         $generated = $meta->generatedField();
         $this->rememberEntity($entity);
@@ -190,7 +326,7 @@ final class EntityGateway
         }
 
         if ($generated === null) {
-            $entity->markPersisted();
+            $entity->markPersisted($this);
             $entity->afterSave();
             $entity->afterInsert();
             $this->rememberEntity($entity);
@@ -204,7 +340,7 @@ final class EntityGateway
         }
 
         $entity->{$generated->property} = $this->caster->toPhp($meta->class, $generated, $id);
-        $entity->markPersisted();
+        $entity->markPersisted($this);
         $entity->afterSave();
         $entity->afterInsert();
         $this->rememberEntity($entity);
@@ -235,58 +371,120 @@ final class EntityGateway
         }
 
         $rows = array_values($rows);
-        $entityCount = 0;
-        foreach ($rows as $row) {
-            if ($row instanceof Entity) {
-                $entityCount++;
+        $entities = [];
+        $prepared = [];
+        $now = time();
+        // 数组值、实体类型、新旧状态和归属先预检；失败批次不提前绑定新实体。
+        foreach ($rows as $index => $row) {
+            if (!$row instanceof Entity) {
+                $prepared[$index] = $this->prepareBatchRow($meta, $fieldList, $row, $now);
+                continue;
             }
+            if (!$row instanceof $class) {
+                throw new \InvalidArgumentException('批量插入实体必须是 ' . $class . '，收到 ' . $row::class);
+            }
+            if (!$row->isNew()) {
+                throw new IdentityException($row::class . ' 已经在库里，不能再批量 insert');
+            }
+            if ($row->hasGatewayBinding()) {
+                $bound = $row->boundGateway()
+                    ?? throw new \LogicException($row::class . ' 原 Gateway 已销毁，请在新 Gateway 上显式重查');
+                $this->assertSame($bound, '批量插入');
+            }
+            $entities[$index] = $row;
         }
 
-        // P0-3：多行实体 + 生成列时，RETURNING 是唯一可靠的批量回填途径。
-        // 不支持 RETURNING 的连接（mysql）下 lastInsertId 只反映最后一行，回填会串号。
-        if ($generated !== null && $entityCount > 0 && count($rows) > 1 && !$this->connection->supportsReturning()) {
+        // P0-3：多行含实体 + 生成列时，RETURNING 是唯一可靠的批量回填途径。
+        if ($generated !== null && $entities !== [] && count($rows) > 1 && !$this->connection->supportsReturning()) {
             throw new IdentityException(
                 $meta->class . ' 该连接不支持 RETURNING，无法批量回填生成列，请逐行 insert',
                 true,
             );
         }
 
-        // P1-4：分块。块大小同时受行数（500）与占位符上限（65535）约束。
-        $columnCount = count($fieldList);
-        $chunkSize = max(1, min(500, intdiv(65535, max(1, $columnCount))));
+        // 钩子可以补必填字段，但必须在首条 SQL 前完成整批最终值物化。
+        // 事务内先保存钩子及自动填值之前的新实体基线；预检失败不假装撤销业务副作用。
+        foreach ($entities as $index => $row) {
+            $this->rememberEntity($row);
+            $this->fillTimestamp($row, $meta, 'created_at');
+            $this->fillTimestamp($row, $meta, 'updated_at');
+            $this->fillVersion($row, $meta);
+            $row->beforeSave();
+            $row->beforeInsert();
+            $prepared[$index] = $this->prepareBatchRow($meta, $fieldList, $row, $now);
+        }
+        ksort($prepared);
 
-        // P0-3：RETURNING 时按块收集生成列值，行序与 $rows 一一对应
+        // SQL 严格保留原始混批行序。RETURNING 的每个结果仍对应全局原始索引，
+        // 所有 SQL 成功后才按输入顺序回填实体、执行后置钩子和发布缓存。
+        $chunkSize = max(1, min(500, intdiv(65535, max(1, count($fieldList)))));
         $generatedIds = [];
-        foreach (array_chunk($rows, $chunkSize) as $chunk) {
-            foreach ($this->executeBatchChunk($meta, $generated, $fieldList, $chunk) as $id) {
-                $generatedIds[] = $id;
+        foreach (array_chunk($prepared, $chunkSize, true) as $chunk) {
+            $ids = $this->executeBatchChunk($meta, $generated, $fieldList, array_values($chunk));
+            foreach (array_keys($chunk) as $position => $index) {
+                $generatedIds[$index] = $ids[$position] ?? null;
             }
         }
-
-        $rowIndex = 0;
-        foreach ($rows as $row) {
-            if ($row instanceof Entity) {
-                $this->rememberEntity($row);
-                if ($generated !== null && !$row->propSet($generated->property)) {
-                    $id = $generatedIds[$rowIndex] ?? null;
-                    if ($id !== null && $id !== '' && $id !== '0') {
-                        $row->{$generated->property} = $this->caster->toPhp($meta->class, $generated, $id);
-                    }
-                }
-                $row->markPersisted();
-                $row->afterSave();
-                $row->afterInsert();
-                $this->cacheSet($row, true);
-            }
-            $rowIndex++;
+        foreach ($entities as $index => $row) {
+            $this->publishBatchEntity($row, $meta, $generated, $generatedIds[$index] ?? null);
         }
     }
 
+    /** @param list<FieldMeta> $fieldList @return list<int|float|string|null> */
+    private function prepareBatchRow(ModelMeta $meta, array $fieldList, array|Entity $row, int $now): array
+    {
+        $isEntity = $row instanceof Entity;
+        $values = [];
+        foreach ($fieldList as $field) {
+            $isTimestamp = in_array($field->property, $meta->timestamps, true);
+            $isVersion = $field->property === $meta->version;
+            $has = $isEntity
+                ? $row->propSet($field->property)
+                : (array_key_exists($field->column, $row) || array_key_exists($field->property, $row));
+            if (($isTimestamp || $isVersion) && !$has) {
+                $value = $isVersion ? 1 : $this->currentTimestamp($field, $now);
+            } elseif ($has) {
+                $value = $isEntity
+                    ? $row->{$field->property}
+                    : (array_key_exists($field->column, $row) ? $row[$field->column] : $row[$field->property]);
+            } else {
+                throw new IdentityException($meta->class . '::' . $field->property . ' 批量插入缺少列');
+            }
+            $values[] = $this->toDbValue($meta, $field, $value);
+            if ($isVersion) {
+                $version = $meta->versionField() ?? throw new \LogicException('版本元数据不一致');
+                $this->versionValue($meta, $version, $this->caster->toPhp($meta->class, $version, $value));
+            }
+        }
+
+        return $values;
+    }
+
+    /** SQL 成功后才建立新实体的 Gateway 归属并发布身份；后置钩子失败不宣称原子撤销。 */
+    private function publishBatchEntity(
+        Entity $row,
+        ModelMeta $meta,
+        ?FieldMeta $generated,
+        ?string $id,
+    ): void {
+        if ($generated !== null && !$row->propSet($generated->property)) {
+            if ($id === null || $id === '' || $id === '0') {
+                throw new IdentityException($meta->class . ' 行可能已写入，但生成列没有回填', true);
+            }
+            $row->{$generated->property} = $this->caster->toPhp($meta->class, $generated, $id);
+        }
+        $row->markPersisted($this);
+        $row->afterSave();
+        $row->afterInsert();
+        $this->rememberEntity($row);
+        $this->cacheSet($row, true);
+    }
+
     /**
-     * 执行一个分块。返回该块内每行的生成列值（无生成列时为 null 填充）。
+     * 执行已完整预检的分块；这里不再运行钩子或修改实体。
      *
      * @param list<FieldMeta> $fieldList
-     * @param list<Entity|array<string, mixed>> $chunk
+     * @param list<list<int|float|string|null>> $chunk
      * @return list<string|null>
      */
     private function executeBatchChunk(
@@ -296,53 +494,17 @@ final class EntityGateway
         array $chunk,
     ): array {
         $columns = array_map(fn (FieldMeta $f): string => $this->quote($f->column), $fieldList);
-        $now = time();
-        $version = $meta->versionField();
         $paramIndex = 0;
         $valueGroups = [];
         $params = [];
-
-        foreach ($chunk as $row) {
-            $isEntity = $row instanceof Entity;
-            if ($isEntity) {
-                $this->rememberEntity($row);
-                $this->fillVersion($row, $meta);
-                $row->beforeSave();
-                $row->beforeInsert();
-            }
+        foreach ($chunk as $values) {
             $placeholders = [];
-            foreach ($fieldList as $field) {
-                $column = $field->column;
-                $isTimestamp = in_array($field->property, $meta->timestamps, true);
-                $isVersion = $field->property === $meta->version;
-                $has = $isEntity
-                    ? $row->propSet($field->property)
-                    : (array_key_exists($column, $row) || array_key_exists($field->property, $row));
-                if (($isTimestamp || $isVersion) && !$has) {
-                    $value = $isVersion ? 1 : $this->currentTimestamp($field, $now);
-                } elseif ($has) {
-                    $value = $isEntity
-                        ? $row->{$field->property}
-                        : (array_key_exists($column, $row) ? $row[$column] : $row[$field->property]);
-                } else {
-                    throw new IdentityException($meta->class . '::' . $field->property . ' 批量插入缺少列');
-                }
-                $p = ':b' . $paramIndex++;
-                $placeholders[] = $p;
-                $params[substr($p, 1)] = $this->toDbValue($meta, $field, $value);
-                if ($isVersion && $isEntity && !$has) {
-                    $row->{$field->property} = $value;
-                }
+            foreach ($values as $value) {
+                $placeholder = ':b' . $paramIndex++;
+                $placeholders[] = $placeholder;
+                $params[substr($placeholder, 1)] = $value;
             }
             $valueGroups[] = '(' . implode(', ', $placeholders) . ')';
-        }
-        if ($version !== null) {
-            foreach ($chunk as $row) {
-                $value = $row instanceof Entity
-                    ? ($row->propSet($version->property) ? $row->{$version->property} : null)
-                    : ($row[$version->column] ?? $row[$version->property] ?? 1);
-                $this->versionValue($meta, $version, $this->caster->toPhp($meta->class, $version, $value));
-            }
         }
 
         $sql = sprintf(
@@ -400,6 +562,7 @@ final class EntityGateway
 
     public function update(Entity $entity): void
     {
+        $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
         $identity = $this->identityOf($entity, $meta);
         $this->rememberEntity($entity);
@@ -432,7 +595,7 @@ final class EntityGateway
             if ($expectedVersion !== null) {
                 $entity->{$meta->version} = $expectedVersion;
             }
-            $entity->markPersisted();
+            $entity->markPersisted($this);
 
             return;
         }
@@ -458,7 +621,7 @@ final class EntityGateway
         if ($expectedVersion !== null) {
             $entity->{$meta->version} = $expectedVersion + 1;
         }
-        $entity->markPersisted();
+        $entity->markPersisted($this);
         $entity->afterSave();
         $entity->afterUpdate();
         $this->rememberEntity($entity);
@@ -469,6 +632,7 @@ final class EntityGateway
 
     public function delete(Entity $entity): void
     {
+        $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
         $identity = $this->identityOf($entity, $meta);
         $this->rememberEntity($entity);
@@ -524,6 +688,8 @@ final class EntityGateway
         $identity = $this->identityFrom($meta, $key);
         $cached = $this->cache->get($class, $identity->parts);
         if ($cached !== null) {
+            $this->forEntity($cached);
+
             return $cached;
         }
         $params = [];
@@ -543,6 +709,7 @@ final class EntityGateway
         }
 
         $entity = $this->hydrate($meta, $row);
+        $this->forEntity($entity);
         $this->rememberEntity($entity);
         $this->cacheSet($entity);
 
@@ -569,6 +736,7 @@ final class EntityGateway
 
     public function refresh(Entity $entity): void
     {
+        $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
         $identity = $this->identityOf($entity, $meta);
         $this->rememberEntity($entity);
@@ -594,7 +762,8 @@ final class EntityGateway
             }
             $entity->{$field->property} = $this->caster->toPhp($meta->class, $field, $row[$field->column]);
         }
-        $entity->markPersisted();
+        $entity->markPersisted($this);
+        $entity->clearLoadedRelations();
         $this->rememberEntity($entity);
         $this->cacheSet($entity);
     }
@@ -1387,7 +1556,7 @@ final class EntityGateway
         $pending = $this->txnNewIdentities[$context] ?? [];
         $identities = $this->txnIdentityStates[$context] ?? [];
         $key = $this->identityComplete($entity)
-            ? $entity::class . ':' . serialize($this->identityOf($entity, $meta)->parts)
+            ? \Pixiaoka\Orm\Cache\RowCache::key($entity::class, $this->identityOf($entity, $meta)->parts)
             : null;
         if ($entity->isNew() || $key === null || !isset($pending[$key])) {
             if (!$entity->isNew()) {
@@ -1441,35 +1610,64 @@ final class EntityGateway
     // ---- 查询执行 —— 带缓存 ----
 
     /** @return list<Entity> */
-    public function executeQuery(string $class, array $query): array
+    public function executeQuery(string $class, array $query, array $relations = [], bool $cache = true): array
     {
         $this->assertLockSupported($query['sql']);
         $meta = $this->metadata->read($class);
+        $cacheSnapshot = $relations !== [] ? $this->cache->transactionSnapshot() : null;
         $rows = $this->runQueryAll($query['sql'], $query['params'], $class);
         $entities = [];
         foreach ($rows as $row) {
             $entity = $this->hydrate($meta, $row);
+            $this->forEntity($entity);
             $this->rememberEntity($entity);
-            $this->cacheSet($entity);
+            if ($cache && $relations === []) {
+                $this->cacheSet($entity);
+            }
             $entities[] = $entity;
+        }
+        if ($relations !== []) {
+            try {
+                $this->loadRelations($entities, $relations);
+                if ($cache) {
+                    foreach ($entities as $entity) {
+                        $this->cacheSet($entity);
+                    }
+                }
+            } catch (\Throwable $e) {
+                $this->cache->restoreSnapshot($cacheSnapshot);
+                throw $e;
+            }
         }
 
         return $entities;
     }
 
     /** @return Entity|null */
-    public function executeQueryOne(string $class, array $query): ?Entity
+    public function executeQueryOne(string $class, array $query, array $relations = []): ?Entity
     {
         $this->assertLockSupported($query['sql']);
         $meta = $this->metadata->read($class);
+        $cacheSnapshot = $relations !== [] ? $this->cache->transactionSnapshot() : null;
         $row = $this->runQueryOne($query['sql'], $query['params'], $class);
         if ($row === null) {
             return null;
         }
 
         $entity = $this->hydrate($meta, $row);
+        $this->forEntity($entity);
         $this->rememberEntity($entity);
-        $this->cacheSet($entity);
+        if ($relations === []) {
+            $this->cacheSet($entity);
+        } else {
+            try {
+                $this->loadRelations([$entity], $relations);
+                $this->cacheSet($entity);
+            } catch (\Throwable $e) {
+                $this->cache->restoreSnapshot($cacheSnapshot);
+                throw $e;
+            }
+        }
 
         return $entity;
     }
@@ -1514,7 +1712,7 @@ final class EntityGateway
             $entity->{$field->property} = $this->caster->toPhp($meta->class, $field, $row[$field->column]);
         }
 
-        $entity->markPersisted();
+        $entity->markPersisted($this);
 
         return $entity;
     }
@@ -1672,7 +1870,7 @@ final class EntityGateway
         $this->rememberEntity($entity);
         $context = Session::context();
         if ($inserted && ($this->inTransactionByContext[$context] ?? false)) {
-            $key = $entity::class . ':' . serialize($parts);
+            $key = \Pixiaoka\Orm\Cache\RowCache::key($entity::class, $parts);
             $baseline = $this->txnIdentityStates[$context][$key] ?? null;
             $states = $this->txnStatesByContext[$context] ?? $this->newTransactionStates();
             $states[$entity] = $baseline ?? ($this->pendingInsertStates[$entity] ?? $entity->captureState($meta));

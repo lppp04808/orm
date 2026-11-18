@@ -7,8 +7,8 @@
 //   2. 验证数据库连接是否正常
 //
 // 安全铁律（生产库）：
-//   - 每次运行使用 orm_verify_item_<随机后缀> / orm_verify_tag_<随机后缀> 两张表
-//   - 表名登记到 $ownedTables，清理时只 DROP 本次自己创建的表（tag 先、item 后）
+//   - 每次运行使用 orm_verify_*_<随机后缀> 独立测试表
+//   - 表名按 PDO 登记到 $ownedTables，清理时只 DROP 该连接创建的表（逆建表顺序）
 //   - 绝不 DROP 固定名或任何未登记表，避免误删生产同名表
 //   - 连通性只测 SELECT 1，不读写任何其他表
 //
@@ -28,7 +28,10 @@ if (is_file($libAutoload)) {
     require __DIR__ . '/bootstrap.php';
 }
 
+use Pixiaoka\Orm\Annotation\BelongsTo;
 use Pixiaoka\Orm\Annotation\Column;
+use Pixiaoka\Orm\Annotation\HasMany;
+use Pixiaoka\Orm\Annotation\HasOne;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
 use Pixiaoka\Orm\Annotation\Temporal;
 use Pixiaoka\Orm\Annotation\Version;
@@ -39,6 +42,9 @@ use Pixiaoka\Orm\Exception\OptimisticLockException;
 use Pixiaoka\Orm\Gateway\Connection;
 use Pixiaoka\Orm\Gateway\EntityGateway;
 use Pixiaoka\Orm\Gateway\PdoConnection;
+use Pixiaoka\Orm\Observability\Event;
+use Pixiaoka\Orm\Observability\SqlEvent;
+use Pixiaoka\Orm\Query\Builder;
 use Pixiaoka\Orm\Query\JoinClause;
 use Pixiaoka\Orm\Session;
 
@@ -256,6 +262,95 @@ final class VerifyVersionRecord extends Entity
     }
 }
 
+final class VerifyRelationCustomer extends Entity
+{
+    public static string $tableName = 'orm_verify_customer';
+
+    #[Column, PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public string $name;
+
+    public static function table(): string { return self::$tableName; }
+
+    #[HasOne(target: VerifyRelationProfile::class, foreignKey: ['customer_id'])]
+    public function profile(): \Pixiaoka\Orm\Relation\HasOne { return $this->makeRelation(); }
+
+    #[HasMany(target: VerifyRelationOrder::class, foreignKey: ['customer_id'])]
+    public function orders(): \Pixiaoka\Orm\Relation\HasMany { return $this->makeRelation(); }
+}
+
+final class VerifyRelationProfile extends Entity
+{
+    public static string $tableName = 'orm_verify_profile';
+
+    #[Column, PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public int $customer_id;
+    #[Column]
+    public string $bio;
+
+    public static function table(): string { return self::$tableName; }
+}
+
+final class VerifyRelationOrder extends Entity
+{
+    public static string $tableName = 'orm_verify_order';
+
+    #[Column, PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public ?int $customer_id = null;
+    #[Column]
+    public string $status;
+    #[Column]
+    public int $amount;
+
+    public static function table(): string { return self::$tableName; }
+
+    #[BelongsTo(target: VerifyRelationCustomer::class, localKey: ['customer_id'])]
+    public function customer(): \Pixiaoka\Orm\Relation\BelongsTo { return $this->makeRelation(); }
+}
+
+final class VerifyRelationTenant extends Entity
+{
+    public static string $tableName = 'orm_verify_tenant';
+
+    #[Column, PrimaryKey(order: 1)]
+    public int $tenant_id;
+    #[Column, PrimaryKey(order: 2)]
+    public int $id;
+    #[Column]
+    public string $name;
+
+    public static function table(): string { return self::$tableName; }
+
+    #[HasMany(target: VerifyRelationEntry::class, localKey: ['tenant_id', 'id'], foreignKey: ['owner_tenant', 'owner_id'])]
+    public function entries(): \Pixiaoka\Orm\Relation\HasMany { return $this->makeRelation(); }
+}
+
+final class VerifyRelationEntry extends Entity
+{
+    public static string $tableName = 'orm_verify_entry';
+
+    #[Column, PrimaryKey(order: 1)]
+    public int $tenant_id;
+    #[Column, PrimaryKey(order: 2)]
+    public int $id;
+    #[Column]
+    public int $owner_tenant;
+    #[Column]
+    public int $owner_id;
+    #[Column]
+    public string $label;
+
+    public static function table(): string { return self::$tableName; }
+
+    #[BelongsTo(target: VerifyRelationTenant::class, localKey: ['owner_tenant', 'owner_id'], foreignKey: ['tenant_id', 'id'])]
+    public function owner(): \Pixiaoka\Orm\Relation\BelongsTo { return $this->makeRelation(); }
+}
+
 // ----------------------------------------------------------------------------
 // 验证结果收集
 // ----------------------------------------------------------------------------
@@ -295,15 +390,18 @@ final class Check
 // ----------------------------------------------------------------------------
 
 /**
- * 本次运行拥有的表（登记后才允许 DROP）。
+ * 每个 PDO 分别登记本次创建的表（登记后才允许 DROP）。
+ * 双连接场景不能清空另一个连接的所有权，也不能根据会变化的静态表名猜测 DROP 目标。
  *
- * @var list<string>
+ * @var array<int, list<string>>
  */
 $ownedTables = [];
 
 function createTables(PDO $pdo, string $driver): void
 {
     global $ownedTables;
+    $owner = spl_object_id($pdo);
+    $ownedTables[$owner] ??= [];
     $item = VerifyItem::table();
     $tag = VerifyTag::table();
     $version = VerifyVersionRecord::table();
@@ -320,13 +418,13 @@ function createTables(PDO $pdo, string $driver): void
             created_at INT NOT NULL,
             updated_at INT NOT NULL DEFAULT 0
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-        $ownedTables[] = $item;
+        $ownedTables[$owner][] = $item;
         $pdo->exec("CREATE TABLE {$tag} (
             item_id INT NOT NULL,
             label VARCHAR(64) NOT NULL,
             PRIMARY KEY (item_id, label)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-        $ownedTables[] = $tag;
+        $ownedTables[$owner][] = $tag;
     } elseif ($driver === 'sqlite') {
         // 与 tests/Orm 既有套件同构：AUTOINCREMENT + price TEXT 保精度
         $pdo->exec("CREATE TABLE {$item} (
@@ -340,13 +438,13 @@ function createTables(PDO $pdo, string $driver): void
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL DEFAULT 0
         )");
-        $ownedTables[] = $item;
+        $ownedTables[$owner][] = $item;
         $pdo->exec("CREATE TABLE {$tag} (
             item_id INTEGER NOT NULL,
             label TEXT NOT NULL,
             PRIMARY KEY (item_id, label)
         )");
-        $ownedTables[] = $tag;
+        $ownedTables[$owner][] = $tag;
     } else {
         // pgsql
         $pdo->exec("CREATE TABLE {$item} (
@@ -360,13 +458,13 @@ function createTables(PDO $pdo, string $driver): void
             created_at INT NOT NULL,
             updated_at INT NOT NULL DEFAULT 0
         )");
-        $ownedTables[] = $item;
+        $ownedTables[$owner][] = $item;
         $pdo->exec("CREATE TABLE {$tag} (
             item_id INT NOT NULL,
             label VARCHAR(64) NOT NULL,
             PRIMARY KEY (item_id, label)
         )");
-        $ownedTables[] = $tag;
+        $ownedTables[$owner][] = $tag;
     }
 
     $versionId = $driver === 'mysql' ? 'INT AUTO_INCREMENT PRIMARY KEY' : ($driver === 'pgsql' ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT');
@@ -376,22 +474,78 @@ function createTables(PDO $pdo, string $driver): void
         body {$versionBody} NOT NULL,
         revision INT NOT NULL
     )");
-    $ownedTables[] = $version;
+    $ownedTables[$owner][] = $version;
+
+    $idColumn = $driver === 'mysql' ? 'INT AUTO_INCREMENT PRIMARY KEY'
+        : ($driver === 'pgsql' ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT');
+    $text = $driver === 'sqlite' ? 'TEXT' : 'VARCHAR(255)';
+    $relationTables = [
+        VerifyRelationCustomer::table() => "id {$idColumn}, name {$text} NOT NULL",
+        VerifyRelationProfile::table() => "id {$idColumn}, customer_id INT NOT NULL, bio {$text} NOT NULL",
+        VerifyRelationOrder::table() => "id {$idColumn}, customer_id INT NULL, status {$text} NOT NULL, amount INT NOT NULL",
+        VerifyRelationTenant::table() => 'tenant_id INT NOT NULL, id INT NOT NULL, name ' . $text . ' NOT NULL, PRIMARY KEY (tenant_id, id)',
+        VerifyRelationEntry::table() => 'tenant_id INT NOT NULL, id INT NOT NULL, owner_tenant INT NOT NULL, owner_id INT NOT NULL, label ' . $text . ' NOT NULL, PRIMARY KEY (tenant_id, id)',
+    ];
+    foreach ($relationTables as $table => $columns) {
+        $pdo->exec("CREATE TABLE {$table} ({$columns})");
+        $ownedTables[$owner][] = $table;
+    }
 }
 
-/** 只清理本次登记过的表：version/tag 先，item 后。 */
-function dropOwnedTables(PDO $pdo): void
+/** @return list<string> */
+function ownedTables(PDO $pdo): array
 {
     global $ownedTables;
-    $item = VerifyItem::table();
-    $tag = VerifyTag::table();
-    $version = VerifyVersionRecord::table();
-    foreach ([$version, $tag, $item] as $table) {
-        if (in_array($table, $ownedTables, true)) {
-            $pdo->exec("DROP TABLE IF EXISTS {$table}");
+
+    return $ownedTables[spl_object_id($pdo)] ?? [];
+}
+
+/** @return list<string> */
+function existingTables(PDO $pdo, string $driver, array $tables): array
+{
+    $existing = [];
+    foreach ($tables as $table) {
+        $exists = match ($driver) {
+            'sqlite' => $pdo->prepare('SELECT 1 FROM sqlite_master WHERE type = \'table\' AND name = ?'),
+            'mysql' => $pdo->prepare('SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?'),
+            'pgsql' => $pdo->prepare('SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ?'),
+            default => throw new InvalidArgumentException('不支持的数据库驱动 ' . $driver),
+        };
+        $exists->execute([$table]);
+        if ($exists->fetchColumn() !== false) {
+            $existing[] = $table;
         }
     }
-    $ownedTables = [];
+
+    return $existing;
+}
+
+/** @return list<string> 清理后仍存在的表；只 DROP 此 PDO 明确登记的随机表。 */
+function dropOwnedTables(PDO $pdo, string $driver): array
+{
+    global $ownedTables;
+    $owner = spl_object_id($pdo);
+    $tables = $ownedTables[$owner] ?? [];
+    // 静态表名可能已被独立双连接场景改写；只清理此 PDO 登记过的对象。
+    foreach (array_reverse($tables) as $table) {
+        $pdo->exec("DROP TABLE IF EXISTS {$table}");
+    }
+    $remaining = existingTables($pdo, $driver, $tables);
+    if ($remaining === []) {
+        unset($ownedTables[$owner]);
+    }
+
+    return $remaining;
+}
+
+function checkOwnedTablesDropped(Check $check, PDO $pdo, string $driver): void
+{
+    try {
+        $remaining = dropOwnedTables($pdo, $driver);
+        $check->assert($remaining === [], '清理：本次创建的 8 张随机表已 DROP 并通过元数据核验', '仍存在: ' . implode(', ', $remaining));
+    } catch (Throwable $e) {
+        $check->no('清理 DROP TABLE 或元数据核验', $e::class . ': ' . $e->getMessage());
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1236,7 +1390,226 @@ function runVersionScenarios(string $driver, string $dsn, string $user, string $
     } catch (Throwable $e) {
         $check->no('r. Version 实连场景执行意外中断', $e::class . ': ' . $e->getMessage());
     } finally {
+        // 右侧独立 PDO 创建的表也必须由它自己清理，不能借用左侧连接的所有权。
+        if (isset($rightGateway)) {
+            $rightGateway->clearCache(VerifyVersionRecord::class);
+        }
+        if (isset($rightPdo)) {
+            try {
+                dropOwnedTables($rightPdo, $driver);
+            } catch (Throwable $e) {
+                $check->no('r. 右侧独立连接清理', $e::class . ': ' . $e->getMessage());
+            }
+        }
+        // 在归还连接池之前释放本场景全部实体，RowCache 的已知对象身份不应延长测试连接生命周期。
+        $leftGateway->clearCache(VerifyVersionRecord::class);
         Session::use($leftGateway);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 场景 s：只读关系、批量预加载、复合键与关系图回滚
+// ----------------------------------------------------------------------------
+
+function runRelationScenarios(string $driver, PDO $pdo, Check $check): void
+{
+    $gateway = Session::get()->gateway;
+    $selects = 0;
+    $unsubscribe = $gateway->subscribe(static function (Event $event) use (&$selects): void {
+        if ($event instanceof SqlEvent && $event->operation === 'SELECT') {
+            $selects++;
+        }
+    });
+    try {
+        VerifyRelationCustomer::insertAll([['name' => 'alice'], ['name' => 'bob'], ['name' => 'nobody']]);
+        VerifyRelationProfile::insertAll([
+            ['customer_id' => 1, 'bio' => 'first'], ['customer_id' => 1, 'bio' => 'second'],
+        ]);
+        VerifyRelationOrder::insertAll([
+            ['customer_id' => 1, 'status' => 'paid', 'amount' => 30],
+            ['customer_id' => 1, 'status' => 'new', 'amount' => 10],
+            ['customer_id' => 1, 'status' => 'paid', 'amount' => 20],
+            ['customer_id' => 2, 'status' => 'new', 'amount' => 40],
+            ['customer_id' => null, 'status' => 'orphan', 'amount' => 50],
+        ]);
+        VerifyRelationTenant::insertAll([
+            ['tenant_id' => 1, 'id' => 7, 'name' => 'A'],
+            ['tenant_id' => 2, 'id' => 7, 'name' => 'B'],
+            ['tenant_id' => 2, 'id' => 8, 'name' => 'C'],
+        ]);
+        VerifyRelationEntry::insertAll([
+            ['tenant_id' => 1, 'id' => 1, 'owner_tenant' => 1, 'owner_id' => 7, 'label' => 'a1'],
+            ['tenant_id' => 1, 'id' => 2, 'owner_tenant' => 2, 'owner_id' => 7, 'label' => 'b1'],
+            ['tenant_id' => 1, 'id' => 3, 'owner_tenant' => 1, 'owner_id' => 7, 'label' => 'a2'],
+        ]);
+        $check->ok('s0. ' . $driver . ' 关系数据集就绪');
+
+        $customer = VerifyRelationCustomer::find(['id' => 1]);
+        $orders = $customer->orders()->query(
+            VerifyRelationOrder::query()->where('status', 'paid')->orderBy('amount', 'DESC'),
+        )->get();
+        $check->assert(array_column($orders, 'amount') === [30, 20], 's1. hasMany 显式关系查询及约束/排序');
+        $profile = $customer->profile()->query(VerifyRelationProfile::query()->orderBy('id'))->first();
+        $check->assert($profile?->bio === 'first', 's2. hasOne 多条候选记录按明确排序取 first');
+
+        $selects = 0;
+        $customers = VerifyRelationCustomer::query()->with('profile', 'orders')->orderBy('id')->get();
+        $check->assert($selects === 3, 's3. 主表、profile、orders 共三条 SELECT', 'selects=' . $selects);
+        $check->assert($customers[0]->loadedRelation('profile')?->bio === 'first'
+            && count($customers[0]->loadedRelation('orders')) === 3
+            && $customers[1]->loadedRelation('profile') === null
+            && $customers[2]->loadedRelation('orders') === [],
+            's4. 预加载区分实体、null 与空数组');
+        $check->assert($customers[0]->loadedRelation('orders')[0]->customer()->get()?->id === 1,
+            's5. belongsTo 显式查询');
+
+        $selects = 0;
+        $nested = VerifyRelationCustomer::query()->with([
+            'orders' => static fn (Builder $q): Builder => $q->where('status', 'paid'),
+            'orders.customer',
+        ])->where('id', 1)->first();
+        $check->assert($selects === 3 && count($nested->loadedRelation('orders')) === 2
+            && $nested->loadedRelation('orders')[0]->loadedRelation('customer') === $nested,
+            's6. 嵌套约束与反向关系复用本次主查询对象', 'selects=' . $selects);
+
+        $orphan = VerifyRelationOrder::query()->whereNull('customer_id')->first();
+        $selects = 0;
+        $orphan->load('customer');
+        $check->assert($orphan->loadedRelation('customer') === null && $selects === 0,
+            's7. NULL 外键返回已加载 null 且零 SQL', 'selects=' . $selects);
+
+        $tenants = VerifyRelationTenant::query()->with('entries.owner')->orderBy('tenant_id')->orderBy('id')->get();
+        $check->assert(array_column($tenants[0]->loadedRelation('entries'), 'label') === ['a1', 'a2']
+            && array_column($tenants[1]->loadedRelation('entries'), 'label') === ['b1']
+            && $tenants[2]->loadedRelation('entries') === []
+            && $tenants[1]->loadedRelation('entries')[0]->loadedRelation('owner')->name === 'B',
+            's8. 复合键按元组关联，跨租户不串数据');
+
+        $cached = VerifyRelationCustomer::find(['id' => 1])->load('profile');
+        $previousProfile = $cached->loadedRelation('profile');
+        $pdo->exec('UPDATE ' . VerifyRelationCustomer::table() . " SET name = 'database-name' WHERE id = 1");
+        $refreshed = VerifyRelationOrder::query()->with('customer')->where('id', 1)->first();
+        $check->assert($refreshed->loadedRelation('customer') === $cached
+            && $cached->name === 'database-name' && $cached->loadedRelation('profile') === $previousProfile,
+            's9. 关系图刷新 canonical 对象但保留既有关系');
+
+        $pdo->exec('UPDATE ' . VerifyRelationCustomer::table() . " SET name = 'transaction-name' WHERE id = 1");
+        try {
+            VerifyRelationCustomer::transaction(static function () use ($cached, $check): void {
+                $order = VerifyRelationOrder::query()->with('customer')->where('id', 1)->first();
+                $check->assert($order->loadedRelation('customer') === $cached
+                    && $cached->name === 'transaction-name', 's10. 事务内读取关系图并刷新目标');
+                throw new RuntimeException('relation rollback');
+            });
+            $check->no('s11. 关系事务异常传播', '没有抛出预期异常');
+        } catch (RuntimeException $e) {
+            $check->assert($e->getMessage() === 'relation rollback', 's11. 关系事务异常传播', $e->getMessage());
+        }
+        $check->assert($cached->name === 'database-name'
+            && VerifyRelationCustomer::find(['id' => 1]) === $cached
+            && $cached->loadedRelation('profile') === $previousProfile,
+            's12. 回滚恢复目标字段、缓存身份和关系状态');
+
+        $bulkTenants = [];
+        $bulkEntries = [];
+        for ($id = 20; $id <= 1020; $id++) {
+            $bulkTenants[] = ['tenant_id' => 3, 'id' => $id, 'name' => 'bulk-' . $id];
+            $bulkEntries[] = [
+                'tenant_id' => 2,
+                'id' => $id,
+                'owner_tenant' => 3,
+                'owner_id' => $id,
+                'label' => 'bulk-entry-' . $id,
+            ];
+        }
+        VerifyRelationTenant::insertAll($bulkTenants);
+        VerifyRelationEntry::insertAll($bulkEntries);
+        $selects = 0;
+        $entries = VerifyRelationEntry::query()->with('owner')
+            ->where('tenant_id', 2)
+            ->whereOp('id', '>=', 20)
+            ->orderBy('id')
+            ->get();
+        $matched = count($entries) === 1001;
+        foreach ($entries as $index => $entry) {
+            $owner = $entry->loadedRelation('owner');
+            $matched = $matched && $owner?->tenant_id === 3 && $owner?->id === 20 + $index;
+        }
+        $check->assert($selects === 4 && $matched,
+            's13. 1001 个不同复合关系键按 500 + 500 + 1 分三批查询且不串租户',
+            'selects=' . $selects . ' entries=' . count($entries) . ' matched=' . ($matched ? 'yes' : 'no'));
+
+        $stable = VerifyRelationCustomer::find(['id' => 1]);
+        $stableEager = VerifyRelationCustomer::query()->with('profile', 'orders')->where('id', 1)->first();
+        $descending = $stable->profile()->query(VerifyRelationProfile::query()->orderBy('id', 'DESC'))->first();
+        $check->assert($stable->profile()->get()?->id === 1
+            && $stable->profile()->first()?->id === 1
+            && $stableEager?->loadedRelation('profile')?->id === 1
+            && array_column($stableEager?->loadedRelation('orders'), 'id') === [1, 2, 3]
+            && $descending?->id === 2,
+            's14. 显式和预加载关系使用主键决胜排序，保留用户 DESC 优先级');
+
+        $changed = VerifyRelationOrder::query()->where('id', 1)->first()->load('customer');
+        $alice = $changed->loadedRelation('customer');
+        $pdo->exec('UPDATE ' . VerifyRelationOrder::table() . ' SET customer_id = 2 WHERE id = 1');
+        try {
+            $changed->load(['customer', 'missing']);
+            $check->no('s15. 失败关系图恢复旧外键和已加载关系', '没有抛出预期异常');
+        } catch (\Pixiaoka\Orm\Exception\MetadataException) {
+            $check->assert($changed->customer_id === 1 && $changed->loadedRelation('customer') === $alice
+                && VerifyRelationOrder::find(['id' => 1]) === $changed,
+                's15. 失败关系图恢复旧外键和已加载关系');
+        }
+        $bob = VerifyRelationCustomer::query()->with('orders.customer')->where('id', 2)->first();
+        $check->assert($bob?->loadedRelation('orders')[0] === $changed
+            && $changed->customer_id === 2 && $changed->loadedRelation('customer') === $bob,
+            's16. 嵌套图按数据库新外键刷新并替换旧关系');
+
+        $pdo->exec('UPDATE ' . VerifyRelationOrder::table() . ' SET customer_id = 1 WHERE id = 1');
+        try {
+            VerifyRelationOrder::transaction(static function () use ($changed): void {
+                $loaded = VerifyRelationCustomer::query()->with('orders.customer')->where('id', 1)->first();
+                if ($changed->loadedRelation('customer')?->id !== 1
+                    || $changed->loadedRelation('customer') !== $loaded) {
+                    throw new RuntimeException('事务内没有读到新关系');
+                }
+                throw new RuntimeException('rollback refreshed key');
+            });
+            $check->no('s17. 关系图事务回滚恢复关联键和旧关系', '没有抛出预期异常');
+        } catch (RuntimeException $e) {
+            $check->assert($e->getMessage() === 'rollback refreshed key'
+                && $changed->customer_id === 2 && $changed->loadedRelation('customer') === $bob,
+                's17. 关系图事务回滚恢复关联键和旧关系', $e->getMessage());
+        }
+
+        $beforeBadBatch = (int) $pdo->query('SELECT COUNT(*) FROM ' . VerifyRelationCustomer::table())->fetchColumn();
+        $badRows = [];
+        for ($index = 0; $index < 500; $index++) {
+            $badRows[] = ['name' => 'prevalidated-' . $index];
+        }
+        $badRows[] = ['id' => 'invalid'];
+        $inserts = 0;
+        $unsubscribeInserts = $gateway->subscribe(static function (Event $event) use (&$inserts): void {
+            if ($event instanceof SqlEvent && $event->operation === 'INSERT') {
+                $inserts++;
+            }
+        });
+        try {
+            try {
+                VerifyRelationCustomer::insertAll($badRows);
+                $check->no('s18. 500+1 坏数组行在第一条 INSERT 前拒绝', '没有抛出预期异常');
+            } catch (IdentityException|\TypeError) {
+                $afterBadBatch = (int) $pdo->query('SELECT COUNT(*) FROM ' . VerifyRelationCustomer::table())->fetchColumn();
+                $check->assert($inserts === 0 && $afterBadBatch === $beforeBadBatch,
+                    's18. 500+1 坏数组行在第一条 INSERT 前拒绝', 'inserts=' . $inserts);
+            }
+        } finally {
+            $unsubscribeInserts();
+        }
+    } catch (Throwable $e) {
+        $check->no('s. ' . $driver . ' 只读关系场景中断', $e::class . ': ' . $e->getMessage());
+    } finally {
+        $unsubscribe();
     }
 }
 
@@ -1268,51 +1641,41 @@ function verifyOn(string $label, string $dsn, string $user, string $pass): Check
     }
 
     $driver = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
-
+    $rec = null;
     try {
         createTables($pdo, $driver);
-        $check->ok('建表 ' . VerifyItem::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyVersionRecord::table());
-    } catch (PDOException $e) {
-        $check->no('建表 ' . VerifyItem::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyVersionRecord::table(), $e->getMessage());
+        $check->assert(count(ownedTables($pdo)) === 8, '建表并按 PDO 登记 8 张随机测试表');
+
+        $rec = new RecordingConnection(new PdoConnection($pdo));
+        $gateway = new EntityGateway($rec);
+        Session::use($gateway);
+
         try {
-            dropOwnedTables($pdo);
-        } catch (PDOException) {
-            // 建表都失败，清理尽力而为
+            runScenarios($driver, $pdo, $rec, $check);
+        } catch (Throwable $e) {
+            $check->no('基础场景执行意外中断', $e->getMessage());
         }
-
-        return $check;
-    }
-
-    $rec = new RecordingConnection(new PdoConnection($pdo));
-    $gateway = new EntityGateway($rec);
-    Session::use($gateway);
-
-    try {
-        runScenarios($driver, $pdo, $rec, $check);
+        try {
+            runComplexScenarios($driver, $pdo, $rec, $check);
+        } catch (Throwable $e) {
+            $check->no('复杂场景执行意外中断', $e->getMessage());
+        }
+        runVersionScenarios($driver, $dsn, $user, $pass, $check);
+        runRelationScenarios($driver, $pdo, $check);
     } catch (Throwable $e) {
-        $check->no('基础场景执行意外中断', $e->getMessage());
-    }
-    try {
-        runComplexScenarios($driver, $pdo, $rec, $check);
-    } catch (Throwable $e) {
-        $check->no('复杂场景执行意外中断', $e->getMessage());
-    }
-    runVersionScenarios($driver, $dsn, $user, $pass, $check);
-
-    // 清理：只删本次自己创建的表，version/tag 先 item 后
-    try {
-        dropOwnedTables($pdo);
-        $check->ok('清理：' . VerifyVersionRecord::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyItem::table() . ' 已 DROP（仅本次创建）');
-    } catch (PDOException $e) {
-        $check->no('清理 DROP TABLE', $e->getMessage());
+        $check->no('建表或场景执行意外中断', $e::class . ': ' . $e->getMessage());
+    } finally {
+        Session::discard();
+        checkOwnedTablesDropped($check, $pdo, $driver);
     }
 
-    // SQL 清单
-    echo "\n---- $label ORM 生成的 SQL 清单（去重）----\n";
-    foreach ($rec->sqlList() as $sql) {
-        echo "  $sql\n";
+    if ($rec !== null) {
+        echo "\n---- $label ORM 生成的 SQL 清单（去重）----\n";
+        foreach ($rec->sqlList() as $sql) {
+            echo "  $sql\n";
+        }
+        echo "-------------------------------------------\n";
     }
-    echo "-------------------------------------------\n";
 
     return $check;
 }
@@ -1328,15 +1691,25 @@ function runSqliteVersionScenarios(string $path, Check $check): void
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $gateway = new EntityGateway(new PdoConnection($pdo));
     Session::use($gateway);
-    createTables($pdo, 'sqlite');
-    runVersionScenarios('sqlite', 'sqlite:' . $path, '', '', $check, $gateway);
-    dropOwnedTables($pdo);
+    try {
+        createTables($pdo, 'sqlite');
+        runVersionScenarios('sqlite', 'sqlite:' . $path, '', '', $check, $gateway);
+        runRelationScenarios('sqlite', $pdo, $check);
+    } finally {
+        Session::discard();
+        $remaining = dropOwnedTables($pdo, 'sqlite');
+        $check->assert($remaining === [], 'r24. 双连接 SQLite 仅清理自己创建的表并核验元数据', implode(', ', $remaining));
+        unset($gateway, $pdo);
+        gc_collect_cycles();
+    }
 }
 
 function verifySqliteFull(): Check
 {
     echo "==== SQLite 全量场景兜底（证明脚本逻辑正确；RETURNING 路径与 PG 同构）====\n";
     $check = new Check();
+    $pdo = null;
+    $rec = null;
     try {
         $pdo = new PDO('sqlite::memory:');
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -1344,7 +1717,7 @@ function verifySqliteFull(): Check
         $check->assert((string) $one === '1', 'a. 连接 + SELECT 1');
 
         createTables($pdo, 'sqlite');
-        $check->ok('建表 ' . VerifyItem::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyVersionRecord::table());
+        $check->assert(count(ownedTables($pdo)) === 8, '建表并按 PDO 登记 8 张随机测试表');
 
         $rec = new RecordingConnection(new PdoConnection($pdo));
         $gateway = new EntityGateway($rec);
@@ -1352,6 +1725,7 @@ function verifySqliteFull(): Check
 
         runScenarios('sqlite', $pdo, $rec, $check);
         runComplexScenarios('sqlite', $pdo, $rec, $check);
+        runRelationScenarios('sqlite', $pdo, $check);
         $sqlitePath = tempnam(sys_get_temp_dir(), 'pixiaoka-orm-version-');
         if (!is_string($sqlitePath)) {
             $check->no('r. SQLite 双连接临时数据库', '无法创建临时文件');
@@ -1363,20 +1737,23 @@ function verifySqliteFull(): Check
                 Session::use($gateway);
                 gc_collect_cycles();
                 $check->assert(@unlink($sqlitePath), 'r23. 释放双连接后仅删除自己的 SQLite 临时文件');
-                $ownedTables = [VerifyItem::table(), VerifyTag::table(), VerifyVersionRecord::table()];
             }
         }
+    } catch (Throwable $e) {
+        $check->no('SQLite 兜底执行', $e::class . ': ' . $e->getMessage());
+    } finally {
+        Session::discard();
+        if ($pdo instanceof PDO) {
+            checkOwnedTablesDropped($check, $pdo, 'sqlite');
+        }
+    }
 
-        dropOwnedTables($pdo);
-        $check->ok('清理：' . VerifyVersionRecord::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyItem::table() . ' 已 DROP（仅本次创建）');
-
+    if ($rec !== null) {
         echo "\n---- SQLite ORM 生成的 SQL 清单（去重）----\n";
         foreach ($rec->sqlList() as $sql) {
             echo "  $sql\n";
         }
         echo "-------------------------------------------\n";
-    } catch (Throwable $e) {
-        $check->no('SQLite 兜底执行', $e->getMessage());
     }
 
     return $check;
@@ -1391,6 +1768,11 @@ $suffix = strtolower(bin2hex(random_bytes(4))); // 8 位十六进制
 VerifyItem::$tableName = 'orm_verify_item_' . $suffix;
 VerifyTag::$tableName = 'orm_verify_tag_' . $suffix;
 VerifyVersionRecord::$tableName = 'orm_verify_version_' . $suffix;
+VerifyRelationCustomer::$tableName = 'orm_verify_customer_' . $suffix;
+VerifyRelationProfile::$tableName = 'orm_verify_profile_' . $suffix;
+VerifyRelationOrder::$tableName = 'orm_verify_order_' . $suffix;
+VerifyRelationTenant::$tableName = 'orm_verify_tenant_' . $suffix;
+VerifyRelationEntry::$tableName = 'orm_verify_entry_' . $suffix;
 echo '本次验证表名: ' . VerifyItem::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyVersionRecord::table() . "\n";
 
 // .env 依序探测：库根 → webman 主项目（作为库在主项目内开发时复用其连接配置）

@@ -90,6 +90,20 @@ final class Asset extends Entity
     }
 }
 
+final class BoundaryKey extends Entity
+{
+    #[Column, PrimaryKey(order: 1)]
+    public string $left;
+
+    #[Column, PrimaryKey(order: 2)]
+    public string $right;
+
+    #[Column]
+    public string $label;
+
+    public static function table(): string { return 'boundary_key'; }
+}
+
 final class Flag extends Entity
 {
     #[Column]
@@ -188,6 +202,7 @@ final class OrmKernelTest extends TestCase
             )'
         );
         $this->pdo->exec('CREATE TABLE flag ("on" INTEGER NOT NULL PRIMARY KEY, label TEXT NOT NULL, created_at INTEGER NOT NULL)');
+        $this->pdo->exec('CREATE TABLE boundary_key (left TEXT NOT NULL, right TEXT NOT NULL, label TEXT NOT NULL, PRIMARY KEY (left, right))');
         $this->pdo->exec('CREATE TABLE hooked_asset (
             user_id INTEGER NOT NULL, key TEXT NOT NULL, val INTEGER NOT NULL,
             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0,
@@ -197,6 +212,35 @@ final class OrmKernelTest extends TestCase
     }
 
     // —— 基础 CRUD ——
+
+    public function testCacheIdentityPreservesCompositeKeyBoundariesAndTypes(): void
+    {
+        BoundaryKey::insertAll([
+            ['left' => "a\0b", 'right' => 'c', 'label' => 'first'],
+            ['left' => 'a', 'right' => "b\0c", 'label' => 'second'],
+        ]);
+        $first = BoundaryKey::find(['left' => "a\0b", 'right' => 'c']);
+        $second = BoundaryKey::find(['left' => 'a', 'right' => "b\0c"]);
+        self::assertSame('first', $first?->label);
+        self::assertSame('second', $second?->label);
+        self::assertNotSame($first, $second);
+
+        Flag::insertAll([['on' => true, 'label' => 'enabled']]);
+        $cached = Flag::find(['on' => true]);
+        $sameBoolean = Flag::find(['on' => 1]);
+        self::assertSame($cached, $sameBoolean, '同一布尔主键规范化后必须复用缓存对象');
+        $flagPdo = new PDO('sqlite::memory:');
+        $flagPdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $flagPdo->exec('CREATE TABLE flag ("on" INTEGER NOT NULL PRIMARY KEY, label TEXT NOT NULL, created_at INTEGER NOT NULL)');
+        $flagPdo->exec("INSERT INTO flag (\"on\", label, created_at) VALUES (1, 'other', 0)");
+        Session::use(new EntityGateway(new PdoConnection($flagPdo)));
+        try {
+            $cached->refresh();
+            self::fail('不同 Gateway 不得共享实体缓存');
+        } catch (\InvalidArgumentException) {
+        }
+        self::assertSame('enabled', $cached?->label);
+    }
 
     public function testSurrogateInsertFillsGeneratedKeyAndCastsTypes(): void
     {
@@ -536,6 +580,30 @@ final class OrmKernelTest extends TestCase
         self::assertFalse($asset->isNew());
         $found = Asset::find(['user_id' => 9, 'key' => 'vip']);
         self::assertInstanceOf(Asset::class, $found);
+    }
+
+    public function testDeleteAndReinsertInsideTransactionRestoresIdentityBaseline(): void
+    {
+        $asset = new Asset();
+        $asset->user_id = 9;
+        $asset->key = 'vip';
+        $asset->val = 5;
+        $asset->save();
+        $baseline = $asset->takeOriginal();
+        try {
+            Asset::transaction(function () use ($asset): void {
+                $asset->delete();
+                $asset->save();
+                self::assertSame($asset, Asset::find(['user_id' => 9, 'key' => 'vip']));
+                throw new \RuntimeException('rollback reinsert');
+            });
+        } catch (\RuntimeException $e) {
+            self::assertSame('rollback reinsert', $e->getMessage());
+        }
+        self::assertFalse($asset->isNew());
+        self::assertSame($baseline, $asset->takeOriginal());
+        self::assertSame($asset, Asset::find(['user_id' => 9, 'key' => 'vip']));
+        self::assertSame(5, Asset::find(['user_id' => 9, 'key' => 'vip'])?->val);
     }
 
     // —— 幂等更新 ——

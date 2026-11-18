@@ -5,21 +5,35 @@ declare(strict_types=1);
 namespace Pixiaoka\Orm;
 
 use Pixiaoka\Orm\Exception\IdentityException;
+use Pixiaoka\Orm\Gateway\EntityGateway;
 use Pixiaoka\Orm\Metadata\ModelMeta;
+use Pixiaoka\Orm\Metadata\RelationMeta;
 use Pixiaoka\Orm\Query\Builder;
 use Pixiaoka\Orm\Query\Expression;
+use Pixiaoka\Orm\Relation\BelongsTo;
+use Pixiaoka\Orm\Relation\HasMany;
+use Pixiaoka\Orm\Relation\HasOne;
+use Pixiaoka\Orm\Relation\Relation;
 
 /**
  * Active Record。字段是带 #[Column] 的类型化属性，表名由子类给出。
- * save / insert / delete 走当前 Session，不在模型里写 SQL。
+ * save / insert / delete 走当前 Session 并检查实体的弱 Gateway 归属，不在模型里写 SQL。
  */
 abstract class Entity
 {
     private bool $ormNew = true;
 
+    /** 弱归属不延长 Gateway/连接生命周期；禁止跨连接隐式切换。 */
+    private ?\WeakReference $ormGateway = null;
+
     /** @var array<string, mixed> 持久化时的原值，用于脏跟踪 */
     private array $ormOriginal = [];
 
+    /** @var array<string, Entity|list<Entity>|null> 仅保存显式加载的关系，不参与持久化。 */
+    private array $ormRelations = [];
+
+    /** @var array<string, true> 已加载 null/空数组也必须与未加载区分。 */
+    private array $ormLoadedRelations = [];
     // ---- 生命周期钩子，子类覆盖 ----
 
     public function beforeSave(): void {}
@@ -35,18 +49,81 @@ abstract class Entity
 
     public function isNew(): bool { return $this->ormNew; }
 
-    /** 插入成功，或从数据库读出后，标成已存在。 */
-    public function markPersisted(): void
+    /** @internal 由所属 Gateway 在插入成功或水合后标成已存在；业务代码应使用 save/refresh。 */
+    public function markPersisted(EntityGateway $gateway): void
     {
+        $gateway->forEntity($this);
         $this->ormNew = false;
         $this->ormOriginal = $this->snapshot();
     }
 
-    /** 删除成功后标成未入库。之后 save 会重新插入。 */
+    /** 删除成功后标成未入库。之后 save 只能在原 Gateway 上重新插入。 */
     public function markDeleted(): void
     {
         $this->ormNew = true;
         $this->ormOriginal = [];
+        $this->clearLoadedRelations();
+    }
+
+    /** 显式重新读取当前行时也清理关系，避免旧外键继续对应新实体状态。 @internal */
+    public function clearLoadedRelations(): void
+    {
+        $this->ormRelations = [];
+        $this->ormLoadedRelations = [];
+    }
+
+    /** @internal 只由只读关系加载器在关联键变化时失效对应关系。 */
+    public function forgetLoadedRelation(string $name): void
+    {
+        unset($this->ormRelations[$name], $this->ormLoadedRelations[$name]);
+    }
+
+    /** @internal 只由只读关系加载器调用。 */
+    public function setLoadedRelation(string $name, Entity|array|null $value): void
+    {
+        $this->ormRelations[$name] = $value;
+        $this->ormLoadedRelations[$name] = true;
+    }
+
+    public function relationLoaded(string $name): bool
+    {
+        return isset($this->ormLoadedRelations[$name]);
+    }
+
+    /** 未加载关系不会隐式查询。 @return Entity|list<Entity>|null */
+    public function loadedRelation(string $name): Entity|array|null
+    {
+        if (!$this->relationLoaded($name)) {
+            throw new \LogicException(static::class . "::$name 尚未加载；请先 with/load，或调用 $name()->get()");
+        }
+
+        return $this->ormRelations[$name];
+    }
+
+    /** @param string|array<int|string, mixed> $relations */
+    public function load(string|array $relations): static
+    {
+        $this->gateway()->loadRelations([$this], $relations);
+
+        return $this;
+    }
+
+    /** 根据目标关系方法的显式返回类型创建查询对象。 @internal */
+    public function makeRelation(?RelationMeta $meta = null): Relation
+    {
+        $gateway = $this->gateway();
+        if ($meta === null) {
+            $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2);
+            $name = $trace[1]['function'] ?? '';
+            $meta = $gateway->relation(static::class, $name);
+        }
+
+        return match ($meta->kind) {
+            'hasOne' => new HasOne($this, $meta, $gateway),
+            'hasMany' => new HasMany($this, $meta, $gateway),
+            'belongsTo' => new BelongsTo($this, $meta, $gateway),
+            default => throw new \LogicException('未知关系类型 ' . $meta->kind),
+        };
     }
 
     /** @internal */
@@ -55,9 +132,36 @@ abstract class Entity
         return $this->ormOriginal;
     }
 
+    /** @internal 仅首次接触实体时建立弱归属；过期也不能静默换绑。 */
+    public function bindGateway(EntityGateway $gateway): void
+    {
+        if ($this->ormGateway !== null) {
+            throw new \LogicException(static::class . ' 已有 Gateway 归属，不能重新绑定');
+        }
+        $this->ormGateway = \WeakReference::create($gateway);
+    }
+
+    /** @internal */
+    public function hasGatewayBinding(): bool
+    {
+        return $this->ormGateway !== null;
+    }
+
+    /** @internal */
+    public function boundGateway(): ?EntityGateway
+    {
+        return $this->ormGateway?->get();
+    }
+
+    /** @internal 任何实体入口都须经过 Gateway 的绑定/归属检查。 */
+    private function gateway(): EntityGateway
+    {
+        return Session::get()->gateway->forEntity($this);
+    }
+
     /**
      * @internal 事务边界保存完整持久化状态，包含字段的未初始化状态。
-     * @return array{new: bool, original: array<string, mixed>, values: array<string, mixed>}
+     * @return array{new: bool, original: array<string, mixed>, values: array<string, mixed>, relations: array<string, mixed>, loadedRelations: array<string, true>}
      */
     public function captureState(ModelMeta $meta): array
     {
@@ -68,11 +172,17 @@ abstract class Entity
             }
         }
 
-        return ['new' => $this->ormNew, 'original' => $this->ormOriginal, 'values' => $values];
+        return [
+            'new' => $this->ormNew,
+            'original' => $this->ormOriginal,
+            'values' => $values,
+            'relations' => $this->ormRelations,
+            'loadedRelations' => $this->ormLoadedRelations,
+        ];
     }
 
     /**
-     * @param array{new: bool, original: array<string, mixed>, values: array<string, mixed>} $state
+     * @param array{new: bool, original: array<string, mixed>, values: array<string, mixed>, relations?: array<string, mixed>, loadedRelations?: array<string, true>} $state
      * @param ModelMeta $meta
      * @throws \ReflectionException
      * @internal 只在物理事务回滚时恢复，不能用于普通业务赋值。
@@ -89,13 +199,22 @@ abstract class Entity
         }
         $this->ormNew = $state['new'];
         $this->ormOriginal = $state['original'];
+        $this->ormRelations = $state['relations'] ?? [];
+        $this->ormLoadedRelations = $state['loadedRelations'] ?? [];
     }
 
     /** 只改过的字段才进入 UPDATE。 */
     private function snapshot(): array
     {
         $arr = [];
-        $meta = Session::get()->gateway->meta(static::class);
+        $gateway = $this->boundGateway();
+        if ($gateway === null) {
+            if ($this->hasGatewayBinding()) {
+                throw new \LogicException(static::class . ' 原 Gateway 已销毁，请在新 Gateway 上显式重查');
+            }
+            $gateway = Session::get()->gateway;
+        }
+        $meta = $gateway->meta(static::class);
         foreach ($meta->fields as $field) {
             if (!$field->primary && $this->propSet($field->property)) {
                 $arr[$field->property] = $this->{$field->property};
@@ -113,7 +232,7 @@ abstract class Entity
             return;
         }
 
-        Session::get()->gateway->update($this);
+        $this->gateway()->update($this);
     }
 
     public function insert(): void
@@ -122,7 +241,7 @@ abstract class Entity
             throw new IdentityException(static::class . ' 已经在库里，不能再 insert');
         }
 
-        Session::get()->gateway->insert($this);
+        $this->gateway()->insert($this);
     }
 
     public function delete(): void
@@ -131,7 +250,7 @@ abstract class Entity
             throw new IdentityException(static::class . ' 还没入库，不能 delete');
         }
 
-        Session::get()->gateway->delete($this);
+        $this->gateway()->delete($this);
     }
 
     /** @return Builder<static> */
@@ -151,18 +270,26 @@ abstract class Entity
 
     public function toArray(): array
     {
+        $gateway = $this->boundGateway();
+        if ($gateway !== null) {
+            return $gateway->toArray($this);
+        }
+        if ($this->hasGatewayBinding()) {
+            throw new \LogicException(static::class . ' 原 Gateway 已销毁，请在新 Gateway 上显式重查');
+        }
+
         return Session::get()->gateway->toArray($this);
     }
 
     public function refresh(): static
     {
-        Session::get()->gateway->refresh($this);
+        $this->gateway()->refresh($this);
 
         return $this;
     }
 
     /**
-     * @param list<array<string, mixed>> $rows
+     * @param list<static|array<string, mixed>> $rows
      */
     public static function insertAll(array $rows): void
     {
@@ -216,6 +343,16 @@ abstract class Entity
     public static function transaction(callable $func): mixed
     {
         return Session::get()->gateway->transaction($func);
+    }
+
+    public function __call(string $name, array $arguments): Relation
+    {
+        $meta = $this->gateway()->relation(static::class, $name);
+        if ($arguments !== []) {
+            throw new \InvalidArgumentException(static::class . "::$name 关系方法不接受参数");
+        }
+
+        return $this->makeRelation($meta);
     }
 
     /** @internal 属性是否已初始化 */

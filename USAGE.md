@@ -180,7 +180,83 @@ try {
 
 带 `#[Version]` 的模型不支持 Builder 条件 UPDATE/DELETE 或 UPSERT（包括冲突忽略），这些操作缺少逐实体旧版本快照。`executeRaw()` 不自动加版本条件或处理冲突，需由调用方控制 SQL、影响行数以及 `refresh()` / `flushCache()`。生成器只对非空、非主键、列名恰为 `version` 的 `int` 字段自动添加 `#[Version]`，其他字段名请显式添加。
 
-## 3. Active Record
+## 3. 只读关系与预加载
+
+### 声明关系
+
+关系注解和查询类同名但命名空间不同，可使用别名避免冲突：
+
+```php
+use Pixiaoka\Orm\Annotation\BelongsTo;
+use Pixiaoka\Orm\Annotation\HasMany;
+use Pixiaoka\Orm\Relation\BelongsTo as BelongsToQuery;
+use Pixiaoka\Orm\Relation\HasMany as HasManyQuery;
+
+final class Customer extends Entity
+{
+    #[Column, PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public string $name;
+    public static function table(): string { return 'customer'; }
+
+    #[HasMany(target: Order::class, foreignKey: ['customer_id'])]
+    public function orders(): HasManyQuery { return $this->makeRelation(); }
+}
+
+final class Order extends Entity
+{
+    #[Column, PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public ?int $customer_id = null;
+    public static function table(): string { return 'order'; }
+
+    #[BelongsTo(target: Customer::class, localKey: ['customer_id'])]
+    public function customer(): BelongsToQuery { return $this->makeRelation(); }
+}
+```
+
+关系方法必须是 public、无参数、非 static，并精确声明具体关系查询返回类型。`localKey` 属于当前模型，`foreignKey` 属于目标模型；省略一侧使用该侧主键。支持属性名/真实列名及复合键，键按数组位置对应，不允许重复或类型不匹配。
+
+### 显式查询与预加载
+
+```php
+// 单独查询关系，不隐式修改源实体的 loadedRelation 状态。
+$orders = $customer->orders()->get();
+$latestPaid = $customer->orders()->query(
+    Order::query()->where('status', 'paid')->orderBy('id', 'DESC'),
+)->first(); // LIMIT 1
+
+// 一次主查询 + 每层每个关系一次/多批独立 SELECT。
+$customers = Customer::query()->with('profile', 'orders')->get();
+$customers = Customer::query()->with([
+    'orders' => fn ($q) => $q->where('status', 'paid'),
+    'orders.customer',
+])->get();
+
+$customer->load('orders');
+if ($customer->relationLoaded('orders')) {
+    $orders = $customer->loadedRelation('orders');
+}
+```
+
+`hasMany()` 的 `get()` 返回实体列表；`hasOne()`、`belongsTo()` 的 `get()` 返回实体或 `null`。三者 `first()` 都返回实体或 `null`。`loadedRelation()` 未加载时抛异常，不会隐式执行 SQL。任一侧关联键为 `null` 时，结果为 `null` 或空数组，且不执行关系 SQL。
+
+显式关系查询保留用户排序，尚未按目标主键排序时追加目标主键升序决胜条件；`hasOne` 多候选记录与 `belongsTo` 非唯一目标键由同一规则稳定选择，`first()` 仍只取第一行。预加载依次补齐目标关联键和目标主键，用户排序仍在前；与完整主键重叠的关联键不会重复追加排序。关系注解同类重复或混合声明均在首次进入关系功能时抛 `MetadataException`；普通 CRUD 不扫描关系注解。预加载约束只允许 WHERE/OR 和排序，拒绝全局分页、投影、JOIN、GROUP/HAVING、UNION、派生表、DISTINCT、表别名、行锁和闭包内再次 `with/load`。`with()` 只能用于实体 `get()` / `first()`，不能被 `rows()`、`value()`、`count()` 或条件 UPDATE/DELETE 静默忽略。普通 `Builder::first()` 不自动补主键排序。
+
+### 对象、事务和连接边界
+
+- 关系不进入 `toArray()`、dirty tracking 或自动保存/删除；`save()` 保留关系，`refresh()` / `delete()` 清空。
+- 普通 `query()` 返回独立副本；只有单次关系图按主键去重，嵌套反向关系可指向本次主查询父对象。
+- 关系图成功后才统一安装关系并发布缓存，失败恢复字段、原值、关系及缓存；物理事务回滚也恢复这些状态。
+- 刷新缓存目标保留未保存字段；依赖已变化持久化关联键的旧关系会精确失效，本图待安装的新关系会在成功后替换它，未受影响的关系继续保留。需要丢弃本地修改时，应显式 `refresh()`，不能依赖关系加载覆盖。
+- 预加载是多条 SELECT，不是数据库原子快照；一致性要求高时放入事务并选择适当隔离级别。
+- 实体以弱引用记录首次读取/持久化它的 Gateway。`discard()` 后重新登记同一个 Gateway，仍可继续保存、刷新和加载关系；切到另一个 Gateway 则拒绝隐式读写，应显式重查。实体数据库操作仍必须显式选择 Session。原 Gateway 已销毁时，数据库操作和 `toArray()` 会明确报错，不能自动绑定新连接；`loadedRelation()` 只读已加载内存且不查询，无需 Session。
+- 弱归属不等于整个对象图都能立即释放：Gateway 的 `RowCache` 会强持有 LRU 内的实体，已加载关系也会持有相关实体。连接池每次借出需要完全隔离时，应创建新的 Gateway；归还前应丢弃该 Gateway、清理其缓存及外部实体/关系图引用，不能只释放一个 Entity 变量。原 Gateway 被销毁后的旧实体只能在新连接上显式重查。
+- 当前不包含 `belongsToMany`、自动级联写入、`whereHas()`、`withCount()` 或属性懒加载。
+
+## 4. Active Record
 
 ### save() —— 智能插入/更新
 
@@ -253,7 +329,7 @@ $u = User::find(['id' => 1]);
 $u->refresh(); // 重新 SELECT，覆盖所有字段
 ```
 
-## 4. 查询构建器
+## 5. 查询构建器
 
 ### 基础查询
 
@@ -311,9 +387,9 @@ $users = User::query()
     ->get();
 ```
 
-## 5. 复杂查询
+## 6. 复杂查询
 
-### 5.1 结果类型
+### 6.1 结果类型
 
 `get()` / `first()` 只返回完整实体。自定义投影、JOIN、聚合、GROUP/HAVING、UNION、派生表的结果必须走：
 
@@ -323,7 +399,7 @@ $users = User::query()
 
 ORM 不会把缺列数组强行 hydrate 成实体，也不会把部分实体写进行缓存。原始数组不会自动转为 `Decimal`、`DateTimeImmutable` 等 PHP 对象。
 
-### 5.2 投影、JOIN 和表别名
+### 6.2 投影、JOIN 和表别名
 
 ```php
 use Pixiaoka\Orm\Query\JoinClause;
@@ -342,7 +418,7 @@ $rows = Order::query()->alias('o')
 
 基表模型字段的 WHERE/IN/BETWEEN/SET 值会复用模型 Caster，支持属性名和真实列名。带 `alias.column` 的字段不自动推断其他表模型，应传数据库标量或用 raw 条件。
 
-### 5.3 聚合、DISTINCT、GROUP BY / HAVING
+### 6.3 聚合、DISTINCT、GROUP BY / HAVING
 
 ```php
 $stats = Order::query()
@@ -362,7 +438,7 @@ $users = Order::query()->select('user_id')->distinct()->count();
 
 聚合函数只允许 COUNT/SUM/AVG/MIN/MAX。结构化 HAVING 仅接受标识符或上述聚合表达式；复杂条件使用参数化 `havingRaw()`。
 
-### 5.4 子查询与派生表
+### 6.4 子查询与派生表
 
 ```php
 $paid = OrderTag::query()->select('order_id')->where('label', 'paid');
@@ -383,7 +459,7 @@ $rows = Order::query()->select('uid')->from($top, 'ranked')
 
 标量和 IN 子查询必须显式只选择一列；EXISTS 无此限制。子查询、派生表与 UNION 不允许携带行锁；子查询必须与父查询来自同一个 `EntityGateway`，防止 SQL 和参数在错误连接上执行。
 
-### 5.5 UNION / UNION ALL
+### 6.5 UNION / UNION ALL
 
 ```php
 $first = Order::query()->selectAs('sku', 'name')
@@ -399,7 +475,7 @@ $rows = $first->unionAll($second)
 
 各分支必须返回相同数量且同名的输出列，请使用 `select()/selectAs()` 或带别名的 `aggregate()`。`union()` 前的局部分页属于首分支；分支自己的 `orderBy()/limit()/offset()` 由 Builder 按 SQLite/MySQL/PostgreSQL 方言包裹。嵌套 UNION 可作为派生表或单列子查询；复杂 raw UNION 请使用 `queryRaw()`。
 
-### 5.6 Raw SQL：CTE、窗口函数和专有表达式
+### 6.6 Raw SQL：CTE、窗口函数和专有表达式
 
 ```php
 $rows = Order::queryRaw(
@@ -429,9 +505,9 @@ Raw 是**受信任的开发者 SQL**，不是用户输入拼接接口：
 
 Raw 写入模型数据后需要显式 `Order::flushCache()`；它绕过模型身份和生命周期钩子。
 
-## 6. 条件 UPDATE / DELETE、UPSERT 与行锁
+## 7. 条件 UPDATE / DELETE、UPSERT 与行锁
 
-### 6.1 条件批量写入
+### 7.1 条件批量写入
 
 ```php
 $affected = Order::query()->where('user_id', 7)->update(['qty' => 10]);
@@ -444,7 +520,7 @@ PostgreSQL/SQLite 使用 `DELETE ... RETURNING` 读取实际删除主键；MySQL
 
 MySQL 预查与外部并发写之间不提供跨 Session/进程的一致性保证，`isNew()` 状态也不是分布式锁。需要严格并发一致性时，请使用事务、数据库约束和行锁。
 
-### 6.2 跨方言 UPSERT
+### 7.2 跨方言 UPSERT
 
 ```php
 Order::upsert($values);                    // 默认主键冲突，更新其余输入字段
@@ -464,7 +540,7 @@ Order::upsert($values, ['qty'], ['key']);  // 显式冲突键
 
 **MySQL 不能指定 conflict target，会响应任意唯一键冲突**。`$conflictColumns` 在 MySQL 只负责输入完整性校验，不会把 SQL 限制为指定索引。代理生成键只有显式作为冲突键时才允许写入。
 
-### 6.3 行锁
+### 7.3 行锁
 
 ```php
 Order::transaction(function (): void {
@@ -477,7 +553,7 @@ $shared = Order::query()->where('id', 1)->forShare()->first();
 
 PostgreSQL/MySQL 支持 `FOR UPDATE/FOR SHARE`，Builder 按各自语法放置锁与分页子句。SQLite 不支持，执行时明确抛异常，不能静默忽略。通常应在事务内使用；子查询、派生表、UNION 和条件写不允许携带行锁。
 
-## 7. 批量插入
+## 8. 批量插入
 
 ```php
 // 数组方式
@@ -493,7 +569,13 @@ User::insertAll([$a, $b]);
 // $a、$b 的 created_at 被填充，状态变为 persisted
 ```
 
-## 8. 事务
+数组与 Entity 可以混批，SQL 保留输入行序，每块最多 500 行，并同时受 65535 个绑定参数上限约束。首条 INSERT 前会完成整批可预知检查：数组字段和类型转换、实体模型/新旧状态/Gateway 归属、自动时间与版本默认值、前置钩子、钩子执行后的最终值和版本校验。后续分块存在坏行时，前面的分块不会先写入；失败批次也不会给未绑定 Entity 留下 Gateway 归属。
+
+`beforeSave()` / `beforeInsert()` 可以补齐必填字段，每个 Entity 只执行一次；SQL 全部成功后才回填生成键、标记 persisted、执行 `afterSave()` / `afterInsert()` 并发布缓存。预检失败不假装撤销已经运行的前置钩子、字段自动填值或外部副作用。数据库约束冲突、SQL/连接失败、生成键回填或后置钩子失败同样不承诺自动原子撤销，需要整批原子性时必须使用显式事务。事务成功回滚则恢复前置钩子及自动填值之前的持久化字段、未初始化状态、生成键、版本和缓存身份；非字段业务属性及外部副作用仍由业务负责。
+
+带生成键的多行混批或纯 Entity 批次要求连接支持 `INSERT ... RETURNING`；MySQL 会在钩子及 SQL 前拒绝这类调用，请逐行 `save()`。纯数组行无需回填，仍可在 MySQL 批量插入。
+
+## 9. 事务
 
 ```php
 User::transaction(function () {
@@ -525,7 +607,7 @@ User::transaction(function () {
 
 当前上下文有未结束事务时，`Session::use()` / `Session::scope()` 的隐式换绑会直接抛 `LogicException`，即使传入同一个 Gateway 也一样；不执行回滚、不清理事务状态、不释放连接所有权，原 Session 保持不变。必须先显式 `Session::discard()` 并处理回滚结果，不能把换绑当成静默清理事务的方式。
 
-## 9. 生命周期钩子
+## 10. 生命周期钩子
 
 在 Entity 子类中覆盖钩子方法，实现业务逻辑：
 
@@ -566,7 +648,7 @@ final class Order extends Entity
 | `beforeDelete()` | delete 之前 |
 | `afterDelete()` | delete 之后 |
 
-## 10. 行缓存
+## 11. 行缓存
 
 **进程内自动管理**。同一个 class + 主键的 `find()` 会命中缓存返回同一个对象实例。
 
@@ -581,7 +663,7 @@ $b = Asset::find(['user_id' => 1, 'key' => 'x']);
 - 事务回滚恢复事务开始时的 LRU 快照和 canonical 对象，再补齐缺失身份
 - 缓存在进程内有效，不跨进程
 
-## 11. 脏跟踪
+## 12. 脏跟踪
 
 `save()` 做更新时只生成变了字段的 SET 子句。比较的是 `markPersisted()` 时刻的快照和当前值。
 
@@ -593,7 +675,7 @@ $u->save();
 // 不会写 name —— 因为它没变
 ```
 
-## 12. 主键规则
+## 13. 主键规则
 
 | 规则 | 说明 |
 |------|------|
@@ -604,7 +686,7 @@ $u->save();
 | 身份完整 | 任何按主键操作缺少任意一列都会拒绝，不发 SQL |
 | 不可空 | 主键属性不能是可空类型（`?int`） |
 
-## 13. 独立模型生成器
+## 14. 独立模型生成器
 
 `pixiaoka/orm` 自带数据库结构读取和模型生成能力，不依赖 webman。生成器只连接调用方明确给出的数据库，并且只向 `--dir` 指定的目录写入模型。
 
@@ -695,7 +777,7 @@ webman 的 `orm:gen` 只负责读取框架配置并调用同一库内 API，不�
 
 默认值边界详见 [README](README.md#generate-models-from-a-database)：PHP 8.3 不生成对象属性初始化；PostgreSQL 的 Unicode 转义按码点生成 UTF-8，原始高位字节按服务器编码转换。非 UTF-8 混合转义、SQL_ASCII、未知编码和非法序列均不猜测数据库默认值，而采用安全的 PHP 兜底值。
 
-## 14. 可观测性
+## 15. 可观测性
 
 ```php
 use Pixiaoka\Orm\Observability\Event;
@@ -725,23 +807,23 @@ $unsubscribe = $gateway->subscribe(function (Event $event): void {
 
 `ContextInfo::$type` 为 root/fiber/coroutine，`$id` 是进程内上下文对象 `spl_object_id()`，不是跨请求或分布式追踪 ID。事件不包含参数值、查询结果、实体、连接、原异常对象、消息或堆栈；SQL 原文仍可能含手写字面量秘密，不能视为完全脱敏。只覆盖经过 Gateway 的 SQL、事务与 Session 操作，应用直接调用 PDO/Connection、SchemaInspector 不在范围内。可选 `Clock` 构造参数用于确定性计时测试。
 
-## 15. 测试与真实数据库验收
+## 16. 测试与真实数据库验收
 
 ```bash
-# PHP 8.3 完整测试：268 tests / 1356 assertions（2 项显式 DSN 实连测试默认跳过）
+# PHP 8.3 完整测试：318 tests / 10654 assertions（2 项显式 DSN 实连测试默认跳过）
 vendor/bin/phpunit
 
 # SQLite / MySQL / PostgreSQL 实连；进程环境变量覆盖 .env
 php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql tests/orm_live_verify.php
 ```
 
-MySQL/PostgreSQL 推荐使用独立 Docker 测试实例，例如 `mysql:8.4`、`postgres:16-alpine`。将 `DB_MYSQL_HOST/PORT/NAME/USER/PASSWORD`、`DB_PGSQL_HOST/PORT/NAME/USER/PASSWORD` 指向实例映射端口即可，完整启动示例见 [README](README.md#docker-复验)。`orm_live_verify.php` 使用随机表名，只清理本次创建的两张表；SQLite 兜底通过不能算真实 MySQL/PostgreSQL 通过。
+MySQL/PostgreSQL 推荐使用独立 Docker 测试实例，例如 `mysql:8.4`、`postgres:16-alpine`。将 `DB_MYSQL_HOST/PORT/NAME/USER/PASSWORD`、`DB_PGSQL_HOST/PORT/NAME/USER/PASSWORD` 指向实例映射端口即可，完整启动示例见 [README](README.md#docker-复验)。`orm_live_verify.php` 使用随机表名，按 PDO 登记并只清理本次创建的表；SQLite 兜底通过不能算真实 MySQL/PostgreSQL 通过。
 
 生成器另有 `tests/SchemaLiveTest.php`，只有显式设置 `PIXIAOKA_ORM_LIVE_MYSQL_DSN`、`PIXIAOKA_ORM_LIVE_PGSQL_DSN` 及对应 `_USER`、`_PASSWORD` 才连接外部数据库；默认跳过，不隐式读取本机服务或 `.env`。该测试使用原生预处理，覆盖主键、默认值、时间类型、生成文件 lint 和元数据，完整示例见 [README](README.md#模型生成器实连测试)。
 
-本次 PHP 8.3 默认套件为 268 tests / 1356 assertions（2 项显式 DSN 实连测试跳过）；PHP 8.4/8.5 显式配置专用 MySQL/PostgreSQL 后均为 268 tests / 1404 assertions，零跳过。独立真实数据库脚本在 MySQL 8.4 通过 77 项、PostgreSQL 16 通过 80 项，合计 157 项，零失败，SQLite 兜底未执行。PHPStan 生产代码检查零错误；Swoole/Swow 真实扩展验收未执行。
+本次只读关系阶段的本机 PHP 8.3 默认套件为 318 tests / 10654 assertions（2 项显式 DSN 实连测试跳过）；SQLite 实连通过 118 项、零失败，包含 1001 个不同复合关系键的三批查询及测试表元数据清理核验。显式双库 DSN 下完整套件为 318 tests / 10702 assertions；MySQL 8.4.13 实连通过 96 项、PostgreSQL 16.16 通过 99 项，均零失败。Docker PHP 8.3.36、8.4.27、8.5.12 均完成同一默认套件，PHPStan 生产代码检查零错误。CI 继续核验多版本、Composer、lint 和双库服务测试。Swoole/Swow 真实扩展验收未执行。
 
-## 16. 项目集成示例
+## 17. 项目集成示例
 
 当前项目使用 PostgreSQL（见 `config/database.php`），一个典型的模型迁移：
 

@@ -43,7 +43,7 @@ final class RowCache
         if ($item !== null && !$item->isNew()) {
             return $item;
         }
-        unset($this->items[$key]);
+        $this->clearKey($key);
 
         return null;
     }
@@ -197,8 +197,14 @@ final class RowCache
 
     private function makeKey(string $class, array $identity): string
     {
+        return self::key($class, $identity);
+    }
+
+    /** @internal 类型化序列化保留列边界，避免复合字符串键或标量类型拼接碰撞。 */
+    public static function key(string $class, array $identity): string
+    {
         ksort($identity);
 
-        return $class . ':' . implode("\0", $identity);
+        return $class . ':' . serialize($identity);
     }
 }
