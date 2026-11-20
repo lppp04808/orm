@@ -15,6 +15,56 @@ final class RenderContext
     /** @var array<string, int|float|string|bool|null> */
     private array $params = [];
     private int $index = 0;
+    private int $relationAlias = 0;
+
+    /** @var array<string, true> 外部父表、用户别名及关系目标的真实表名。 */
+    private array $relationQualifiers = [];
+
+    /** @var array<string, true> 已分配的内部关联别名，与外部限定名分开登记。 */
+    private array $relationAliases = [];
+
+    /**
+     * 同一次递归渲染共享别名作用域，重复 build 会重新从零编号。
+     * 顶层真实表名/用户别名也属于祖先，不能被更深层内部别名遮蔽。
+     */
+    public function reserveRelationQualifier(string $qualifier): void
+    {
+        $normalized = strtolower($qualifier);
+        if ($this->hasRelationAlias($qualifier) || preg_match('/^_orm_relation_[1-9][0-9]*$/i', $qualifier) === 1) {
+            // 外部父表不得占用内部保留命名空间；更深层展开也必须能安全分配别名。
+            throw new InvalidArgumentException('表名或别名与已分配的 ORM 内部关联别名冲突: ' . $qualifier);
+        }
+        $this->relationQualifiers[$normalized] = true;
+    }
+
+    /** 父表及祖先限定名是否与新分配的内部别名冲突。 */
+    public function hasRelationQualifier(string $qualifier): bool
+    {
+        return isset($this->relationQualifiers[strtolower($qualifier)]);
+    }
+
+    /**
+     * 分配不会被外部父表、祖先或目标真实表名遮蔽的内部别名。
+     * 编号只在无冲突时推进；嵌套内部别名不再作为外部限定名重复登记。
+     */
+    public function relationAlias(): string
+    {
+        $next = $this->relationAlias + 1;
+        $alias = '_orm_relation_' . $next;
+        if ($this->hasRelationQualifier($alias)) {
+            throw new InvalidArgumentException('父表别名或真实表名与 ORM 内部关联别名冲突: ' . $alias);
+        }
+        $this->relationAlias = $next;
+        $this->relationAliases[strtolower($alias)] = true;
+
+        return $alias;
+    }
+
+    /** 已分配的内部别名是否会被一个后登记的外部限定名遮蔽。 */
+    public function hasRelationAlias(string $alias): bool
+    {
+        return isset($this->relationAliases[strtolower($alias)]);
+    }
 
     public function bind(int|float|string|bool|null $value): string
     {

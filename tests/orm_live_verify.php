@@ -351,6 +351,26 @@ final class VerifyRelationEntry extends Entity
     public function owner(): \Pixiaoka\Orm\Relation\BelongsTo { return $this->makeRelation(); }
 }
 
+final class VerifyRelationNode extends Entity
+{
+    public static string $tableName = 'orm_verify_node';
+
+    #[Column, PrimaryKey]
+    public int $id;
+    #[Column]
+    public ?int $parent_id = null;
+    #[Column]
+    public string $name;
+
+    public static function table(): string { return self::$tableName; }
+
+    #[HasMany(target: self::class, foreignKey: ['parent_id'])]
+    public function children(): \Pixiaoka\Orm\Relation\HasMany { return $this->makeRelation(); }
+
+    #[BelongsTo(target: self::class, localKey: ['parent_id'])]
+    public function parent(): \Pixiaoka\Orm\Relation\BelongsTo { return $this->makeRelation(); }
+}
+
 // ----------------------------------------------------------------------------
 // 验证结果收集
 // ----------------------------------------------------------------------------
@@ -485,6 +505,7 @@ function createTables(PDO $pdo, string $driver): void
         VerifyRelationOrder::table() => "id {$idColumn}, customer_id INT NULL, status {$text} NOT NULL, amount INT NOT NULL",
         VerifyRelationTenant::table() => 'tenant_id INT NOT NULL, id INT NOT NULL, name ' . $text . ' NOT NULL, PRIMARY KEY (tenant_id, id)',
         VerifyRelationEntry::table() => 'tenant_id INT NOT NULL, id INT NOT NULL, owner_tenant INT NOT NULL, owner_id INT NOT NULL, label ' . $text . ' NOT NULL, PRIMARY KEY (tenant_id, id)',
+        VerifyRelationNode::table() => 'id INT NOT NULL PRIMARY KEY, parent_id INT NULL, name ' . $text . ' NOT NULL',
     ];
     foreach ($relationTables as $table => $columns) {
         $pdo->exec("CREATE TABLE {$table} ({$columns})");
@@ -542,7 +563,7 @@ function checkOwnedTablesDropped(Check $check, PDO $pdo, string $driver): void
 {
     try {
         $remaining = dropOwnedTables($pdo, $driver);
-        $check->assert($remaining === [], '清理：本次创建的 8 张随机表已 DROP 并通过元数据核验', '仍存在: ' . implode(', ', $remaining));
+        $check->assert($remaining === [], '清理：本次创建的 9 张随机表已 DROP 并通过元数据核验', '仍存在: ' . implode(', ', $remaining));
     } catch (Throwable $e) {
         $check->no('清理 DROP TABLE 或元数据核验', $e::class . ': ' . $e->getMessage());
     }
@@ -1442,6 +1463,13 @@ function runRelationScenarios(string $driver, PDO $pdo, Check $check): void
             ['tenant_id' => 1, 'id' => 2, 'owner_tenant' => 2, 'owner_id' => 7, 'label' => 'b1'],
             ['tenant_id' => 1, 'id' => 3, 'owner_tenant' => 1, 'owner_id' => 7, 'label' => 'a2'],
         ]);
+        VerifyRelationNode::insertAll([
+            ['id' => 1, 'parent_id' => null, 'name' => 'root'],
+            ['id' => 2, 'parent_id' => 1, 'name' => 'child'],
+            ['id' => 3, 'parent_id' => 1, 'name' => 'other'],
+            ['id' => 4, 'parent_id' => 2, 'name' => 'leaf'],
+            ['id' => 5, 'parent_id' => null, 'name' => 'empty'],
+        ]);
         $check->ok('s0. ' . $driver . ' 关系数据集就绪');
 
         $customer = VerifyRelationCustomer::find(['id' => 1]);
@@ -1509,6 +1537,7 @@ function runRelationScenarios(string $driver, PDO $pdo, Check $check): void
             && VerifyRelationCustomer::find(['id' => 1]) === $cached
             && $cached->loadedRelation('profile') === $previousProfile,
             's12. 回滚恢复目标字段、缓存身份和关系状态');
+        $pdo->exec('UPDATE ' . VerifyRelationCustomer::table() . " SET name = 'alice' WHERE id = 1");
 
         $bulkTenants = [];
         $bulkEntries = [];
@@ -1582,6 +1611,55 @@ function runRelationScenarios(string $driver, PDO $pdo, Check $check): void
                 's17. 关系图事务回滚恢复关联键和旧关系', $e->getMessage());
         }
 
+        $paidCustomers = VerifyRelationCustomer::query()->whereRelation('orders', 'status', 'paid')->orderBy('id')->get();
+        $unpaidCustomers = VerifyRelationCustomer::query()->whereDoesntHave(
+            'orders',
+            static fn (Builder $q): Builder => $q->where('status', 'paid'),
+        )->orderBy('id')->get();
+        $countRows = VerifyRelationCustomer::query()->alias('c')->whereIn('id', [1, 2, 3])
+            ->withCount('orders')
+            ->withCount('orders', static fn (Builder $q): Builder => $q->where('status', 'paid'), 'paid_orders')
+            ->orderBy('id')->rows();
+        $check->assert(array_column($paidCustomers, 'name') === ['alice']
+            && array_column($unpaidCustomers, 'name') === ['bob', 'nobody']
+            && array_map('intval', array_column($countRows, 'orders_count')) === [3, 1, 0]
+            && array_map('intval', array_column($countRows, 'paid_orders')) === [2, 0, 0],
+            's18. whereHas/whereDoesntHave 与 withCount 在真实数据库保持集合语义',
+            json_encode(['paid' => array_column($paidCustomers, 'name'), 'unpaid' => array_column($unpaidCustomers, 'name'), 'counts' => $countRows], JSON_UNESCAPED_UNICODE));
+        $nested = VerifyRelationCustomer::query()->whereHas(
+            'orders.customer',
+            static fn (Builder $q): Builder => $q->where('name', 'alice'),
+        )->get();
+        $nestedCounts = VerifyRelationCustomer::query()->whereIn('id', [1, 2, 3])
+            ->withCount('orders.customer')->orderBy('id')->rows();
+        $check->assert(count($nested) === 1 && $nested[0]->name === 'alice'
+            && array_map('intval', array_column($nestedCounts, 'orders_customer_count')) === [3, 1, 0],
+            's19. 点分嵌套关系只约束末级并统计实际匹配行',
+            json_encode(['nested' => array_column($nested, 'name'), 'counts' => $nestedCounts], JSON_UNESCAPED_UNICODE));
+        $composite = VerifyRelationTenant::query()->whereIn('tenant_id', [1, 2])
+            ->withCount('entries')->orderBy('tenant_id')->orderBy('id')->rows();
+        $check->assert(array_map('intval', array_column($composite, 'entries_count')) === [2, 1, 0],
+            's20. 复合键相关计数不串租户', json_encode($composite, JSON_UNESCAPED_UNICODE));
+        $parents = VerifyRelationNode::query()->whereHas('children')->orderBy('id')->get();
+        $selfCounts = VerifyRelationNode::query()->withCount('children')->orderBy('id')->rows();
+        $reverse = VerifyRelationNode::query()->whereHas('parent')->orderBy('id')->get();
+        $check->assert(array_column($parents, 'id') === [1, 2]
+            && array_map('intval', array_column($selfCounts, 'children_count')) === [2, 1, 0, 0, 0]
+            && array_column($reverse, 'id') === [2, 3, 4],
+            's21. 同表自关联通过独立内部别名正相关父级和子级');
+        $query = VerifyRelationCustomer::query()->where('name', 'alice')->whereHas(
+            'orders',
+            static fn (Builder $q): Builder => $q->where('status', 'paid'),
+        );
+        $check->assert($query->build() === $query->build(),
+            's22. 同一关联 Builder 重复构建参数和内部别名稳定');
+        $updated = VerifyRelationCustomer::query()->whereRelation('orders', 'status', 'paid')->update(['name' => 'paid-owner']);
+        $deleted = VerifyRelationCustomer::query()->whereDoesntHave('orders')->delete();
+        $check->assert($updated === 1 && $deleted === 1
+            && VerifyRelationCustomer::query()->where('name', 'paid-owner')->count() === 1
+            && VerifyRelationCustomer::query()->where('name', 'nobody')->count() === 0,
+            's23. 关系条件 UPDATE/DELETE 只修改目标父行');
+
         $beforeBadBatch = (int) $pdo->query('SELECT COUNT(*) FROM ' . VerifyRelationCustomer::table())->fetchColumn();
         $badRows = [];
         for ($index = 0; $index < 500; $index++) {
@@ -1597,11 +1675,11 @@ function runRelationScenarios(string $driver, PDO $pdo, Check $check): void
         try {
             try {
                 VerifyRelationCustomer::insertAll($badRows);
-                $check->no('s18. 500+1 坏数组行在第一条 INSERT 前拒绝', '没有抛出预期异常');
+                $check->no('s24. 500+1 坏数组行在第一条 INSERT 前拒绝', '没有抛出预期异常');
             } catch (IdentityException|\TypeError) {
                 $afterBadBatch = (int) $pdo->query('SELECT COUNT(*) FROM ' . VerifyRelationCustomer::table())->fetchColumn();
                 $check->assert($inserts === 0 && $afterBadBatch === $beforeBadBatch,
-                    's18. 500+1 坏数组行在第一条 INSERT 前拒绝', 'inserts=' . $inserts);
+                    's24. 500+1 坏数组行在第一条 INSERT 前拒绝', 'inserts=' . $inserts);
             }
         } finally {
             $unsubscribeInserts();
@@ -1644,7 +1722,7 @@ function verifyOn(string $label, string $dsn, string $user, string $pass): Check
     $rec = null;
     try {
         createTables($pdo, $driver);
-        $check->assert(count(ownedTables($pdo)) === 8, '建表并按 PDO 登记 8 张随机测试表');
+        $check->assert(count(ownedTables($pdo)) === 9, '建表并按 PDO 登记 9 张随机测试表');
 
         $rec = new RecordingConnection(new PdoConnection($pdo));
         $gateway = new EntityGateway($rec);
@@ -1717,7 +1795,7 @@ function verifySqliteFull(): Check
         $check->assert((string) $one === '1', 'a. 连接 + SELECT 1');
 
         createTables($pdo, 'sqlite');
-        $check->assert(count(ownedTables($pdo)) === 8, '建表并按 PDO 登记 8 张随机测试表');
+        $check->assert(count(ownedTables($pdo)) === 9, '建表并按 PDO 登记 9 张随机测试表');
 
         $rec = new RecordingConnection(new PdoConnection($pdo));
         $gateway = new EntityGateway($rec);
@@ -1773,6 +1851,7 @@ VerifyRelationProfile::$tableName = 'orm_verify_profile_' . $suffix;
 VerifyRelationOrder::$tableName = 'orm_verify_order_' . $suffix;
 VerifyRelationTenant::$tableName = 'orm_verify_tenant_' . $suffix;
 VerifyRelationEntry::$tableName = 'orm_verify_entry_' . $suffix;
+VerifyRelationNode::$tableName = 'orm_verify_node_' . $suffix;
 echo '本次验证表名: ' . VerifyItem::table() . ' / ' . VerifyTag::table() . ' / ' . VerifyVersionRecord::table() . "\n";
 
 // .env 依序探测：库根 → webman 主项目（作为库在主项目内开发时复用其连接配置）

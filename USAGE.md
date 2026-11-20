@@ -254,7 +254,49 @@ if ($customer->relationLoaded('orders')) {
 - 预加载是多条 SELECT，不是数据库原子快照；一致性要求高时放入事务并选择适当隔离级别。
 - 实体以弱引用记录首次读取/持久化它的 Gateway。`discard()` 后重新登记同一个 Gateway，仍可继续保存、刷新和加载关系；切到另一个 Gateway 则拒绝隐式读写，应显式重查。实体数据库操作仍必须显式选择 Session。原 Gateway 已销毁时，数据库操作和 `toArray()` 会明确报错，不能自动绑定新连接；`loadedRelation()` 只读已加载内存且不查询，无需 Session。
 - 弱归属不等于整个对象图都能立即释放：Gateway 的 `RowCache` 会强持有 LRU 内的实体，已加载关系也会持有相关实体。连接池每次借出需要完全隔离时，应创建新的 Gateway；归还前应丢弃该 Gateway、清理其缓存及外部实体/关系图引用，不能只释放一个 Entity 变量。原 Gateway 被销毁后的旧实体只能在新连接上显式重查。
-- 当前不包含 `belongsToMany`、自动级联写入、`whereHas()`、`withCount()` 或属性懒加载。
+- 当前不包含 `belongsToMany`、自动级联写入或属性懒加载；关联过滤和计数见下一节。
+
+### 关联过滤与计数
+
+```php
+use Pixiaoka\Orm\Query\Builder;
+
+$customers = Customer::query()
+    ->whereHas('orders', fn (Builder $q) => $q->where('status', 'paid'))
+    ->get();
+
+$withoutPaid = Customer::query()
+    ->whereDoesntHave('orders', fn (Builder $q) => $q->where('status', 'paid'))
+    ->get();
+
+$customers = Customer::query()
+    ->whereRelation('orders', 'status', 'paid')           // 三参数：column = value
+    ->get();
+$customers = Customer::query()
+    ->whereRelation('orders', 'amount', '>=', 100)       // 四参数：column operator value
+    ->get();
+
+$rows = Customer::query()
+    ->withCount('orders') // orders_count
+    ->withCount('orders', fn (Builder $q) => $q->where('status', 'paid'), 'paid_orders')
+    ->orderBy('id')
+    ->rows();
+
+$rows = Customer::query()
+    ->withCount(['orders', 'orders.customer']) // orders_count、orders_customer_count
+    ->withCount('orders', fn (Builder $q) => $q->where('status', 'paid'), 'paid_orders')
+    ->rows();
+```
+
+`whereHas()` 和 `whereDoesntHave()` 分别生成相关 `EXISTS` / `NOT EXISTS`，不会读取关联实体或设置 `loadedRelation()`。否定条件针对整个受约束集合：同时拥有 paid 和 new 订单的客户，不匹配“不存在 paid 订单”。点分路径逐层相关，闭包只约束末级，例如 `orders.customer` 只统计/筛选有对应 Customer 的 Order，NULL 外键和孤儿外键不计入。复合键按声明位置配对，自关联每层使用独立内部别名。
+
+`whereRelation()` 是 `whereHas()` 的单字段快捷方式；三参数始终按等值处理，即使值看起来像 `IN`、`=` 等运算符。四参数可使用普通结构化比较、NULL、数组 IN/NOT IN 和 BETWEEN，值经过目标模型 Caster。直接父查询可为单基表并带表 alias、普通 WHERE/OR、排序、分页；JOIN/GROUP/HAVING/UNION/派生表/DISTINCT 父查询不支持。`_orm_relation_N` 是 ORM 内部关联别名，父表 alias 或关系涉及的真实表名与已分配内部别名冲突时会明确拒绝，避免同名引用静默错数。
+
+`withCount()` 以相关 `COUNT(*)` 标量子查询添加原始输出列，不水合实体、不修改实体字段、关系状态或缓存，不产生 N+1 查询。默认别名是路径点替换为下划线再加 `_count`；相同路径可用不同别名重复计数，数组可声明多个路径和末级约束。最终输出名与默认模型列、显式投影或其他计数别名冲突会在构建 SQL 时拒绝。计数结果必须通过 `rows()`、`row()` 或 `value('orders_count')` 读取，不承诺 PDO 原始类型一定是 PHP int。
+
+关联过滤和计数约束只允许结构化 WHERE/OR、嵌套关联过滤；支持属性名和真实列名，约束列由当前关系自动限定。不支持 whereRaw/Expression、任意普通 Builder 子查询、显式表前缀、投影、withCount、JOIN、GROUP/HAVING、UNION、派生表、DISTINCT、alias、排序、limit/offset、行锁或 with。闭包必须返回 `null` 或传入的同一个 Builder；不得在闭包或其中的 OR 分组内执行 get/first/rows/row/value/count/build/update/delete 等终结操作。非法约束在任何 SQL 之前拒绝。
+
+`whereHas()/whereDoesntHave()/whereRelation()` 可用于实体查询、原始行、父 COUNT 和条件 UPDATE/DELETE（仍遵守乐观锁等原有写入限制）；可与独立 `with()` 组合，过滤不会变成预加载约束。首版 `withCount()` 与关联过滤互斥，不能用于 `get()/first()/count()`、条件 UPDATE/DELETE 或 `with()`。普通 WHERE/OR 与计数的两种调用顺序均可；计数与 OR 分组内的关联过滤仍互斥。这里不包含 `has()` 的数量比较、关联写入、多对多或全局软删除。
 
 ## 4. Active Record
 

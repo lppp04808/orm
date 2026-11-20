@@ -10,6 +10,8 @@ use InvalidArgumentException;
 use Pixiaoka\Orm\Cast\Decimal;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Gateway\EntityGateway;
+use Pixiaoka\Orm\Exception\RelationException;
+use Pixiaoka\Orm\Relation\Subquery;
 
 /**
  * 结构化查询构建器：单表 / 聚合 / JOIN / 子查询 / 派生表 / UNION / 行锁 / 写操作。
@@ -38,6 +40,20 @@ final class Builder
 
     private bool $distinct = false;
     private ?string $tableAlias = null;
+    /** 内部相关子查询别名，与用户显式 alias 分开校验。 */
+    private ?string $relationAlias = null;
+
+    /** @var list<array{relation: Subquery, alias: string}> */
+    private array $relationCounts = [];
+
+    /** 关联约束及内部查询计划保持保护，禁止闭包提前执行终结查询。 */
+    private bool $buildingRelationConstraint = false;
+
+    /** 只标记 relationQuery() 生成的内部计划，与用户传入的任意 Builder 区分。 */
+    private bool $correlatedRelation = false;
+
+    /** 用户约束形状已校验后，才允许内部 SELECT 1/COUNT(*) 投影。 */
+    private bool $relationConstraintValidated = false;
 
     /** @var array{builder: self, alias: string}|null */
     private ?array $derivedFrom = null;
@@ -95,6 +111,7 @@ final class Builder
     /** @return $this */
     public function select(string ...$columns): self
     {
+        $this->assertRelationFeatureAllowed('投影');
         foreach ($columns as $column) {
             $this->projection[] = ['kind' => 'column', 'column' => $column];
         }
@@ -105,6 +122,7 @@ final class Builder
     /** @return $this */
     public function selectAs(string $column, string $alias): self
     {
+        $this->assertRelationFeatureAllowed('投影');
         $this->projection[] = ['kind' => 'as', 'column' => $column, 'alias' => $alias];
 
         return $this;
@@ -113,6 +131,7 @@ final class Builder
     /** @return $this */
     public function selectRaw(string $sql, array $params = []): self
     {
+        $this->assertRelationFeatureAllowed('Raw 投影');
         $this->projection[] = ['kind' => 'raw', 'sql' => $sql, 'params' => $params];
 
         return $this;
@@ -121,6 +140,7 @@ final class Builder
     /** @return $this */
     public function distinct(): self
     {
+        $this->assertRelationFeatureAllowed('DISTINCT');
         $this->distinct = true;
 
         return $this;
@@ -129,6 +149,7 @@ final class Builder
     /** @return $this */
     public function aggregate(string $function, string $column = '*', ?string $alias = null, bool $distinct = false): self
     {
+        $this->assertRelationFeatureAllowed('聚合投影');
         $function = strtoupper(trim($function));
         if (!in_array($function, self::ALLOWED_AGGREGATES, true)) {
             throw new InvalidArgumentException('非法聚合函数: ' . $function);
@@ -152,6 +173,7 @@ final class Builder
     /** 基表别名。 @return $this */
     public function alias(string $alias): self
     {
+        $this->assertRelationFeatureAllowed('表别名');
         $this->assertIdentifier($alias, '表别名');
         $this->tableAlias = $alias;
 
@@ -161,6 +183,9 @@ final class Builder
     /** 派生表 FROM (子查询) AS alias。 @return $this */
     public function from(Builder $subquery, string $alias): self
     {
+        $this->assertRelationFeatureAllowed('派生表');
+        $this->assertRelationSubqueryAllowed($subquery);
+        $subquery->assertRelationConstraintBuilderAllowed();
         $subquery->assertNoLock('派生表子查询');
         $this->assertSameGateway($subquery, '派生表');
         $this->assertIdentifier($alias, '派生表别名');
@@ -198,6 +223,7 @@ final class Builder
     /** @return $this */
     public function joinRaw(string $sql, array $params = []): self
     {
+        $this->assertRelationFeatureAllowed('JOIN');
         $this->joins[] = ['type' => 'RAW', 'raw' => $sql, 'params' => $params];
 
         return $this;
@@ -206,6 +232,8 @@ final class Builder
     /** @return $this */
     private function addJoin(string $type, string $table, string $alias, callable $on): self
     {
+        $this->assertRelationFeatureAllowed('JOIN');
+        $this->assertRelationConstraintBuilderAllowed();
         $this->assertIdentifier($alias, 'JOIN 别名');
         $clause = new JoinClause();
         $on($clause);
@@ -226,6 +254,9 @@ final class Builder
     public function whereOp(string $column, string $operator, mixed $value): self
     {
         $operator = Operator::normalize($operator);
+        if ($this->buildingRelationConstraint) {
+            $this->assertRelationConditionColumn($column);
+        }
         if (in_array($operator, ['IS NULL', 'IS NOT NULL'], true)) {
             if ($value !== null) {
                 throw new InvalidArgumentException($operator . ' 不接受比较值');
@@ -235,6 +266,9 @@ final class Builder
             return $this;
         }
         if ($operator === 'IN' || $operator === 'NOT IN') {
+            if ($value instanceof self) {
+                $this->assertRelationSubqueryAllowed($value);
+            }
             if (!is_array($value) && !$value instanceof self) {
                 throw new InvalidArgumentException($operator . ' 需要数组或子查询，请用 whereIn()/whereNotIn()');
             }
@@ -257,6 +291,9 @@ final class Builder
         }
         if ($value === null && !in_array($operator, ['IS NULL', 'IS NOT NULL'], true)) {
             throw new InvalidArgumentException($operator . ' 不能与 null 比较，请使用 whereNull()/whereNotNull()');
+        }
+        if ($value instanceof self) {
+            $this->assertRelationSubqueryAllowed($value);
         }
         $this->where[] = ['column' => $column, 'operator' => $operator, 'value' => $value];
 
@@ -293,6 +330,8 @@ final class Builder
     /** @return $this */
     public function whereExists(Builder $subquery): self
     {
+        $this->assertRelationFeatureAllowed('任意 EXISTS 子查询，请使用 whereHas()');
+        $this->assertRelationSubqueryAllowed($subquery);
         $this->assertSameGateway($subquery, 'EXISTS 子查询');
         $this->where[] = ['column' => '', 'operator' => 'EXISTS', 'value' => $subquery];
 
@@ -302,6 +341,8 @@ final class Builder
     /** @return $this */
     public function whereNotExists(Builder $subquery): self
     {
+        $this->assertRelationFeatureAllowed('任意 NOT EXISTS 子查询，请使用 whereDoesntHave()');
+        $this->assertRelationSubqueryAllowed($subquery);
         $this->assertSameGateway($subquery, 'NOT EXISTS 子查询');
         $this->where[] = ['column' => '', 'operator' => 'NOT EXISTS', 'value' => $subquery];
 
@@ -311,6 +352,7 @@ final class Builder
     /** 接收由框架组件生成的命名参数表达式，或调用方显式 SQL 片段。 @return $this */
     public function whereRaw(string|Expression $sql, array $params = []): self
     {
+        $this->assertRelationFeatureAllowed('whereRaw()/Expression');
         if ($sql instanceof Expression) {
             if ($params !== []) {
                 throw new InvalidArgumentException('Expression 已携带参数，不要再传 $params');
@@ -333,7 +375,23 @@ final class Builder
     public function orGroup(callable $group): self
     {
         $sub = new self($this->class, $this->gateway);
-        $group($sub);
+        $sub->buildingRelationConstraint = $this->buildingRelationConstraint;
+        try {
+            $group($sub);
+        } finally {
+            if ($this->buildingRelationConstraint) {
+                $sub->assertRelationConstraint('OR 分组');
+            }
+        }
+        if (!$this->buildingRelationConstraint) {
+            $sub->assertNoRelationCounts('orGroup() 中的 withCount()');
+            if ($this->relationCounts !== []) {
+                $this->assertNoRelationFilters('orGroup() 中与 withCount() 组合的关联过滤', [
+                    'conditions' => $sub->where,
+                    'groups' => $sub->orGroups,
+                ]);
+            }
+        }
         $this->orGroups[] = ['conditions' => $sub->where, 'groups' => $sub->orGroups];
 
         return $this;
@@ -344,6 +402,7 @@ final class Builder
     /** @return $this */
     public function groupBy(string ...$columns): self
     {
+        $this->assertRelationFeatureAllowed('GROUP BY');
         foreach ($columns as $column) {
             $this->groupBy[] = $column;
         }
@@ -354,6 +413,7 @@ final class Builder
     /** 受控 HAVING：expression 必须是合法聚合表达式或标识符，不能放开任意注入。 @return $this */
     public function having(string $expression, string $operator, mixed $value): self
     {
+        $this->assertRelationFeatureAllowed('HAVING');
         $this->assertHavingExpression($expression);
         $operator = Operator::assertComparison($operator);
         $this->assertScalar($value, false);
@@ -365,6 +425,7 @@ final class Builder
     /** @return $this */
     public function havingRaw(string $sql, array $params = []): self
     {
+        $this->assertRelationFeatureAllowed('HAVING');
         $this->having[] = ['kind' => 'raw', 'sql' => $sql, 'params' => $params];
 
         return $this;
@@ -375,6 +436,9 @@ final class Builder
     /** @return $this */
     public function union(Builder $other, bool $all = false): self
     {
+        $this->assertRelationFeatureAllowed('UNION');
+        $this->assertRelationSubqueryAllowed($other);
+        $other->assertRelationConstraintBuilderAllowed();
         $other->assertNoLock('UNION 子查询');
         if ($this->lockMode !== null) {
             throw new InvalidArgumentException('行锁查询不允许 UNION');
@@ -404,6 +468,7 @@ final class Builder
     /** @return $this */
     public function orderBy(string $column, string $direction = 'ASC'): self
     {
+        $this->assertRelationFeatureAllowed('排序');
         $direction = strtoupper(trim($direction));
         if (!in_array($direction, ['ASC', 'DESC'], true)) {
             throw new InvalidArgumentException('ORDER BY 方向只允许 ASC/DESC');
@@ -416,6 +481,7 @@ final class Builder
     /** @return $this */
     public function orderByRaw(string $sql, array $params = []): self
     {
+        $this->assertRelationFeatureAllowed('排序');
         $this->orderBy[] = ['kind' => 'raw', 'sql' => $sql, 'params' => $params];
 
         return $this;
@@ -424,6 +490,7 @@ final class Builder
     /** @return $this */
     public function limit(int $limit): self
     {
+        $this->assertRelationFeatureAllowed('分页');
         if ($limit < 0) {
             throw new InvalidArgumentException('LIMIT 不能为负数');
         }
@@ -435,6 +502,7 @@ final class Builder
     /** @return $this */
     public function offset(int $offset): self
     {
+        $this->assertRelationFeatureAllowed('分页');
         if ($offset < 0) {
             throw new InvalidArgumentException('OFFSET 不能为负数');
         }
@@ -460,6 +528,7 @@ final class Builder
     /** @return $this */
     public function lock(string $mode): self
     {
+        $this->assertRelationFeatureAllowed('行锁');
         $mode = strtoupper(trim($mode));
         if (!in_array($mode, self::LOCK_MODES, true)) {
             throw new InvalidArgumentException('行锁模式只允许 UPDATE/SHARE');
@@ -484,6 +553,7 @@ final class Builder
      */
     public function with(string|array $relations, string ...$more): self
     {
+        $this->assertRelationFeatureAllowed('with() 预加载');
         $this->eagerRelations[] = $relations;
         foreach ($more as $relation) {
             $this->eagerRelations[] = $relation;
@@ -492,9 +562,140 @@ final class Builder
         return $this;
     }
 
+    /**
+     * 用相关 EXISTS 过滤实体。点分路径表示逐层相关子查询，闭包只约束最后一层。
+     * 不读取关联实体、不修改预加载状态，可与 get()/count()/条件写组合。
+     *
+     * @param callable(Builder): mixed|null $constraint
+     * @return $this
+     */
+    public function whereHas(string $path, ?callable $constraint = null): self
+    {
+        $this->assertNoRelationCounts('whereHas()');
+        $this->where[] = [
+            'column' => '',
+            'operator' => 'EXISTS',
+            'value' => new Subquery($path, $constraint),
+        ];
+
+        return $this;
+    }
+
+    /** @param callable(Builder): mixed|null $constraint @return $this */
+    public function whereDoesntHave(string $path, ?callable $constraint = null): self
+    {
+        $this->assertNoRelationCounts('whereDoesntHave()');
+        $this->where[] = [
+            'column' => '',
+            'operator' => 'NOT EXISTS',
+            'value' => new Subquery($path, $constraint),
+        ];
+
+        return $this;
+    }
+
+    /** 三个参数表示 field = value；四个参数表示 field operator value。 @return $this */
+    public function whereRelation(
+        string $path,
+        string $column,
+        mixed $operatorOrValue,
+        mixed $value = null,
+    ): self {
+        if (func_num_args() === 3) {
+            return $this->whereHas(
+                $path,
+                static fn (self $query): self => $query->where($column, $operatorOrValue),
+            );
+        }
+
+        return $this->whereHas(
+            $path,
+            static fn (self $query): self => $query->whereOp($column, $operatorOrValue, $value),
+        );
+    }
+
+    /**
+     * 在原始行结果中追加相关 COUNT(*) 标量列，不改写实体属性。
+     * 单条路径可传约束和别名；数组使用与 with() 相同的路径/末级约束格式。
+     * 例如 withCount('orders') / withCount('orders', $constraint, 'paid_orders')。
+     *
+     * @param string|array<int|string, mixed> $relations
+     * @param callable(Builder): mixed|null $constraint
+     * @return $this
+     */
+    public function withCount(
+        string|array $relations,
+        ?callable $constraint = null,
+        ?string $alias = null,
+    ): self {
+        $this->assertRelationFeatureAllowed('withCount()');
+        $this->assertNoRelationFilters('withCount()');
+        if (is_string($relations)) {
+            $this->addRelationCount(
+                $relations,
+                $constraint,
+                $alias ?? str_replace('.', '_', $relations) . '_count',
+            );
+
+            return $this;
+        }
+        if ($constraint !== null || $alias !== null) {
+            throw new RelationException('withCount() 数组配置请把约束写在对应路径上，不能另传约束或别名');
+        }
+        foreach ($this->relationCountItems($relations) as [$path, $itemConstraint]) {
+            $this->addRelationCount(
+                $path,
+                $itemConstraint,
+                str_replace('.', '_', $path) . '_count',
+            );
+        }
+
+        return $this;
+    }
+
+    /** @param callable|null $constraint */
+    private function addRelationCount(string $path, ?callable $constraint, string $alias): void
+    {
+        $this->assertIdentifier($alias, '关联计数别名');
+        $this->relationCounts[] = [
+            'relation' => new Subquery($path, $constraint),
+            'alias' => $alias,
+        ];
+    }
+
+    /** @return list<array{string, callable|null}> */
+    private function relationCountItems(array $relations, string $prefix = ''): array
+    {
+        $items = [];
+        foreach ($relations as $key => $value) {
+            if (is_int($key)) {
+                if (is_array($value)) {
+                    $items = [...$items, ...$this->relationCountItems($value, $prefix)];
+                    continue;
+                }
+                if (!is_string($value)) {
+                    throw new RelationException('withCount() 位置项必须是路径字符串或嵌套配置数组');
+                }
+                $items[] = [$prefix . $value, null];
+            } elseif (is_callable($value)) {
+                $items[] = [$prefix . $key, $value];
+            } elseif (is_string($value) || is_array($value)) {
+                $children = is_string($value)
+                    ? $this->relationCountItems([$value], $prefix . $key . '.')
+                    : $this->relationCountItems($value, $prefix . $key . '.');
+                $items = [...$items, ...$children];
+            } else {
+                throw new RelationException('withCount() 约束必须是可调用对象或嵌套路径数组');
+            }
+        }
+
+        return $items;
+    }
+
     /** @internal 关系子查询只在整棵关系图成功后发布，不能提前覆盖缓存身份。 @return list<T> */
     public function withoutCache(): array
     {
+        $this->assertDeferredRelationExecution();
         $this->assertHydratable();
 
         return $this->gateway->executeQuery($this->class, $this->build(), cache: false);
@@ -503,6 +704,8 @@ final class Builder
     /** @internal 关系 Loader 只读检查，不改变查询。 */
     public function relationShape(): array
     {
+        $this->assertRelationParentSupported();
+
         return [
             'projection' => $this->projection !== [],
             'joins' => $this->joins !== [],
@@ -519,15 +722,53 @@ final class Builder
                 static fn (array $order): ?string => $order['kind'] === 'column' ? $order['column'] : null,
                 $this->orderBy,
             ))),
+            'ordered' => $this->orderBy !== [],
             'relations' => $this->eagerRelations,
+            'counts' => $this->relationCounts !== [],
         ];
     }
 
     // ==================== 执行 ====================
 
+    private function assertDeferredRelationExecution(): void
+    {
+        if ($this->buildingRelationConstraint) {
+            throw new RelationException('关系约束闭包只能声明查询条件，不得执行 get/rows/build/update/delete 等终结操作');
+        }
+    }
+
+    private function assertRelationFeatureAllowed(string $feature): void
+    {
+        if ($this->buildingRelationConstraint) {
+            throw new RelationException('关系约束不支持' . $feature . '；只允许结构化 WHERE/OR 和嵌套关联条件');
+        }
+    }
+
+    private function assertRelationConditionColumn(string $column): void
+    {
+        if (str_contains($column, '.')) {
+            throw new RelationException('关系约束的列由当前关系自动限定，不接受显式表前缀');
+        }
+    }
+
+    private function assertRelationSubqueryAllowed(self $subquery): void
+    {
+        if ($this->buildingRelationConstraint && !$subquery->buildingRelationConstraint) {
+            throw new RelationException('关系约束不接受任意子查询 Builder；请使用嵌套 whereHas()');
+        }
+    }
+
+    private function assertRelationConstraintBuilderAllowed(): void
+    {
+        if ($this->buildingRelationConstraint) {
+            throw new RelationException('关系约束不能通过 JOIN、UNION 或派生表改写子查询结构');
+        }
+    }
+
     /** @return list<T> */
     public function get(): array
     {
+        $this->assertDeferredRelationExecution();
         $this->assertHydratable();
 
         return $this->gateway->executeQuery($this->class, $this->build(), $this->eagerRelations);
@@ -536,6 +777,7 @@ final class Builder
     /** @return T|null */
     public function first(): ?Entity
     {
+        $this->assertDeferredRelationExecution();
         $this->assertHydratable();
         $clone = clone $this;
         $clone->limit = 1;
@@ -550,6 +792,7 @@ final class Builder
      */
     public function rows(): array
     {
+        $this->assertDeferredRelationExecution();
         $this->assertNoEagerRelations('rows()');
 
         return $this->gateway->executeRows($this->class, $this->build());
@@ -558,6 +801,7 @@ final class Builder
     /** 单行原始结果（强制 LIMIT 1 clone）。 */
     public function row(): ?array
     {
+        $this->assertDeferredRelationExecution();
         $this->assertNoEagerRelations('row()');
         $clone = clone $this;
         $clone->limit = 1;
@@ -568,6 +812,7 @@ final class Builder
     /** 标量值（COUNT/SUM/单值列）。$column 指定返回列，null 取首列。 */
     public function value(?string $column = null): mixed
     {
+        $this->assertDeferredRelationExecution();
         $this->assertNoEagerRelations('value()');
         $clone = clone $this;
         $clone->limit = 1;
@@ -577,7 +822,9 @@ final class Builder
 
     public function count(string $column = '*'): int
     {
+        $this->assertDeferredRelationExecution();
         $this->assertNoEagerRelations('count()');
+        $this->assertNoRelationCounts('count()');
 
         return $this->gateway->executeCountQuery($this->countSql($column));
     }
@@ -585,12 +832,16 @@ final class Builder
     /** 按条件更新，返回受影响行数。无 WHERE、空 SET 或主键更新会被拒绝。 */
     public function update(array $values): int
     {
+        $this->assertDeferredRelationExecution();
+
         return $this->gateway->executeUpdate($this, $values);
     }
 
     /** 按条件删除，返回受影响行数。无 WHERE 会被拒绝。 */
     public function delete(): int
     {
+        $this->assertDeferredRelationExecution();
+
         return $this->gateway->executeDelete($this);
     }
 
@@ -611,6 +862,8 @@ final class Builder
     /** @return array{sql: string, params: array<string, int|float|string|bool|null>} */
     public function build(): array
     {
+        $this->assertDeferredRelationExecution();
+        $this->assertRelationParentSupported();
         $ctx = new RenderContext();
         $sql = $this->renderSelect($ctx);
 
@@ -632,6 +885,9 @@ final class Builder
      */
     public function countSql(string $column = '*'): array
     {
+        $this->assertDeferredRelationExecution();
+        $this->assertRelationParentSupported();
+        $this->assertNoRelationCounts('countSql()');
         if ($this->isSimpleBaseQuery()) {
             $ctx = new RenderContext();
             $where = $this->renderWhereClause($ctx);
@@ -663,6 +919,8 @@ final class Builder
      */
     public function buildUpdate(array $set): array
     {
+        $this->assertDeferredRelationExecution();
+        $this->assertRelationParentSupported();
         $this->assertWritable();
         if ($set === []) {
             throw new InvalidArgumentException('UPDATE SET 不能为空');
@@ -701,6 +959,8 @@ final class Builder
      */
     public function buildDelete(): array
     {
+        $this->assertDeferredRelationExecution();
+        $this->assertRelationParentSupported();
         $this->assertWritable();
         if ($this->where === [] && $this->orGroups === []) {
             throw new InvalidArgumentException('DELETE 必须有 WHERE 条件，拒绝全表删除');
@@ -861,7 +1121,9 @@ final class Builder
 
     private function renderProjection(RenderContext $ctx): string
     {
+        $this->assertRelationParentSupported();
         $this->assertProjectionAliasesUnique();
+        $parts = [];
         if ($this->projection === []) {
             $meta = $this->gateway->meta($this->class);
             $qualifier = null;
@@ -871,33 +1133,37 @@ final class Builder
                     $segments = explode('.', $meta->table);
                     $qualifier = end($segments);
                 }
+            } elseif ($this->relationAlias !== null) {
+                $qualifier = $this->relationAlias;
             }
             $columns = array_map(
                 fn ($f) => $this->quote($qualifier === null ? $f->column : $qualifier . '.' . $f->column),
                 array_values($meta->fields),
             );
-
-            return implode(', ', $columns);
-        }
-
-        $parts = [];
-        foreach ($this->projection as $proj) {
-            switch ($proj['kind']) {
-                case 'column':
-                    $parts[] = $this->quote($proj['column']);
-                    break;
-                case 'as':
-                    $parts[] = $this->quote($proj['column']) . ' AS ' . $this->quote($proj['alias']);
-                    break;
-                case 'raw':
-                    $parts[] = $ctx->mergeRaw($proj['sql'], $proj['params'] ?? []);
-                    break;
-                case 'aggregate':
-                    $inner = $proj['column'] === '*' ? '*' : $this->quote($proj['column']);
-                    $agg = $proj['function'] . '(' . ($proj['distinct'] ? 'DISTINCT ' : '') . $inner . ')';
-                    $parts[] = $agg . ($proj['alias'] !== null ? ' AS ' . $this->quote($proj['alias']) : '');
-                    break;
+            $parts = $columns;
+        } else {
+            foreach ($this->projection as $proj) {
+                switch ($proj['kind']) {
+                    case 'column':
+                        $parts[] = $this->quote($proj['column']);
+                        break;
+                    case 'as':
+                        $parts[] = $this->quote($proj['column']) . ' AS ' . $this->quote($proj['alias']);
+                        break;
+                    case 'raw':
+                        $parts[] = $ctx->mergeRaw($proj['sql'], $proj['params'] ?? []);
+                        break;
+                    case 'aggregate':
+                        $inner = $proj['column'] === '*' ? '*' : $this->quote($this->relationColumn($proj['column']));
+                        $agg = $proj['function'] . '(' . ($proj['distinct'] ? 'DISTINCT ' : '') . $inner . ')';
+                        $parts[] = $agg . ($proj['alias'] !== null ? ' AS ' . $this->quote($proj['alias']) : '');
+                        break;
+                }
             }
+        }
+        foreach ($this->relationCounts as $count) {
+            $subquery = $this->relationQuery($count['relation'], $ctx, true);
+            $parts[] = '(' . $subquery->renderSelect($ctx) . ') AS ' . $this->quote($count['alias']);
         }
 
         return implode(', ', $parts);
@@ -912,8 +1178,9 @@ final class Builder
         }
 
         $from = $this->quote($this->baseTable());
-        if ($this->tableAlias !== null) {
-            $from .= ' AS ' . $this->quote($this->tableAlias);
+        $alias = $this->tableAlias ?? $this->relationAlias;
+        if ($alias !== null) {
+            $from .= ' AS ' . $this->quote($alias);
         }
 
         return $from;
@@ -1005,20 +1272,28 @@ final class Builder
 
                 return $ctx->mergeRaw($expr->sql, $expr->params);
 
+            case 'CORRELATION':
+                // 仅由 relationQuery() 用已校验的字段元数据和内部别名构造。
+                return (string) $value;
+
             case 'EXISTS':
             case 'NOT EXISTS':
-                /** @var self $sub */
-                $sub = $value;
+                $sub = $value instanceof Subquery
+                    ? $this->relationQuery($value, $ctx, false)
+                    : $value;
+                if (!$sub instanceof self) {
+                    throw new \LogicException('EXISTS 条件必须是 Builder 或关系子查询');
+                }
                 $sub->assertNoLock('EXISTS 子查询');
                 $inner = $sub->renderSelect($ctx);
 
                 return $operator . ' (' . $inner . ')';
 
             case 'IS NULL':
-                return $this->quote($column) . ' IS NULL';
+                return $this->quote($this->relationColumn($column)) . ' IS NULL';
 
             case 'IS NOT NULL':
-                return $this->quote($column) . ' IS NOT NULL';
+                return $this->quote($this->relationColumn($column)) . ' IS NOT NULL';
 
             case 'IN':
             case 'NOT IN':
@@ -1028,7 +1303,7 @@ final class Builder
                 $lo = $this->castQueryValue($column, $value[0]);
                 $hi = $this->castQueryValue($column, $value[1]);
 
-                return $this->quote($column) . ' BETWEEN ' . $ctx->bind($lo) . ' AND ' . $ctx->bind($hi);
+                return $this->quote($this->relationColumn($column)) . ' BETWEEN ' . $ctx->bind($lo) . ' AND ' . $ctx->bind($hi);
         }
 
         // 标量子查询
@@ -1038,33 +1313,33 @@ final class Builder
             $value->assertNoLock('标量子查询');
             $inner = $value->renderSelect($ctx);
 
-            return $this->quote($column) . ' ' . $operator . ' (' . $inner . ')';
+            return $this->quote($this->relationColumn($column)) . ' ' . $operator . ' (' . $inner . ')';
         }
 
         $casted = $this->castQueryValue($column, $value);
 
-        return $this->quote($column) . ' ' . $operator . ' ' . $ctx->bind($casted);
+        return $this->quote($this->relationColumn($column)) . ' ' . $operator . ' ' . $ctx->bind($casted);
     }
 
     private function renderIn(string $column, string $operator, mixed $value, RenderContext $ctx): string
     {
+        if ($value === []) {
+            return $operator === 'IN' ? '1 = 0' : '1 = 1';
+        }
         if ($value instanceof self) {
             $this->assertSameGateway($value, 'IN 子查询');
             $value->assertSingleColumn('IN 子查询');
             $value->assertNoLock('IN 子查询');
             $inner = $value->renderSelect($ctx);
 
-            return $this->quote($column) . ' ' . $operator . ' (' . $inner . ')';
-        }
-        if ($value === []) {
-            return $operator === 'IN' ? '1 = 0' : '1 = 1';
+            return $this->quote($this->relationColumn($column)) . ' ' . $operator . ' (' . $inner . ')';
         }
         $placeholders = [];
         foreach ($value as $v) {
             $placeholders[] = $ctx->bind($this->castQueryValue($column, $v));
         }
 
-        return $this->quote($column) . ' ' . $operator . ' (' . implode(', ', $placeholders) . ')';
+        return $this->quote($this->relationColumn($column)) . ' ' . $operator . ' (' . implode(', ', $placeholders) . ')';
     }
 
     /** @param array{conditions: list, groups: array} $group */
@@ -1085,6 +1360,271 @@ final class Builder
         }
 
         return $orParts === [] ? null : '(' . implode(' OR ', $orParts) . ')';
+    }
+
+    // ==================== 内部：相关关系子查询 ====================
+
+    private function relationQuery(Subquery $spec, RenderContext $ctx, bool $count): self
+    {
+        $parts = explode('.', $spec->path);
+        if ($parts === [] || in_array('', $parts, true)) {
+            throw new RelationException('关系路径不能包含空名称');
+        }
+        $name = array_shift($parts);
+        $relation = $this->gateway->relation($this->class, $name);
+        try {
+            // 嵌套关系已有内部别名，只把外部真实表名/用户别名登记为祖先限定名。
+            if ($this->relationAlias === null) {
+                $ctx->reserveRelationQualifier($this->tableQualifier());
+            }
+            $alias = $ctx->relationAlias();
+            // 自关联允许重复登记真实表名，但不得遮蔽任意已分配的内部别名。
+            $ctx->reserveRelationQualifier($this->gateway->meta($relation->target)->table);
+        } catch (InvalidArgumentException $e) {
+            throw new RelationException('内部关联别名冲突: ' . $e->getMessage(), 0, $e);
+        }
+        $query = new self($relation->target, $this->gateway);
+        $query->relationAlias = $alias;
+        $constraint = $spec->constraint;
+        // 内部计划始终保留终结操作保护。
+        $query->buildingRelationConstraint = true;
+        if ($parts !== []) {
+            // 中间层不接受自己的闭包；约束沿路径传递给最后一层。
+            $query->where[] = [
+                'column' => '',
+                'operator' => 'EXISTS',
+                'value' => new Subquery(implode('.', $parts), $constraint),
+            ];
+        } elseif ($constraint !== null) {
+            $result = $constraint($query);
+            if ($result !== null && $result !== $query) {
+                throw new RelationException($spec->path . ' 关系约束必须修改传入的 Builder，或返回同一 Builder');
+            }
+        }
+        $query->correlatedRelation = true;
+        $query->materializeRelationConditions($ctx);
+        $query->assertRelationConstraint($spec->path);
+        $query->relationConstraintValidated = true;
+        $query->projection = [$count
+            ? ['kind' => 'aggregate', 'function' => 'COUNT', 'column' => '*', 'alias' => null, 'distinct' => false]
+            : ['kind' => 'raw', 'sql' => '1', 'params' => []],
+        ];
+        $sourceQualifier = $this->tableQualifier();
+        $correlations = [];
+        foreach ($relation->sourceKey as $index => $sourceField) {
+            $targetField = $relation->targetKey[$index];
+            $correlations[] = $this->quote($alias . '.' . $targetField->column)
+                . ' = ' . $this->quote($sourceQualifier . '.' . $sourceField->column);
+        }
+        $query->where[] = [
+            'column' => '',
+            'operator' => 'CORRELATION',
+            'value' => implode(' AND ', $correlations),
+        ];
+
+        return $query;
+    }
+
+    private function assertRelationConstraint(string $path, bool $internal = false): void
+    {
+        if ($this->limit !== null || $this->offset > 0 || $this->orderBy !== []
+            || ($internal && !$this->relationConstraintValidated)
+            || (!$internal && $this->projection !== []) || $this->relationCounts !== [] || $this->joins !== []
+            || $this->groupBy !== [] || $this->having !== [] || $this->unions !== []
+            || $this->derivedFrom !== null || $this->distinct || $this->tableAlias !== null
+            || $this->lockMode !== null || $this->eagerRelations !== []) {
+            throw new RelationException($path . ' 关系约束只允许结构化 WHERE/OR 和嵌套关系条件，不支持投影、计数、JOIN、GROUP、UNION、派生表、DISTINCT、alias、排序、分页、行锁或 with');
+        }
+        $this->assertNoRawRelationConditions($this->where, $path);
+        foreach ($this->orGroups as $group) {
+            $this->assertNoRawRelationGroup($group, $path);
+        }
+    }
+
+    /** 展开一次内部关系计划；用户约束只执行一次，校验不会重复触发闭包。 */
+    private function materializeRelationConditions(RenderContext $ctx): void
+    {
+        if ($this->derivedFrom !== null || $this->joins !== [] || $this->unions !== []) {
+            // 形状校验先拒绝这些结构，不能执行其内部闭包或静默忽略其参数。
+            return;
+        }
+        foreach ($this->where as $index => $condition) {
+            if ($condition['value'] instanceof Subquery) {
+                $this->where[$index]['value'] = $this->relationQuery(
+                    $condition['value'],
+                    $ctx,
+                    false,
+                );
+            }
+        }
+        foreach ($this->orGroups as $index => $group) {
+            $this->orGroups[$index] = $this->materializeRelationGroup($group, $ctx);
+        }
+    }
+
+    private function materializeRelationGroup(array $group, RenderContext $ctx): array
+    {
+        foreach ($group['conditions'] as $index => $condition) {
+            if ($condition['value'] instanceof Subquery) {
+                $group['conditions'][$index]['value'] = $this->relationQuery(
+                    $condition['value'],
+                    $ctx,
+                    false,
+                );
+            }
+        }
+        foreach ($group['groups'] as $index => $nested) {
+            $group['groups'][$index] = $this->materializeRelationGroup($nested, $ctx);
+        }
+
+        return $group;
+    }
+
+    private function assertNoRawRelationConditions(array $conditions, string $path): void
+    {
+        foreach ($conditions as $condition) {
+            if ($condition['operator'] === 'RAW') {
+                throw new RelationException($path . ' 关系约束不支持 whereRaw；请使用结构化条件或嵌套 whereHas()');
+            }
+            if ($condition['operator'] === 'CORRELATION') {
+                continue;
+            }
+            if (str_contains($condition['column'], '.')) {
+                throw new RelationException($path . ' 关系约束的列由当前关系自动限定，不接受显式表前缀');
+            }
+            if ($condition['value'] instanceof self) {
+                if (!$condition['value']->correlatedRelation) {
+                    throw new RelationException($path . ' 关系约束不接受任意子查询 Builder；请使用嵌套 whereHas()');
+                }
+                $condition['value']->assertRelationConstraint($path, true);
+            }
+        }
+    }
+
+    private function assertNoRawRelationGroup(array $group, string $path): void
+    {
+        $this->assertNoRawRelationConditions($group['conditions'], $path);
+        foreach ($group['groups'] as $nested) {
+            $this->assertNoRawRelationGroup($nested, $path);
+        }
+    }
+
+    private function assertRelationParentSupported(): void
+    {
+        if (!$this->hasRelationFeatures()) {
+            return;
+        }
+        if ($this->derivedFrom !== null || $this->joins !== [] || $this->groupBy !== []
+            || $this->having !== [] || $this->unions !== [] || $this->distinct) {
+            throw new RelationException('关联过滤/计数当前仅支持无 JOIN/GROUP/HAVING/UNION/派生表/DISTINCT 的父查询；可保留父查询表别名');
+        }
+    }
+
+    private function hasRelationFeatures(): bool
+    {
+        if ($this->relationCounts !== []) {
+            return true;
+        }
+        foreach ($this->where as $condition) {
+            if ($condition['value'] instanceof Subquery) {
+                return true;
+            }
+        }
+        foreach ($this->orGroups as $group) {
+            if ($this->groupHasRelationFeatures($group)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function groupHasRelationFeatures(array $group): bool
+    {
+        foreach ($group['conditions'] as $condition) {
+            if ($condition['value'] instanceof Subquery) {
+                return true;
+            }
+        }
+        foreach ($group['groups'] as $nested) {
+            if ($this->groupHasRelationFeatures($nested)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function tableQualifier(): string
+    {
+        if ($this->tableAlias !== null) {
+            return $this->tableAlias;
+        }
+        if ($this->relationAlias !== null) {
+            return $this->relationAlias;
+        }
+
+        return $this->baseTable();
+    }
+
+    private function relationColumn(string $column): string
+    {
+        if (str_contains($column, '.')) {
+            return $column;
+        }
+        if ($this->relationAlias === null) {
+            $field = $this->resolveField($column);
+
+            return $field === null ? $column : $field->column;
+        }
+        $field = $this->resolveField($column);
+
+        return $this->relationAlias . '.' . ($field === null ? $column : $field->column);
+    }
+
+    private function assertNoRelationCounts(string $operation): void
+    {
+        if ($this->relationCounts !== []) {
+            throw new RelationException($operation . ' 不能与 withCount() 组合，请拆分查询');
+        }
+    }
+
+    private function assertNoRelationFiltersInGroups(string $operation): void
+    {
+        foreach ($this->orGroups as $group) {
+            if ($this->groupHasRelationFeatures($group)) {
+                throw new RelationException($operation . ' 不能与 whereHas()/whereDoesntHave()/whereRelation() 组合，请拆分查询');
+            }
+        }
+    }
+
+    private function assertNoRelationFilters(string $operation, ?array $group = null): void
+    {
+        if ($this->buildingRelationConstraint) {
+            return;
+        }
+        if ($group !== null) {
+            if ($this->groupHasRelationFeatures($group)) {
+                throw new RelationException($operation . ' 不能与 whereHas()/whereDoesntHave()/whereRelation() 组合，请拆分查询');
+            }
+
+            return;
+        }
+        $this->assertNoRelationFiltersInWhere($operation);
+        foreach ($this->orGroups as $group) {
+            if ($this->groupHasRelationFeatures($group)) {
+                throw new RelationException($operation . ' 不能与 whereHas()/whereDoesntHave()/whereRelation() 组合，请拆分查询');
+            }
+        }
+    }
+
+    private function assertNoRelationFiltersInWhere(string $operation): void
+    {
+        foreach ($this->where as $condition) {
+            if ($condition['value'] instanceof Subquery) {
+                throw new RelationException($operation . ' 不能与 whereHas()/whereDoesntHave()/whereRelation() 组合，请拆分查询');
+            }
+        }
     }
 
     // ==================== 内部：LIMIT / OFFSET ====================
@@ -1138,7 +1678,9 @@ final class Builder
             && $this->unions === []
             && $this->derivedFrom === null
             && !$this->distinct
-            && $this->tableAlias === null;
+            && $this->tableAlias === null
+            && $this->relationAlias === null
+            && $this->relationCounts === [];
     }
 
     private function assertHydratable(): void
@@ -1162,7 +1704,8 @@ final class Builder
         $this->assertNoEagerRelations('UPDATE/DELETE');
         if ($this->joins !== [] || $this->groupBy !== [] || $this->having !== []
             || $this->unions !== [] || $this->derivedFrom !== null || $this->tableAlias !== null
-            || $this->projection !== [] || $this->distinct || $this->orderBy !== []
+            || $this->projection !== [] || $this->relationCounts !== []
+            || $this->distinct || $this->orderBy !== []
             || $this->limit !== null || $this->offset > 0 || $this->lockMode !== null) {
             throw new InvalidArgumentException(
                 'UPDATE/DELETE 仅支持基表 WHERE 条件，不支持投影/JOIN/GROUP/HAVING/UNION/alias/派生表/排序/分页/行锁',
@@ -1206,12 +1749,13 @@ final class Builder
     private function projectionShape(): array
     {
         if ($this->projection === []) {
-            return array_map(
+            $shape = array_map(
                 static fn ($field): string => strtolower($field->column),
                 array_values($this->gateway->meta($this->class)->fields),
             );
+        } else {
+            $shape = [];
         }
-        $shape = [];
         foreach ($this->projection as $projection) {
             if ($projection['kind'] === 'raw' || ($projection['kind'] === 'aggregate' && $projection['alias'] === null)) {
                 throw new InvalidArgumentException(
@@ -1224,6 +1768,9 @@ final class Builder
             };
             $shape[] = strtolower($name);
         }
+        foreach ($this->relationCounts as $count) {
+            $shape[] = strtolower($count['alias']);
+        }
         if (count($shape) !== count(array_unique($shape))) {
             throw new InvalidArgumentException('UNION 分支不能包含重复的输出列名/别名');
         }
@@ -1234,13 +1781,42 @@ final class Builder
     private function assertProjectionAliasesUnique(): void
     {
         $names = [];
-        foreach ($this->projection as $projection) {
-            if (!in_array($projection['kind'], ['as', 'aggregate'], true) || $projection['alias'] === null) {
-                continue;
+        if ($this->relationCounts === []) {
+            foreach ($this->projection as $projection) {
+                if (!in_array($projection['kind'], ['as', 'aggregate'], true) || $projection['alias'] === null) {
+                    continue;
+                }
+                $name = strtolower($projection['alias']);
+                if (isset($names[$name])) {
+                    throw new InvalidArgumentException('SELECT 输出别名重复: ' . $projection['alias']);
+                }
+                $names[$name] = true;
             }
-            $name = strtolower($projection['alias']);
+
+            return;
+        }
+        if ($this->projection === []) {
+            foreach ($this->gateway->meta($this->class)->fields as $field) {
+                $names[strtolower($field->column)] = true;
+            }
+        }
+        foreach ($this->projection as $projection) {
+            if ($projection['kind'] === 'raw' || ($projection['kind'] === 'aggregate' && $projection['alias'] === null)) {
+                throw new RelationException('withCount() 不能与无明确输出别名的 selectRaw()/aggregate() 组合');
+            }
+            $name = match ($projection['kind']) {
+                'as', 'aggregate' => strtolower($projection['alias']),
+                default => strtolower(($parts = explode('.', $projection['column']))[count($parts) - 1]),
+            };
             if (isset($names[$name])) {
-                throw new InvalidArgumentException('SELECT 输出别名重复: ' . $projection['alias']);
+                throw new InvalidArgumentException('SELECT 输出别名重复: ' . $name);
+            }
+            $names[$name] = true;
+        }
+        foreach ($this->relationCounts as $count) {
+            $name = strtolower($count['alias']);
+            if (isset($names[$name])) {
+                throw new InvalidArgumentException('SELECT 输出别名重复: ' . $count['alias']);
             }
             $names[$name] = true;
         }

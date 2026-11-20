@@ -256,13 +256,47 @@ $orders = $customer->loadedRelation('orders'); // 未加载时抛异常，不隐
 
 关联键未初始化会拒绝查询；任一键为 `null` 时返回 `null` 或空数组，不执行关系 SQL。空主结果也不执行预加载。复合键采用参数化 OR-of-AND 元组条件，按最多 1000 个关系参数分批，不会把不同租户错误组合。
 
-关系值不进入 `toArray()`，不参与字段 dirty tracking，也不会自动保存或删除。`save()` 保留已加载关系，`refresh()` 和 `delete()` 清空它们。当前只提供 `hasOne`、`hasMany`、`belongsTo`；不包含多对多、自动级联写入、`whereHas()`、`withCount()` 或隐式属性懒加载。
+关系值不进入 `toArray()`，不参与字段 dirty tracking，也不会自动保存或删除。`save()` 保留已加载关系，`refresh()` 和 `delete()` 清空它们。当前只提供 `hasOne`、`hasMany`、`belongsTo`；不包含多对多、自动级联写入或隐式属性懒加载。关联过滤和计数见下一节，详细使用约束见 [USAGE](USAGE.md#关联过滤与计数)。
 
 预加载不是数据库原子快照；需要一致快照时应在数据库事务和相应隔离级别内读取。普通 `query()` 仍返回独立对象副本，不是全局 identity map；单次关系图按目标主键去重，嵌套反向关系可复用本次主查询对象。关系图成功后才统一发布缓存和关系状态，失败会恢复字段、原值、关系和缓存身份；事务回滚同样恢复关系状态。刷新已缓存目标时保留本地未保存字段，只更新未修改字段及持久化原值；依赖已变化持久化关联键的旧关系会精确失效，本图待安装的新关系在成功后替换它，未受影响的关系继续保留。
 
 实体首次进入 ORM 持久化/读取路径后，以弱引用记录其 `EntityGateway`。`discard()` 后重新登记同一个 Gateway，仍可继续 `save()`、`refresh()`、`delete()`、`load()` 和显式关系查询；切换到另一个 Gateway 则拒绝隐式跨连接，请在新连接上重新查询。实体数据库操作仍必须显式选择 Session；原 Gateway 已销毁后，数据库操作和 `toArray()` 明确报错，不会自动绑定新连接。静态模型查询和静态原生 SQL 由当前 Session 选择连接；`loadedRelation()` 只读已加载内存、不查询，无需 Session。
 
 弱归属不等于整个对象图立即释放：Gateway 的 `RowCache` 强持有 LRU 内的实体，已加载关系也持有相关实体。连接池每次借出需要完全隔离时，应创建新的 Gateway；归还前丢弃该 Gateway、清理其缓存及外部实体/关系图引用，不能只释放一个 Entity 变量。
+
+### 关联过滤与计数
+
+```php
+use Pixiaoka\Orm\Query\Builder;
+
+$paidCustomers = Customer::query()
+    ->whereHas('orders', fn (Builder $q) => $q->where('status', 'paid'))
+    ->get();
+
+$withoutPaid = Customer::query()
+    ->whereDoesntHave('orders', fn (Builder $q) => $q->where('status', 'paid'))
+    ->get();
+
+$largeOrderCustomers = Customer::query()
+    ->whereRelation('orders', 'amount', '>=', 100)
+    ->get();
+
+$rows = Customer::query()
+    ->withCount('orders')
+    ->withCount(
+        'orders',
+        fn (Builder $q) => $q->where('status', 'paid'),
+        'paid_orders',
+    )
+    ->orderBy('id')
+    ->rows();
+```
+
+`whereHas()` 生成相关 `EXISTS`，`whereDoesntHave()` 对整个受约束关联集合取反。例如存在非 paid 订单、但同时存在 paid 订单的客户，不会出现在上面的 `$withoutPaid` 中。点分路径逐层关联，闭包只约束末级；单键、复合键、自关联及属性名/真实列名均使用已声明的关系元数据。约束支持结构化 WHERE、OR 及嵌套关联条件，不支持 Raw、任意 Builder 子查询、投影、JOIN、GROUP、UNION、排序、分页、锁或预加载，也不能在闭包内执行查询或写入。
+
+`whereRelation($path, $column, $value)` 是等值过滤；四参数形式 `$path, $column, $operator, $value` 支持 NULL、IN、BETWEEN 等普通运算符语义。`withCount()` 追加相关 `COUNT(*)` 标量列，默认别名为 `orders_count`、嵌套路径为 `orders_customer_count`；同一路径可用不同别名分别计数，数组可一次声明多个路径及末级约束。结果必须经 `rows()`、`row()` 或 `value()` 读取，不写实体属性、关系状态或缓存。首版计数与关联过滤互斥，也不能水合实体、执行父 COUNT/条件写或与 `with()` 一起消费；普通 WHERE/OR 仍可组合。
+
+关联功能直接父查询目前限模型单基表，可使用父表 alias、普通 WHERE/OR、排序和分页；普通 OR 与 `withCount()` 的调用顺序不限，但计数不能与 OR 分组内的关联过滤组合。`_orm_relation_N` 是内部关联别名：父表 alias 或关系涉及的真实表名与已分配内部别名冲突时会明确拒绝，不会静默生成错误相关条件。JOIN/GROUP/HAVING/UNION/派生表/DISTINCT 父查询明确拒绝。关联过滤可用于 `get()/first()/rows()/count()` 及不带乐观锁模型的条件 UPDATE/DELETE，但不会给独立 `with()` 隐式继承过滤条件。
 
 ### Active Record
 
@@ -481,13 +515,13 @@ SQLite 不允许多个未提交写事务并行；独立 PDO 的 Fiber 测试验�
 ```bash
 composer install
 composer analyse            # PHPStan 生产代码静态分析
-composer test               # PHP 8.3：318 tests / 10654 assertions；2 项外部 DSN 测试默认跳过
+composer test               # PHP 8.3：331 tests / 10750 assertions；2 项外部 DSN 测试默认跳过
 
 # 实连脚本：进程环境变量覆盖 .env；两个真实库均不可达时自动 SQLite 兜底
 php -d extension=pdo_sqlite -d extension=pdo_pgsql -d extension=pdo_mysql tests/orm_live_verify.php
 ```
 
-本次只读关系阶段的本机 PHP 8.3 默认 SQLite 套件为 318 tests / 10654 assertions，2 项显式 DSN 测试跳过；独立 SQLite 实连通过 118 项、零失败，并验证 1001 个不同复合关系键分三批查询及测试表元数据清理。显式双库 DSN 下完整套件为 318 tests / 10702 assertions；MySQL 8.4.13 实连通过 96 项、PostgreSQL 16.16 通过 99 项，均零失败。Docker PHP 8.3.36、8.4.27、8.5.12 均完成同一默认套件。PHPStan 生产代码分析零告警。CI 继续核验 PHP 8.3/8.4/8.5、Composer、lint 与双库服务测试；Swoole/Swow 真实扩展验收未执行，Fiber 测试不代替这些运行时验证。
+本次关联过滤与计数阶段的本机 PHP 8.3 默认 SQLite 套件为 331 tests / 10750 assertions，2 项显式 DSN 测试跳过；独立 SQLite 实连通过 130 项、零失败，并验证 1001 个不同复合关系键分三批查询及测试表元数据清理。显式双库 DSN 下完整套件为 331 tests / 10798 assertions、无跳过；MySQL 8.4 实连通过 102 项、PostgreSQL 16 通过 105 项，均零失败。Docker PHP 8.3.36、8.4.27、8.5.12 均完成同一默认套件。PHPStan 生产代码分析零告警。CI 继续核验 PHP 8.3/8.4/8.5、Composer、lint 与双库服务测试；Swoole/Swow 真实扩展验收未执行，Fiber 测试不代替这些运行时验证。
 
 ### Docker 复验
 
