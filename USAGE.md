@@ -1,10 +1,12 @@
-# ORM 内核使用指南
+# ORM Core Usage Guide
 
-命名空间 `Pixiaoka\Orm\`，独立 Composer 包代码在 `src/`。这是一个独立于 webman 的 Active Record ORM 内核，通过注解定义字段和主键，在网关层做类型进出转换。
+简体中文: [USAGE.zh-CN.md](./USAGE.zh-CN.md) | Home: [README.md](./README.md)
 
-## 1. 初始化
+Namespace: `Pixiaoka\Orm\`. The standalone Composer package lives in `src/`. This is an Active Record ORM core independent of webman, using attributes to define columns and keys and converting types at the gateway boundary.
 
-ORM 不依赖 webman，也不拥有 PDO 或强制连接池。普通 PHP-FPM 可在请求开始时登记 Session，并在 `finally` 中调用 `Session::discard()`。常驻进程和并发 Fiber/协程建议使用严格模式与作用域：
+## 1. Initialization
+
+The ORM does not depend on webman, own PDO, or require a connection pool. With ordinary PHP-FPM, register a Session at the start of a request and call `Session::discard()` in `finally`. Long-running workers and concurrent Fibers/coroutines should use strict mode and explicit scopes:
 
 ```php
 use Pixiaoka\Orm\Gateway\EntityGateway;
@@ -16,60 +18,70 @@ $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
 
 Session::use(new EntityGateway(new PdoConnection($pdo)));
 try {
-    // 业务操作
+    // Application operations.
 } finally {
     Session::discard();
 }
 
-// 每个 Fiber/协程使用自己的连接；连接可由应用或可选连接池提供。
+// Each Fiber/coroutine uses its own connection; the application or an optional pool supplies it.
 Session::strict();
 Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
-    // 正常返回、异常均自动恢复此前的 Session。
+    // The previous Session is restored on both normal return and exceptions.
 });
+
+// Alternatively, omit the callback and manage the scope manually; close it in the same Context.
+$scope = Session::scope(new EntityGateway(new PdoConnection($pdo)));
+try {
+    // Application operations.
+} finally {
+    $scope->close();
+}
 ```
 
-作用域不关闭 PDO，应用负责创建、重连、健康检查及归还。`Session::discard()` 会回滚当前上下文遗留的整条受管事务链并解除绑定；`Session::scope()` 关闭时先执行同样的清理，再恢复此前的 Session，即使回滚失败也会恢复绑定并透传异常。事务回调内清理 Session 后不能继续提交。
+A scope does not close PDO. The application creates, reconnects, health-checks, and returns connections. `Session::discard()` rolls back the entire managed transaction chain left in the current context and unbinds it. Closing a `Session::scope()` performs the same cleanup before restoring the previous Session; the binding is restored and the exception is propagated even if rollback fails. Do not continue committing after clearing a Session inside a transaction callback.
 
-同一个 `EntityGateway` 从绑定成功到 `discard()` / 作用域释放为止，整个活跃读写生命周期都只能属于一个 Context，不限于事务期间。另一个 Fiber/协程尝试绑定会提前抛出 `LogicException`，避免覆盖 `lastInsertId()` 或交错异步驱动协议包。同一 Context 的重复绑定采用引用计数，嵌套作用域会恢复外层归属。
+An `EntityGateway` belongs to one Context throughout its active read/write lifetime, from successful binding until `discard()` or scope release, not just during transactions. Another Fiber/coroutine attempting to bind it receives an early `LogicException`, preventing `lastInsertId()` interference or interleaved asynchronous driver packets. Repeated binding in the same Context is reference-counted, and nested scopes restore outer ownership.
 
-### 命名会话与多数据源
+### Named sessions and multiple data sources
 
 ```php
-Session::use($writerGateway);                 // 默认名 default
+Session::use($writerGateway);                 // Default name: default
 Session::use($readerGateway, 'readonly');
 try {
     $reader = Session::get('readonly')->gateway;
-    // 模型静态 API 默认选择 default；显式 Builder 可选择其他数据源。
+    // Static model APIs select default; an explicit Builder selects another data source.
     $rows = (new \Pixiaoka\Orm\Query\Builder(User::class, $reader))
         ->where('active', true)
         ->get();
 
-    // default 临时切到 reader，正常返回或异常都恢复 writer。
+    // Temporarily switch default to reader; writer is restored on return or exception.
     $count = Session::scope($readerGateway, fn (): int => User::query()->count());
 
-    Session::discard('readonly');             // 只清理 readonly
+    Session::discard('readonly');             // Clear only readonly
 } finally {
-    Session::discard(null);                    // 清理当前 Context 的全部命名会话
+    Session::discard(null);                    // Clear every named session in this Context
 }
 ```
 
-`use()`、`get()` 与 `scope()` 的 `$name` 默认都是 `'default'`；`discard()` 省略参数只清理 `default`，只有显式 `null` 才清理全部。命名会话分别维护事务与回滚状态，跨数据源的实体不能隐式换绑。多个会话需要各自独立的 PDO/Gateway，不能借此共享一个并发物理连接。
+The `$name` argument of `use()`, `get()`, and `scope()` defaults to `'default'`. Omitting the argument to `discard()` clears only `default`; pass explicit `null` to clear all. Named sessions maintain separate transaction and rollback state, and an entity cannot implicitly switch data sources. Multiple sessions need independent PDO/Gateway instances; this API does not make one physical connection safe for concurrent use.
 
-### ManagedConnection 与连接池
+### ManagedConnection and connection pools
 
-`PdoConnection` 实现可选的 `ManagedConnection`，除基础 SQL 契约外还提供：
+`PdoConnection` implements the optional `ManagedConnection` interface. In addition to the basic SQL contract, it provides:
 
-- `ping(): bool`：执行轻量存活探测，断线或失败返回 `false`，不向连接池泄漏驱动异常；
-- `forceRollback(): bool`：回滚整条物理事务链，成功后把嵌套深度重置为零；
-- 嵌套事务：最外层用原生 PDO 事务，后续层级用 SAVEPOINT。
+- `ping(): bool`: performs a lightweight liveness check and returns `false` on disconnection or failure without leaking driver exceptions to the pool;
+- `forceRollback(): bool`: rolls back the entire physical transaction chain and resets nesting depth to zero on success;
+- nested transactions: native PDO transactions at the outermost level and SAVEPOINTs at deeper levels.
 
-连接池可在借出或归还时调用 `ping()`，但归还前必须先通过 `Session::discard()` 正常清理 ORM 上下文。`ping()` 不证明未提交事务的结果，`forceRollback()` 也不能被用来掩盖 commit/rollback 结果未知；结果未知时仍应废弃连接、Gateway 和关联实体。只实现旧 `Connection` 的装饰器无需添加这两个方法，但它没有物理 SAVEPOINT 能力，嵌套事务行为见[事务](#9-事务)。
+A pool may call `ping()` when lending or returning a connection, but must first clean up the ORM context normally through `Session::discard()`. `ping()` does not establish the result of an uncommitted transaction, and `forceRollback()` must not hide an unknown commit/rollback result. After an unknown result, discard the connection, Gateway, and associated entities. A decorator implementing only the legacy `Connection` interface need not add these methods, but it has no physical SAVEPOINT capability; see [Transactions](#9-transactions) for nested behavior.
 
-**webman 只是可选适配方式**，可在应用中间件中为每个请求调用上述作用域；不要把根 PDO 隐式共享给所有 Fiber。嵌套上下文必须显式选择连接。Session 与事务状态按 Fiber/运行时协程对象弱引用隔离，不依赖可复用的数字 ID。Swoole/Swow 仍应在真实扩展环境验证，不能仅以 Fiber 测试替代。
+`Session` associates Fiber or runtime coroutine objects through `WeakMap`, rather than reusable numeric IDs; transaction contexts are likewise isolated by object identity. `Session::strict()` prevents an unregistered Fiber/coroutine from implicitly falling back to the root Session. It is disabled by default for backward compatibility. `Session::scope()` restores the previous Session on normal return or exception. Without a callback, the returned `SessionScope` must be closed manually with `close()` and cannot be closed from another context.
 
-## 2. 定义模型
+**webman is only an optional integration.** Application middleware may create the scope for each request; do not implicitly share a root PDO with all Fibers. Nested contexts must explicitly select connections and do not inherit a parent transaction. PHP-FPM needs no pool for one connection per request; long-running workers and concurrent Fibers/coroutines rely on the application or an optional adapter to lend and return connections. SQLite does not permit multiple uncommitted write transactions in parallel. Fiber tests with independent PDO instances validate lifecycle, not concurrent SQLite writes. Validate Swoole/Swow with their real extensions; Fiber tests are not a substitute.
 
-### 代理键（自增 ID）
+## 2. Defining Models
+
+### Surrogate key (auto-increment ID)
 
 ```php
 use Pixiaoka\Orm\Annotation\Column;
@@ -101,7 +113,7 @@ final class User extends Entity
 }
 ```
 
-### 复合自然主键
+### Composite natural key
 
 ```php
 final class OrderItem extends Entity
@@ -130,28 +142,28 @@ final class OrderItem extends Entity
 }
 ```
 
-### 禁止：生成键和自然键混用
+### Invalid: mixing generated and natural keys
 
 ```php
-// ❌ 一个模型里不能同时有 generated: true 和 order: N 的主键
+// One model cannot combine generated: true and order: N primary keys.
 ```
 
-### 字段类型支持
+### Supported field types
 
-| PHP 类型 | 数据库 | 示例属性 |
-|----------|--------|----------|
+| PHP type | Database | Example property |
+|----------|----------|------------------|
 | `int` | INTEGER | `public int $count;` |
 | `float` | REAL / FLOAT | `public float $amount;` |
 | `string` | VARCHAR / TEXT | `public string $name;` |
 | `bool` | 0/1 | `public bool $active;` |
 | `array` | JSON | `public array $tags;` |
-| `Pixiaoka\Orm\Cast\BcDecimal` | TEXT（高精度十进制） | `public BcDecimal $price;` |
-| `BackedEnum` | 枚举的 int/string 值 | `public SampleStatus $status;` |
-| `Castable` 实现 | 自定义标量表示 | `public Money $price;` |
+| `Pixiaoka\Orm\Cast\BcDecimal` | TEXT (high-precision decimal) | `public BcDecimal $price;` |
+| `BackedEnum` | Backing int/string value | `public SampleStatus $status;` |
+| `Castable` implementation | Custom scalar representation | `public Money $price;` |
 | `DateTimeImmutable` | `Y-m-d H:i:s` UTC | `#[Temporal] public DateTimeImmutable $at;` |
-| 可空 `?` 形式 | NULL | `public ?string $desc;` |
+| Nullable `?` forms | NULL | `public ?string $desc;` |
 
-数组按 JSON 编解码，非法 JSON 或未知枚举值会抛 `CastException`。`BackedEnum` 只支持 int/string backed enum，不接受纯 enum。自定义值对象实现 `Castable`：
+Arrays are encoded and decoded as JSON. Invalid JSON or an unknown enum value throws `CastException`. Only int/string backed enums are supported; pure enums are not. Implement `Castable` for a custom value object:
 
 ```php
 use Pixiaoka\Orm\Annotation\Column;
@@ -169,40 +181,65 @@ final readonly class Money implements Castable
     public static function fromDatabase(int|float|string $value): static
     {
         if (filter_var($value, FILTER_VALIDATE_INT) === false) {
-            throw new \InvalidArgumentException('金额格式错误');
+            throw new \InvalidArgumentException('Invalid monetary amount');
         }
         return new self((int) $value);
     }
 }
 
-// 以下属性位于 Entity 模型类内部：
+// This property belongs inside an Entity model:
 #[Column]
-public Money $price; // 数据库保存整数分，PHP 保存 Money
+public Money $price; // Integer cents in the database, Money in PHP
 ```
 
-`toDatabase()` 可返回 int/float/string/null；非空字段仍按字段可空性约束。`fromDatabase()` 接收数据库标量，读写失败由 Caster 统一包装为 `CastException`。实现类应不可变或自行保证一致性，不要依赖对象中的瞬态属性表达持久化值。
+`toDatabase()` may return int/float/string/null; non-nullable fields remain subject to their nullability constraint. `fromDatabase()` receives a database scalar, and read/write conversion failures are wrapped in `CastException`. Implementations should be immutable or otherwise maintain consistency; do not represent persistent values through transient object state.
 
-实体更新与关系刷新对对象字段按规范化数据库表示进行语义比较：等值的新 `Money`、`DateTimeImmutable`、Decimal 对象不会被误判为脏字段，也不会因此产生多余 UPDATE 或递增 `#[Version]`。不同时区但同一时刻的时间按其实际存储格式比较。绑定给 Builder 的 Castable 也经同一 Caster 规范化。
+### Decimal
 
-### DateTimeImmutable 的存储格式
+On PHP 8.3, use the built-in `Pixiaoka\Orm\Cast\BcDecimal`, which preserves precision with strings. On PHP 8.4+, you may wrap `BcMath\Number` in an implementation of `Pixiaoka\Orm\Cast\Decimal`:
+
+```php
+final class BcNumber implements Pixiaoka\Orm\Cast\Decimal
+{
+    public function __construct(private readonly BcMath\Number $n) {}
+
+    public static function fromString(string|int $value): static
+    {
+        return new static(new BcMath\Number($value));
+    }
+
+    public function __toString(): string
+    {
+        return (string) $this->n;
+    }
+}
+```
+
+Like `Castable`, Decimal values are converted at the gateway boundary. Fields are compared by normalized database representation, so a new equal instance does not trigger a meaningless UPDATE.
+
+### Semantic dirty tracking for value objects
+
+Entity updates and relation refreshes compare object fields by normalized database representation. New but equal `Money`, `DateTimeImmutable`, or Decimal objects are not marked dirty, and therefore do not cause an extra UPDATE or increment `#[Version]`. Times with different time zones but the same instant are compared using their actual storage format. Castable values bound to a Builder are normalized by the same Caster.
+
+### DateTimeImmutable storage formats
 
 ```php
 use Pixiaoka\Orm\Annotation\Temporal;
 
-// 默认：存成 UTC 文本 "2026-11-13 21:17:45"
+// Default: UTC text such as "2026-11-13 21:17:45"
 #[Column]
 #[Temporal]
 public DateTimeImmutable $happened_at;
 
-// Unix 时间戳
+// Unix timestamp
 #[Column]
 #[Temporal(Temporal::UNIX)]
 public DateTimeImmutable $created_at;
 ```
 
-### 可配置时间字段自动填充
+### Configurable automatic timestamps
 
-传统 `int $created_at` / `int $updated_at` 不写其他注解仍兼容。自定义字段名使用 `#[CreatedAt]` 和 `#[UpdatedAt]`，支持 `int` 与 `DateTimeImmutable`：
+Traditional `int $created_at` / `int $updated_at` properties remain compatible without additional attributes. Use `#[CreatedAt]` and `#[UpdatedAt]` for custom field names; both `int` and `DateTimeImmutable` are supported:
 
 ```php
 use Pixiaoka\Orm\Annotation\CreatedAt;
@@ -211,23 +248,28 @@ use Pixiaoka\Orm\Annotation\Temporal;
 
 #[Column]
 #[CreatedAt]
-public DateTimeImmutable $created_on; // 默认 UTC Y-m-d H:i:s
+public DateTimeImmutable $created_on; // Default UTC Y-m-d H:i:s
 
 #[Column(name: 'modify_time')]
 #[UpdatedAt]
-public int $modify_time; // Unix 秒
+public int $modify_time; // Unix seconds
+
+#[Column]
+#[CreatedAt]
+#[Temporal(Temporal::UNIX)]
+public DateTimeImmutable $created_unix; // Creation time can also use Unix seconds
 
 #[Column]
 #[UpdatedAt]
 #[Temporal(Temporal::UNIX)]
-public DateTimeImmutable $updated_unix; // DateTimeImmutable 也可存 Unix 秒
+public DateTimeImmutable $updated_unix; // Update time supports Unix seconds too
 ```
 
-插入时填充两者，更新时只刷新更新时间。调用方显式修改过更新时间则不覆盖；创建时间不会在普通更新或 UPSERT 冲突更新中被覆盖。插入、批量插入和 UPSERT 都支持自动填充。每个角色只能声明一次、不能共用同一字段、不能标在主键上；不支持其他 PHP 类型。没有这些字段的模型无需配置。
+Both timestamps are populated on insert, and only the update timestamp is refreshed on update. An explicitly modified update timestamp is not overwritten. A creation timestamp is not overwritten by ordinary updates or UPSERT conflict updates. Inserts, batch inserts, and UPSERT all support automatic population. Each role may be declared once only; the roles cannot share a field or be placed on a primary key. Other PHP types are unsupported. Models without these fields need no configuration.
 
-模型生成器会为传统的 `created_at` / `updated_at` 自动附加时间角色注解，但仅当它们映射为 `int` 或可无损读取的 `DateTimeImmutable` 时；其他列名需自行添加上述注解。
+The model generator adds timestamp-role attributes to conventional `created_at` / `updated_at` fields only when they map to `int` or a losslessly readable `DateTimeImmutable`. Add the attributes manually for other column names.
 
-### 乐观锁：#[Version]
+### Optimistic locking: #[Version]
 
 ```php
 use Pixiaoka\Orm\Annotation\Version;
@@ -238,18 +280,18 @@ use Pixiaoka\Orm\Exception\OptimisticLockException;
 public int $revision;
 
 try {
-    $order->save(); // UPDATE 同时带完整主键与旧版本条件，数据库执行 revision = revision + 1
+    $order->save(); // UPDATE includes the full key and old version; SQL executes revision = revision + 1
 } catch (OptimisticLockException $e) {
-    // 可读取 model / operation / expectedVersion；不会自动刷新、覆盖或重试。
+    // Read model / operation / expectedVersion; no automatic refresh, overwrite, or retry occurs.
     $order->refresh();
 }
 ```
 
-版本字段必须同时声明 `#[Column]`，类型是非空 `int`，每模型仅一个，不能兼任主键、生成列或自动时间字段。插入默认版本 `1`，显式 `0` 保留；负数与 `PHP_INT_MAX` 拒绝。删除同样带版本条件。影响行数不是 `1` 时抛异常，内存版本、快照和缓存不提前推进；无业务变化时不执行无意义的版本递增 UPDATE。不能手改版本属性绕过检查。
+A version field must also declare `#[Column]`, have non-nullable `int` type, be unique within the model, and not serve as a primary key, generated column, or automatic timestamp. Inserts default to version `1`; an explicit `0` is retained, while negative values and `PHP_INT_MAX` are rejected. Deletes use the same version condition. If the affected-row count is not `1`, an exception is thrown without advancing the in-memory version, snapshot, or cache. With no business changes, no UPDATE is issued merely to increment the version. Directly modifying the version property cannot bypass the check.
 
-带 `#[Version]` 的模型不支持 Builder 条件 UPDATE/DELETE 或 UPSERT（包括冲突忽略），这些操作缺少逐实体旧版本快照。`executeRaw()` 不自动加版本条件或处理冲突，需由调用方控制 SQL、影响行数以及 `refresh()` / `flushCache()`。生成器只对非空、非主键、列名恰为 `version` 的 `int` 字段自动添加 `#[Version]`，其他字段名请显式添加。
+Models with `#[Version]` do not support Builder conditional UPDATE/DELETE or UPSERT, including conflict-ignore, because these operations have no per-entity old-version snapshot. `executeRaw()` neither adds version conditions nor handles conflicts; the caller controls SQL, affected rows, and subsequent `refresh()` / `flushCache()`. The generator adds `#[Version]` only to a non-nullable, non-primary-key `int` column named exactly `version`; declare other version columns explicitly.
 
-### 软删除：#[SoftDelete]
+### Soft deletion: #[SoftDelete]
 
 ```php
 use Pixiaoka\Orm\Annotation\Column;
@@ -262,31 +304,31 @@ use Pixiaoka\Orm\Annotation\Temporal;
 public ?DateTimeImmutable $deleted_at = null;
 ```
 
-软删除字段声明位于 Entity 模型类内部，必须同时有 `#[Column]`，类型为可空 `DateTimeImmutable`，且不能兼任主键、生成列、版本字段或自动时间字段；每个模型最多一个。`NULL` 表示未删除，时间统一使用秒级 UTC，单实体与批量软删除后的内存值与数据库刷新值一致。
+This declaration belongs inside an Entity model. The field must also have `#[Column]`, be a nullable `DateTimeImmutable`, and not serve as a primary key, generated column, version, or automatic timestamp. A model may declare at most one. `NULL` means not deleted. Times use second-precision UTC, and in-memory values match a database refresh after both single-entity and batch soft deletion.
 
 ```php
-$visible = Article::query()->get();                    // 默认 deleted_at IS NULL
-$all = Article::query()->withTrashed()->get();          // 包含回收站
-$deleted = Article::query()->onlyTrashed()->get();      // 仅回收站
+$visible = Article::query()->get();                    // Default: deleted_at IS NULL
+$all = Article::query()->withTrashed()->get();          // Include trash
+$deleted = Article::query()->onlyTrashed()->get();      // Trash only
 
-$article->delete();                                    // 软删除
-$article->restore();                                   // 实体恢复
-$article->forceDelete();                               // 实体物理删除
+$article->delete();                                    // Soft delete
+$article->restore();                                   // Restore entity
+$article->forceDelete();                               // Physically delete entity
 
 $n = Article::query()->where('tenant_id', 7)->delete();
 $n = Article::query()->onlyTrashed()->where('tenant_id', 7)->restore();
 $n = Article::query()->withTrashed()->where('id', 7)->forceDelete();
 ```
 
-Builder 的 `delete()` 在声明软删除的模型上写时间戳，`restore()` 只恢复符合当前条件的已删除行，`forceDelete()` 才物理删除。默认 `delete()` / `forceDelete()` 不包含已软删除行，需要时用 `withTrashed()` 或 `onlyTrashed()` 明确范围。软删除范围本身就是写入边界，所以即使没有其他显式 WHERE，也不会像普通模型 DELETE 一样被拒绝；`restore()` 也只针对回收站。特别地，`withTrashed()->forceDelete()` 且没有其他条件可能物理清空整表，应谨慎使用。`restore()` / `forceDelete()` 对未声明软删除的模型会拒绝执行。批量写不触发实体钩子，必要时刷新已持有对象。
+On a soft-deleting model, Builder `delete()` writes a timestamp, `restore()` restores matching deleted rows, and `forceDelete()` physically deletes. By default, `delete()` / `forceDelete()` exclude already soft-deleted rows; use `withTrashed()` or `onlyTrashed()` to select an explicit scope. The soft-delete scope is itself a write boundary, so these operations do not require another WHERE as ordinary model DELETE does. `restore()` also targets only trash. In particular, `withTrashed()->forceDelete()` without other conditions can physically empty the table. `restore()` / `forceDelete()` are rejected on models without soft deletion. Batch writes do not invoke entity hooks; refresh already-held objects when necessary.
 
-普通查询、关系加载、关系过滤与计数都应用目标模型的软删除范围。关系约束闭包中可显式调用 `withTrashed()` 包含目标回收站；软删除不是关联加载的额外全局功能开关，而是目标模型元数据的一部分。
+Ordinary queries, relation loading, relation filters, and counts all apply the target model's soft-delete scope. A relation constraint may explicitly call `withTrashed()` to include the target trash. Soft deletion is target-model metadata, not an additional global switch for relation loading.
 
-## 3. 只读关系与预加载
+## 3. Read-only Relations and Eager Loading
 
-### 声明关系
+### Declaring relations
 
-关系注解和查询类同名但命名空间不同，可使用别名避免冲突：
+Relation attributes and query classes have the same short names in different namespaces; use aliases to avoid collisions:
 
 ```php
 use Pixiaoka\Orm\Annotation\BelongsTo;
@@ -319,18 +361,18 @@ final class Order extends Entity
 }
 ```
 
-关系方法必须是 public、无参数、非 static，并精确声明具体关系查询返回类型。`localKey` 属于当前模型，`foreignKey` 属于目标模型；省略一侧使用该侧主键。支持属性名/真实列名及复合键，键按数组位置对应，不允许重复或类型不匹配。
+A relation method must be public, non-static, take no parameters, and declare the exact concrete relation-query return type. `localKey` belongs to the current model and `foreignKey` to the target model; an omitted side uses its primary key. Property names, real column names, and composite keys are supported. Keys correspond by array position and cannot be duplicated or type-mismatched.
 
-### 显式查询与预加载
+### Explicit queries and eager loading
 
 ```php
-// 单独查询关系，不隐式修改源实体的 loadedRelation 状态。
+// Query a relation separately without implicitly changing the source entity's loadedRelation state.
 $orders = $customer->orders()->get();
 $latestPaid = $customer->orders()->query(
     Order::query()->where('status', 'paid')->orderBy('id', 'DESC'),
 )->first(); // LIMIT 1
 
-// 一次主查询 + 每层每个关系一次/多批独立 SELECT。
+// One main query plus one or more batched SELECTs per relation at each level.
 $customers = Customer::query()->with('profile', 'orders')->get();
 $customers = Customer::query()->with([
     'orders' => fn ($q) => $q->where('status', 'paid'),
@@ -343,22 +385,22 @@ if ($customer->relationLoaded('orders')) {
 }
 ```
 
-`hasMany()` 的 `get()` 返回实体列表；`hasOne()`、`belongsTo()` 的 `get()` 返回实体或 `null`。三者 `first()` 都返回实体或 `null`。`loadedRelation()` 未加载时抛异常，不会隐式执行 SQL。任一侧关联键为 `null` 时，结果为 `null` 或空数组，且不执行关系 SQL。
+For `hasMany()`, `get()` returns an entity list; for `hasOne()` and `belongsTo()`, it returns an entity or `null`. All three `first()` methods return an entity or `null`. `loadedRelation()` throws when the relation has not been loaded rather than executing SQL implicitly. An uninitialized relation key rejects the query. If any relation key is `null`, the result is `null` or an empty array without relation SQL. An empty main result also skips eager loading. Composite keys use parameterized OR-of-AND tuple conditions in batches of at most 1000 relation parameters, preventing incorrect combinations across parent records.
 
-显式关系查询保留用户排序，尚未按目标主键排序时追加目标主键升序决胜条件；`hasOne` 多候选记录与 `belongsTo` 非唯一目标键由同一规则稳定选择，`first()` 仍只取第一行。预加载依次补齐目标关联键和目标主键，用户排序仍在前；与完整主键重叠的关联键不会重复追加排序。关系注解同类重复或混合声明均在首次进入关系功能时抛 `MetadataException`；普通 CRUD 不扫描关系注解。预加载约束只允许 WHERE/OR 和排序，拒绝全局分页、投影、JOIN、GROUP/HAVING、UNION、派生表、DISTINCT、表别名、行锁和闭包内再次 `with/load`。`with()` 只能用于实体 `get()` / `first()`，不能被 `rows()`、`value()`、`count()` 或条件 UPDATE/DELETE 静默忽略。普通 `Builder::first()` 不自动补主键排序。
+Explicit relation queries preserve user ordering and append an ascending target-primary-key tiebreaker when the full target key is not already ordered. The same rule makes `hasOne` with multiple candidates and `belongsTo` with a non-unique target key deterministic; `first()` still returns only the first row. Eager loading appends target relation keys followed by the target primary key, retaining user ordering first; relation keys overlapping the full primary key are not repeated. Duplicate or mixed relation attributes on one method throw `MetadataException` when relation functionality is first used; ordinary CRUD does not scan relation attributes. Eager-load constraints allow only WHERE/OR and ordering. Global pagination, projections, JOIN, GROUP/HAVING, UNION, derived tables, DISTINCT, table aliases, row locks, and nested `with/load` inside a constraint are rejected. `with()` applies only to entity `get()` / `first()` and is never silently ignored by `rows()`, `value()`, `count()`, or conditional UPDATE/DELETE. Ordinary `Builder::first()` does not add primary-key ordering.
 
-### 对象、事务和连接边界
+### Object, transaction, and connection boundaries
 
-- 关系不进入 `toArray()`、dirty tracking 或自动保存/删除；`save()` 保留关系，`refresh()` / `delete()` 清空。
-- 普通 `query()` 返回独立副本；只有单次关系图按主键去重，嵌套反向关系可指向本次主查询父对象。
-- 关系图成功后才统一安装关系并发布缓存，失败恢复字段、原值、关系及缓存；物理事务回滚也恢复这些状态。
-- 刷新缓存目标保留未保存字段；依赖已变化持久化关联键的旧关系会精确失效，本图待安装的新关系会在成功后替换它，未受影响的关系继续保留。需要丢弃本地修改时，应显式 `refresh()`，不能依赖关系加载覆盖。
-- 预加载是多条 SELECT，不是数据库原子快照；一致性要求高时放入事务并选择适当隔离级别。
-- 实体以弱引用记录首次读取/持久化它的 Gateway。`discard()` 后重新登记同一个 Gateway，仍可继续保存、刷新和加载关系；切到另一个 Gateway 则拒绝隐式读写，应显式重查。实体数据库操作仍必须显式选择 Session。原 Gateway 已销毁时，数据库操作和 `toArray()` 会明确报错，不能自动绑定新连接；`loadedRelation()` 只读已加载内存且不查询，无需 Session。
-- 弱归属不等于整个对象图都能立即释放：Gateway 的 `RowCache` 会强持有 LRU 内的实体，已加载关系也会持有相关实体。连接池每次借出需要完全隔离时，应创建新的 Gateway；归还前应丢弃该 Gateway、清理其缓存及外部实体/关系图引用，不能只释放一个 Entity 变量。原 Gateway 被销毁后的旧实体只能在新连接上显式重查。
-- 当前不包含 `belongsToMany`、自动级联写入或属性懒加载；关联过滤和计数见下一节。
+- Relations are excluded from `toArray()`, dirty tracking, and automatic save/delete. `save()` preserves relations; `refresh()` / `delete()` clears them.
+- Ordinary `query()` returns independent copies. Only one relation graph deduplicates by primary key; a nested reverse relation may point to the parent object from that main query.
+- Relations and cache are published only after the whole graph succeeds. Failure restores fields, original values, relations, and cache; a physical transaction rollback also restores them.
+- Refreshing a cached target preserves unsaved fields. An old relation depending on a changed persistent relation key is precisely invalidated; a pending new relation replaces it after success, while unaffected relations remain. Use explicit `refresh()` to discard local changes rather than relying on relation loading.
+- Eager loading uses multiple SELECT statements, not an atomic database snapshot. Use a transaction with an appropriate isolation level when consistency requires it.
+- An entity weakly records the Gateway that first read or persisted it. After `discard()`, rebinding the same Gateway permits further saves, refreshes, and relation loads; switching to another Gateway rejects implicit reads/writes, so query explicitly on the new connection. Entity database operations still require an explicitly selected Session. Once the original Gateway is destroyed, database operations and `toArray()` fail explicitly rather than binding a new connection automatically. `loadedRelation()` only reads loaded memory and needs no Session.
+- Weak ownership does not release the whole object graph immediately: the Gateway's `RowCache` strongly holds entities in its LRU, and loaded relations hold related entities. For full isolation on each pool checkout, create a new Gateway. Before return, discard that Gateway, clear its cache, and release external entity/graph references; unsetting one Entity variable is insufficient. After the original Gateway is destroyed, explicitly query old entities again on a new connection.
+- `belongsToMany`, automatic cascading writes, and property lazy loading are not included. Relation filtering and counting follow below.
 
-### 关联过滤与计数
+### Relation filtering and counting
 
 ```php
 use Pixiaoka\Orm\Query\Builder;
@@ -372,10 +414,10 @@ $withoutPaid = Customer::query()
     ->get();
 
 $customers = Customer::query()
-    ->whereRelation('orders', 'status', 'paid')           // 三参数：column = value
+    ->whereRelation('orders', 'status', 'paid')           // Three arguments: column = value
     ->get();
 $customers = Customer::query()
-    ->whereRelation('orders', 'amount', '>=', 100)       // 四参数：column operator value
+    ->whereRelation('orders', 'amount', '>=', 100)       // Four arguments: column operator value
     ->get();
 
 $rows = Customer::query()
@@ -385,149 +427,149 @@ $rows = Customer::query()
     ->rows();
 
 $rows = Customer::query()
-    ->withCount(['orders', 'orders.customer']) // orders_count、orders_customer_count
+    ->withCount(['orders', 'orders.customer']) // orders_count and orders_customer_count
     ->withCount('orders', fn (Builder $q) => $q->where('status', 'paid'), 'paid_orders')
     ->rows();
 ```
 
-`whereHas()` 和 `whereDoesntHave()` 分别生成相关 `EXISTS` / `NOT EXISTS`，不会读取关联实体或设置 `loadedRelation()`。否定条件针对整个受约束集合：同时拥有 paid 和 new 订单的客户，不匹配“不存在 paid 订单”。点分路径逐层相关，闭包只约束末级，例如 `orders.customer` 只统计/筛选有对应 Customer 的 Order，NULL 外键和孤儿外键不计入。复合键按声明位置配对，自关联每层使用独立内部别名。
+`whereHas()` and `whereDoesntHave()` generate correlated `EXISTS` / `NOT EXISTS`; they neither read related entities nor set `loadedRelation()`. Negation applies to the whole constrained set: a customer with both paid and new orders does not match "has no paid orders". Dot paths correlate each level, and the closure constrains only the last level. For example, `orders.customer` counts/filters only Orders with a corresponding Customer; NULL and orphan foreign keys do not count. Composite keys pair by declaration position, and self-relations use a separate internal alias at each level.
 
-`whereRelation()` 是 `whereHas()` 的单字段快捷方式；三参数始终按等值处理，即使值看起来像 `IN`、`=` 等运算符。四参数可使用普通结构化比较、NULL、数组 IN/NOT IN 和 BETWEEN，值经过目标模型 Caster。直接父查询可为单基表并带表 alias、普通 WHERE/OR、排序、分页；JOIN/GROUP/HAVING/UNION/派生表/DISTINCT 父查询不支持。`_orm_relation_N` 是 ORM 内部关联别名，父表 alias 或关系涉及的真实表名与已分配内部别名冲突时会明确拒绝，避免同名引用静默错数。
+`whereRelation()` is the single-field shortcut for `whereHas()`. Three arguments always mean equality, even if the value looks like `IN`, `=`, or another operator. Four arguments support ordinary structured comparisons, NULL, array IN/NOT IN, and BETWEEN, with values converted by the target model Caster. The immediate parent query may use one base table with an alias, ordinary WHERE/OR, ordering, and pagination. Parent JOIN/GROUP/HAVING/UNION/derived-table/DISTINCT queries are unsupported. `_orm_relation_N` is an internal relation alias; conflicts with a parent alias or a real table involved in a relation are explicitly rejected to avoid silently incorrect counts.
 
-`withCount()` 以相关 `COUNT(*)` 标量子查询添加原始输出列，不水合实体、不修改实体字段、关系状态或缓存，不产生 N+1 查询。默认别名是路径点替换为下划线再加 `_count`；相同路径可用不同别名重复计数，数组可声明多个路径和末级约束。最终输出名与默认模型列、显式投影或其他计数别名冲突会在构建 SQL 时拒绝。计数结果必须通过 `rows()`、`row()` 或 `value('orders_count')` 读取，不承诺 PDO 原始类型一定是 PHP int。
+`withCount()` adds a raw output column through a correlated `COUNT(*)` scalar subquery. It does not hydrate entities, modify entity fields, relation state, or cache, or cause N+1 queries. The default alias replaces dots in the path with underscores and appends `_count`. The same path may be counted under different aliases, and an array declares multiple paths and final-level constraints. Output-name conflicts with default model columns, explicit projections, or other count aliases are rejected when building SQL. Read counts with `rows()`, `row()`, or `value('orders_count')`; the PDO raw type is not guaranteed to be PHP int.
 
-关联过滤和计数约束只允许结构化 WHERE/OR、嵌套关联过滤；支持属性名和真实列名，约束列由当前关系自动限定。不支持 whereRaw/Expression、任意普通 Builder 子查询、显式表前缀、投影、withCount、JOIN、GROUP/HAVING、UNION、派生表、DISTINCT、alias、排序、limit/offset、行锁或 with。闭包必须返回 `null` 或传入的同一个 Builder；不得在闭包或其中的 OR 分组内执行 get/first/rows/row/value/count/build/update/delete 等终结操作。非法约束在任何 SQL 之前拒绝。
+Relation filters and count constraints allow only structured WHERE/OR and nested relation filters. Property names and real column names are supported, and constraint columns are automatically qualified for the current relation. Raw conditions/expressions, arbitrary ordinary Builder subqueries, explicit table prefixes, projections, withCount, JOIN, GROUP/HAVING, UNION, derived tables, DISTINCT, aliases, ordering, limit/offset, row locks, and with are unsupported. A closure must return `null` or the same Builder passed to it. Do not execute get/first/rows/row/value/count/build/update/delete or other terminal operations in a closure or its OR groups. Invalid constraints are rejected before any SQL.
 
-`whereHas()/whereDoesntHave()/whereRelation()` 可用于实体查询、原始行、父 COUNT 和条件 UPDATE/DELETE（仍遵守乐观锁等原有写入限制）；可与独立 `with()` 组合，过滤不会变成预加载约束。首版 `withCount()` 与关联过滤互斥，不能用于 `get()/first()/count()`、条件 UPDATE/DELETE 或 `with()`。普通 WHERE/OR 与计数的两种调用顺序均可；计数与 OR 分组内的关联过滤仍互斥。目标模型声明软删除时，关联过滤与计数默认只统计未删除目标，关系约束中可用 `withTrashed()` 显式放宽。这里不包含 `has()` 的数量比较、关联写入或多对多。
+`whereHas()/whereDoesntHave()/whereRelation()` work with entity queries, raw rows, parent COUNT, and conditional UPDATE/DELETE, subject to existing restrictions such as optimistic locking. They may be combined with independent `with()`; filters do not become eager-load constraints. In the current version, `withCount()` is mutually exclusive with relation filters and cannot be used with `get()/first()/count()`, conditional UPDATE/DELETE, or `with()`. Ordinary WHERE/OR may be called before or after a count, but a count cannot be combined with relation filters inside an OR group. If the target model uses soft deletion, relation filters and counts include only non-deleted targets by default; a relation constraint may explicitly call `withTrashed()`. Quantity comparisons through `has()`, relation writes, and many-to-many relations are not included.
 
 ## 4. Active Record
 
-### save() —— 智能插入/更新
+### save() — intelligent insert/update
 
-`save()` 看 `new` 出来的走插入，`find` 出来的走更新。**不看主键值**。
+`save()` inserts an object created with `new` and updates one returned by `find`. **It does not decide based on the primary-key value.**
 
 ```php
-// 插入
+// Insert
 $u = new User();
-$u->name = '张三';
+$u->name = 'Alice';
 $u->age = 28;
 $u->save();
-// $u->id 已被回填
+// $u->id has been populated
 
-// 查询后更新
+// Query then update
 $u = User::find(['id' => 1]);
 $u->age = 29;
-$u->save();  // UPDATE —— 只改变了的字段
+$u->save();  // UPDATE — changed fields only
 
-// 删除后重新插入
+// Reinsert after deletion
 $u = User::find(['id' => 1]);
 $u->delete();
-$u->save();  // 重新 INSERT
+$u->save();  // INSERT again
 ```
 
-### insert() —— 强制插入
+### insert() — forced insertion
 
 ```php
 $u = new User();
-$u->name = '李四';
-$u->insert(); // 只在 isNew=true 时可用
+$u->name = 'Bob';
+$u->insert(); // Available only while isNew=true
 
-$u->insert(); // ❌ IdentityException:"已经在库里，不能再 insert"
+$u->insert(); // IdentityException: the row is already persisted and cannot be inserted again
 ```
 
-### delete() —— 删除
+### delete() — deletion
 
 ```php
 $u = User::find(['id' => 5]);
-$u->delete(); // 返回 void；受影响行 !== 1 时抛异常
+$u->delete(); // Returns void; throws if affected rows !== 1
 
-$u->delete(); // ❌ IdentityException:"还没入库，不能 delete"
+$u->delete(); // IdentityException: the row is not persisted and cannot be deleted
 ```
 
-### find() —— 按主键查找
+### find() — lookup by primary key
 
 ```php
-// 代理键
+// Surrogate key
 $u = User::find(['id' => 42]);
 
-// 复合主键 —— 必须给全
+// Composite key — every column is required
 $item = OrderItem::find(['order_id' => 10, 'sku' => 'ABC']);
 
-// 少给一列不会发 SQL，直接拒绝
-OrderItem::find(['order_id' => 10]); // ❌ IdentityException
+// A missing column is rejected before SQL
+OrderItem::find(['order_id' => 10]); // IdentityException
 ```
 
-### toArray() —— 导出
+### toArray() — export
 
 ```php
 $u = User::find(['id' => 1]);
 print_r($u->toArray());
-// ['id' => 1, 'name' => '张三', 'age' => 29, 'created_at' => 1700000000, 'updated_at' => 1700000000]
+// ['id' => 1, 'name' => 'Alice', 'age' => 29, 'created_at' => 1700000000, 'updated_at' => 1700000000]
 ```
 
-### refresh() —— 重新从数据库读
+### refresh() — reread from the database
 
 ```php
 $u = User::find(['id' => 1]);
-// ... 其他进程改了 ...
-$u->refresh(); // 重新 SELECT，覆盖所有字段
+// ... another process changed the row ...
+$u->refresh(); // SELECT again and overwrite all fields
 ```
 
-## 5. 查询构建器
+## 5. Query Builder
 
-### 基础查询
+### Basic queries
 
 ```php
 use app\model\User;
 
-// 条件查询
+// Conditional query
 $users = User::query()
     ->where('age', 28)
-    ->whereOp('name', 'LIKE', '张%')
+    ->whereOp('name', 'LIKE', 'A%')
     ->get();
 
-// 单条
+// Single row
 $user = User::query()
-    ->where('name', '张三')
+    ->where('name', 'Alice')
     ->first();
 
-// 计数
+// Count
 $count = User::query()
     ->where('age', 28)
     ->count();
 
-// 克隆复用：两个 Builder 的查询结构互不影响。
+// Clone and reuse: query structures do not affect one another.
 $adults = User::query()->whereOp('age', '>=', 18);
 $firstPage = (clone $adults)->orderBy('id')->limit(20);
 $admins = (clone $adults)->where('role', 'admin');
 ```
 
-`clone` 会递归隔离 WHERE/OR、子查询、JOIN、UNION、派生表、排序和分页等 ORM 查询状态；`first()`、`row()`、`value()` 与复杂 `count()` 也通过克隆避免污染原查询。绑定值中的 `DateTimeImmutable`、枚举、Decimal 等业务对象不克隆，调用方应避免修改共享的可变值对象。内部 `QueryState`、SQL/关系编译器不是公共扩展接口，流式 Builder 才是稳定使用入口。
+`clone` recursively isolates ORM query state including WHERE/OR, subqueries, JOIN, UNION, derived tables, ordering, and pagination. `first()`, `row()`, `value()`, and complex `count()` also clone to avoid contaminating the original query. Business objects in bindings, such as `DateTimeImmutable`, enums, and Decimal, are not cloned; avoid modifying shared mutable value objects. Internal `QueryState` and SQL/relation compilers are not public extension points; the fluent Builder is the stable API.
 
-### 可用条件方法
+### Available condition methods
 
 ```php
-->where('column', $value)                     // column = :value；null 自动转为 IS NULL
+->where('column', $value)                     // column = :value; null becomes IS NULL
 ->whereOp('column', '>', 10)                  // column > 10
 ->whereOp('column', '!=', null)               // column IS NOT NULL
-->whereOp('column', 'BETWEEN', [1, 5])        // 两个参数
+->whereOp('column', 'BETWEEN', [1, 5])        // Two parameters
 ->whereNull('column')                         // column IS NULL
 ->whereNotNull('column')                      // column IS NOT NULL
 ->whereIn('column', [1, 2, 3])               // column IN (1,2,3)
-->whereNotIn('column', [])                    // 空 IN 恒假；空 NOT IN 恒真
+->whereNotIn('column', [])                    // Empty IN is false; empty NOT IN is true
 ```
 
-### OR 条件
+### OR conditions
 
 ```php
-// (age < 18 OR age > 60) AND city = '北京'
+// (age < 18 OR age > 60) AND city = 'Shanghai'
 $users = User::query()
     ->orGroup(fn($q) => $q->whereOp('age', '<', 18)->whereOp('age', '>', 60))
-    ->where('city', '北京')
+    ->where('city', 'Shanghai')
     ->get();
 ```
 
-### 排序和分页
+### Ordering and pagination
 
 ```php
 $users = User::query()
@@ -538,19 +580,19 @@ $users = User::query()
     ->get();
 ```
 
-## 6. 复杂查询
+## 6. Advanced Queries
 
-### 6.1 结果类型
+### 6.1 Result types
 
-`get()` / `first()` 只返回完整实体。自定义投影、JOIN、聚合、GROUP/HAVING、UNION、派生表的结果必须走：
+`get()` / `first()` return only complete entities. Custom projections, JOIN, aggregates, GROUP/HAVING, UNION, and derived tables must use:
 
-- `rows()`：数组列表；
-- `row()`：一行数组或 `null`；
-- `value()`：第一个字段或指定字段的标量。
+- `rows()`: a list of arrays;
+- `row()`: one array or `null`;
+- `value()`: the scalar from the first or a named field.
 
-ORM 不会把缺列数组强行 hydrate 成实体，也不会把部分实体写进行缓存。原始数组不会自动转为 `Decimal`、`DateTimeImmutable` 等 PHP 对象。
+The ORM does not hydrate incomplete rows into entities or put partial entities into the row cache. Raw arrays are not automatically converted to `Decimal`, `DateTimeImmutable`, or other PHP objects.
 
-### 6.2 投影、JOIN 和表别名
+### 6.2 Projections, JOIN, and table aliases
 
 ```php
 use Pixiaoka\Orm\Query\JoinClause;
@@ -559,17 +601,17 @@ $rows = Order::query()->alias('o')
     ->selectAs('o.sku', 'order_sku')
     ->selectAs('t.label', 'tag_label')
     ->leftJoin('order_tag', 't', fn (JoinClause $j) => $j
-        ->on('o.id', '=', 't.order_id')       // 列对列，标识符校验并引用
-        ->where('t.label', '=', 'paid'))      // ON 中的绑定参数
+        ->on('o.id', '=', 't.order_id')       // Column-to-column; identifiers are validated and quoted
+        ->where('t.label', '=', 'paid'))      // Bound parameter in ON
     ->where('o.user_id', 7)
     ->rows();
 ```
 
-`join()` / `innerJoin()` / `leftJoin()` / `rightJoin()` 使用结构化 ON。无 ON 的特殊连接必须显式 `joinRaw($sql, $params)`。JOIN 不带 select 时默认只返回基表的完整列；仍建议使用 `selectAs()` 并调用 `rows()`。
+`join()` / `innerJoin()` / `leftJoin()` / `rightJoin()` use structured ON conditions. A special join without ON must explicitly use `joinRaw($sql, $params)`. Without a select, JOIN returns complete base-table columns by default; using `selectAs()` with `rows()` is still recommended.
 
-基表模型字段的 WHERE/IN/BETWEEN/SET 值会复用模型 Caster，支持属性名和真实列名。带 `alias.column` 的字段不自动推断其他表模型，应传数据库标量或用 raw 条件。
+WHERE/IN/BETWEEN/SET values for base-model fields reuse the model Caster and accept property names or real column names. An `alias.column` field does not infer another table's model; pass a database scalar or use a raw condition.
 
-### 6.3 聚合、DISTINCT、GROUP BY / HAVING
+### 6.3 Aggregates, DISTINCT, GROUP BY / HAVING
 
 ```php
 $stats = Order::query()
@@ -587,9 +629,9 @@ $sum = Order::query()->aggregate('SUM', 'qty')->value();
 $users = Order::query()->select('user_id')->distinct()->count();
 ```
 
-聚合函数只允许 COUNT/SUM/AVG/MIN/MAX。结构化 HAVING 仅接受标识符或上述聚合表达式；复杂条件使用参数化 `havingRaw()`。
+Only COUNT/SUM/AVG/MIN/MAX aggregate functions are accepted. Structured HAVING accepts only identifiers or those aggregate expressions; use parameterized `havingRaw()` for complex conditions.
 
-### 6.4 子查询与派生表
+### 6.4 Subqueries and derived tables
 
 ```php
 $paid = OrderTag::query()->select('order_id')->where('label', 'paid');
@@ -608,7 +650,7 @@ $rows = Order::query()->select('uid')->from($top, 'ranked')
     ->whereOp('amount', '>', 5)->rows();
 ```
 
-标量和 IN 子查询必须显式只选择一列；EXISTS 无此限制。子查询、派生表与 UNION 不允许携带行锁；子查询必须与父查询来自同一个 `EntityGateway`，防止 SQL 和参数在错误连接上执行。
+Scalar and IN subqueries must explicitly select exactly one column; EXISTS has no such restriction. Subqueries, derived tables, and UNION cannot carry row locks. A subquery must use the same `EntityGateway` as its parent, preventing SQL and parameters from executing on the wrong connection.
 
 ### 6.5 UNION / UNION ALL
 
@@ -619,14 +661,14 @@ $second = Order::query()->selectAs('sku', 'name')
     ->where('user_id', 8)->orderBy('id', 'DESC')->limit(1);
 
 $rows = $first->unionAll($second)
-    ->orderBy('name', 'DESC')   // 整个 UNION 的顶层排序
-    ->limit(10)                 // 整个 UNION 的顶部分页
+    ->orderBy('name', 'DESC')   // Top-level UNION ordering
+    ->limit(10)                 // Top-level UNION pagination
     ->rows();
 ```
 
-各分支必须返回相同数量且同名的输出列，请使用 `select()/selectAs()` 或带别名的 `aggregate()`。`union()` 前的局部分页属于首分支；分支自己的 `orderBy()/limit()/offset()` 由 Builder 按 SQLite/MySQL/PostgreSQL 方言包裹。嵌套 UNION 可作为派生表或单列子查询；复杂 raw UNION 请使用 `queryRaw()`。
+Every branch must return the same number and names of output columns. Use `select()/selectAs()` or aliased `aggregate()`. Local pagination before `union()` belongs to the first branch. The Builder wraps each branch's own `orderBy()/limit()/offset()` according to SQLite/MySQL/PostgreSQL syntax. A nested UNION may be used as a derived table or single-column subquery; use `queryRaw()` for complex raw UNION statements.
 
-### 6.6 Raw SQL：CTE、窗口函数和专有表达式
+### 6.6 Raw SQL: CTEs, window functions, and vendor-specific expressions
 
 ```php
 $rows = Order::queryRaw(
@@ -643,140 +685,140 @@ $rows = Order::query()
     ->rows();
 ```
 
-Raw 是**受信任的开发者 SQL**，不是用户输入拼接接口：
+Raw SQL is **trusted developer SQL**, not an interface for concatenating user input:
 
-- 只接受命名占位符，参数名和 SQL 实际使用必须完全一致；
-- 缺参、多参、`?` 占位符、数组/对象参数均抛异常；
-- 字符串、双引号、反引号、行注释、块注释中的伪参数会被跳过；
-- PostgreSQL `value::type` 类型转换不会误识别为参数；
-- PostgreSQL `$$...$$` / `$tag$...$tag$` dollar-quoted 文本中的 `:name`、`?` 不识别为参数；`PdoConnection` 会在交给 `pdo_pgsql` 前将其转换为等价的转义字符串字面量，避免 PDO 驱动误读伪参数，返回文本保持原样；
-- 同一参数重复出现时，每次构建独立分配唯一的 `qN`；
-- `Order::raw($sql, $params)` 创建可复用 Expression；不可再重复传参数；
-- `queryRaw/queryOneRaw` 返回数组；`executeRaw` 返回受影响行数，不自动 hydrate。
+- Only named placeholders are accepted, and parameter names must exactly match actual SQL usage;
+- Missing or extra parameters, `?` placeholders, and array/object parameters throw exceptions;
+- Pseudo-parameters inside strings, double quotes, backticks, line comments, and block comments are skipped;
+- PostgreSQL `value::type` casts are not misread as parameters;
+- `:name` and `?` inside PostgreSQL `$$...$$` / `$tag$...$tag$` dollar-quoted text are not parameters. Before passing SQL to `pdo_pgsql`, `PdoConnection` converts such text to an equivalent escaped string literal, avoiding PDO misinterpretation while preserving returned text;
+- Repeated parameters receive independent unique `qN` names on each build;
+- `Order::raw($sql, $params)` creates a reusable Expression; parameters cannot be supplied again;
+- `queryRaw/queryOneRaw` return arrays; `executeRaw` returns affected rows and never hydrates automatically.
 
-Raw 写入模型数据后需要显式 `Order::flushCache()`；它绕过模型身份和生命周期钩子。
+After raw model writes, explicitly call `Order::flushCache()`. Raw SQL bypasses model identity and lifecycle hooks.
 
-## 7. 条件 UPDATE / DELETE、UPSERT 与行锁
+## 7. Conditional UPDATE / DELETE, UPSERT, and Row Locks
 
-### 7.1 条件批量写入
+### 7.1 Conditional batch writes
 
 ```php
 $affected = Order::query()->where('user_id', 7)->update(['qty' => 10]);
 $affected = Order::query()->whereIn('id', [1, 2])->delete();
 ```
 
-必须有 WHERE。空 IN 仍保留为恒假条件，不会退化为全表写；空 SET、主键修改、JOIN/GROUP/HAVING/UNION/投影/排序/分页/锁均拒绝。成功执行后清理该模型缓存，命中 0 行不是异常。
+A WHERE clause is required. An empty IN remains a false condition and never becomes a full-table write. Empty SET, primary-key modification, JOIN/GROUP/HAVING/UNION, projections, ordering, pagination, and locks are rejected. The model cache is cleared after success; affecting zero rows is not an exception.
 
-PostgreSQL/SQLite 使用 `DELETE ... RETURNING` 读取实际删除主键；MySQL 先对当前 Session 已交付实体的身份做受限预查，再执行 DELETE。两者都按模型 Caster 规范化主键，只把实际删除的对象标为未入库；对象即使已被 LRU 或批量写清出缓存，仍能通过弱引用身份表精确失效，不会误标同表其他实体。条件 UPDATE/UPSERT 不会更新调用方已经持有的旧实体对象，必要时请 `refresh()` 或重新查询。批量写不触发生命周期钩子。
+PostgreSQL/SQLite use `DELETE ... RETURNING` to read actually deleted keys. MySQL first performs a constrained pre-query for identities of entities already delivered by the current Session, then executes DELETE. Both normalize keys with the model Caster and mark only actually deleted objects as unpersisted. Weak-reference identity tracking precisely invalidates objects even after eviction from the LRU or batch writes, without affecting other entities from the same table. Conditional UPDATE/UPSERT does not update old entity objects already held by the caller; `refresh()` or query again when needed. Batch writes do not invoke lifecycle hooks.
 
-MySQL 预查与外部并发写之间不提供跨 Session/进程的一致性保证，`isNew()` 状态也不是分布式锁。需要严格并发一致性时，请使用事务、数据库约束和行锁。
+The MySQL pre-query does not guarantee consistency against external concurrent writes across Sessions/processes, and `isNew()` is not a distributed lock. Use transactions, database constraints, and row locks for strict concurrency.
 
-### 7.2 跨方言 UPSERT
+### 7.2 Cross-dialect UPSERT
 
 ```php
-Order::upsert($values);                    // 默认主键冲突，更新其余输入字段
-Order::upsert($values, ['qty']);           // 只更新 qty，并自动维护 updated_at
-Order::upsert($values, []);                // 冲突时忽略
-Order::upsert($values, ['qty'], ['key']);  // 显式冲突键
+Order::upsert($values);                    // Default primary-key conflict; update other input fields
+Order::upsert($values, ['qty']);           // Update only qty and maintain updated_at automatically
+Order::upsert($values, []);                // Ignore conflicts
+Order::upsert($values, ['qty'], ['key']);  // Explicit conflict key
 ```
 
-- PostgreSQL/SQLite：`ON CONFLICT (...) DO UPDATE/DO NOTHING`；
-- MySQL：`ON DUPLICATE KEY UPDATE`；
-- 默认冲突键为模型主键，冲突键必须包含在输入中；
-- 默认更新列不包含冲突键、生成列和 `created_at`；
-- 自动填充缺失的 int 型 `created_at/updated_at`；
-- 显式 `$updateColumns=['qty']` 仍自动附加 `updated_at`；显式提供的时间戳值会被尊重；
-- 未提供的非空字段提前拒绝，不会自动猜测 PHP 属性默认值或数据库 `DEFAULT`，请显式传值；
-- 字段值复用模型 Caster；返回受影响行数，不承诺回填 ID，不触发实体钩子。
+- PostgreSQL/SQLite: `ON CONFLICT (...) DO UPDATE/DO NOTHING`;
+- MySQL: `ON DUPLICATE KEY UPDATE`;
+- The conflict key defaults to the model primary key and must be present in the input;
+- Default update columns exclude conflict keys, generated columns, and `created_at`;
+- Missing int `created_at/updated_at` values are populated automatically;
+- Explicit `$updateColumns=['qty']` still adds `updated_at`; explicit timestamp values are respected;
+- Missing non-nullable fields are rejected early. PHP property defaults and database `DEFAULT` are not guessed; provide values explicitly;
+- Values use the model Caster. The return value is affected rows; generated IDs are not guaranteed to be populated, and entity hooks are not invoked.
 
-**MySQL 不能指定 conflict target，会响应任意唯一键冲突**。`$conflictColumns` 在 MySQL 只负责输入完整性校验，不会把 SQL 限制为指定索引。代理生成键只有显式作为冲突键时才允许写入。
+**MySQL cannot specify a conflict target and responds to any unique-key conflict.** `$conflictColumns` only validates input completeness on MySQL; it does not limit SQL to a particular index. A surrogate generated key may be written only when explicitly used as the conflict key.
 
-### 7.3 行锁
+### 7.3 Row locks
 
 ```php
 Order::transaction(function (): void {
     $order = Order::query()->where('id', 1)->forUpdate()->first();
-    // 在事务内修改并保存
+    // Modify and save inside the transaction
 });
 
 $shared = Order::query()->where('id', 1)->forShare()->first();
 ```
 
-PostgreSQL/MySQL 支持 `FOR UPDATE/FOR SHARE`，Builder 按各自语法放置锁与分页子句。SQLite 不支持，执行时明确抛异常，不能静默忽略。通常应在事务内使用；子查询、派生表、UNION 和条件写不允许携带行锁。
+PostgreSQL/MySQL support `FOR UPDATE/FOR SHARE`, and the Builder places locks and pagination according to each dialect. SQLite rejects them explicitly at execution instead of silently ignoring them. Locks should normally be used inside transactions. Subqueries, derived tables, UNION, and conditional writes cannot carry row locks.
 
-## 8. 批量插入
+## 8. Batch Insert
 
 ```php
-// 数组方式
+// Array rows
 User::insertAll([
     ['name' => 'A', 'age' => 20],
     ['name' => 'B', 'age' => 25],
 ]);
 
-// Entity 对象方式（会触发钩子）
+// Entity rows (hooks are invoked)
 $a = new User(); $a->name = 'A'; $a->age = 20;
 $b = new User(); $b->name = 'B'; $b->age = 25;
 User::insertAll([$a, $b]);
-// $a、$b 的 created_at 被填充，状态变为 persisted
+// $a and $b receive created_at and become persisted
 ```
 
-数组与 Entity 可以混批，SQL 保留输入行序，每块最多 500 行，并同时受 65535 个绑定参数上限约束。首条 INSERT 前会完成整批可预知检查：数组字段和类型转换、实体模型/新旧状态/Gateway 归属、自动时间与版本默认值、前置钩子、钩子执行后的最终值和版本校验。后续分块存在坏行时，前面的分块不会先写入；失败批次也不会给未绑定 Entity 留下 Gateway 归属。
+Arrays and entities may be mixed. SQL preserves input row order, with at most 500 rows per chunk and a maximum of 65535 bound parameters. Before the first INSERT, the whole batch undergoes all predictable checks: array fields and type conversion, entity model/new state/Gateway ownership, automatic time and version defaults, before-hooks, final values after hooks, and version validation. A bad row in a later chunk therefore does not allow earlier chunks to be written first, and a failed batch leaves no Gateway ownership on an unbound Entity.
 
-`beforeSave()` / `beforeInsert()` 可以补齐必填字段，每个 Entity 只执行一次；SQL 全部成功后才回填生成键、标记 persisted、执行 `afterSave()` / `afterInsert()` 并发布缓存。预检失败不假装撤销已经运行的前置钩子、字段自动填值或外部副作用。数据库约束冲突、SQL/连接失败、生成键回填或后置钩子失败同样不承诺自动原子撤销，需要整批原子性时必须使用显式事务。事务成功回滚则恢复前置钩子及自动填值之前的持久化字段、未初始化状态、生成键、版本和缓存身份；非字段业务属性及外部副作用仍由业务负责。
+`beforeSave()` / `beforeInsert()` may populate required fields and run once per Entity. Only after all SQL succeeds are generated keys populated, entities marked persisted, `afterSave()` / `afterInsert()` invoked, and cache published. Prevalidation failure does not pretend to undo before-hooks, automatic field values, or external side effects. Database constraint violations, SQL/connection failures, generated-key population failures, and after-hook failures likewise do not promise automatic atomic undo. Use an explicit transaction when the whole batch must be atomic. A successful transaction rollback restores persistent fields, uninitialized state, generated keys, versions, and cache identity to their state before before-hooks and automatic population; non-column business state and external side effects remain the application's responsibility.
 
-带生成键的多行混批或纯 Entity 批次要求连接支持 `INSERT ... RETURNING`；MySQL 会在钩子及 SQL 前拒绝这类调用，请逐行 `save()`。纯数组行无需回填，仍可在 MySQL 批量插入。
+Multi-row mixed or Entity-only batches with generated keys require `INSERT ... RETURNING`. MySQL rejects these calls before hooks or SQL; call `save()` row by row. Pure array rows need no generated-key population and can still be batch-inserted on MySQL.
 
-## 9. 事务
+## 9. Transactions
 
 ```php
 User::transaction(function () {
     $a = new User();
-    $a->name = '付款方';
+    $a->name = 'Payer';
     $a->save();
 
     $b = new User();
-    $b->name = '收款方';
+    $b->name = 'Payee';
     $b->save();
 });
 
-// PdoConnection：嵌套层使用真实 SAVEPOINT。
+// PdoConnection: nested levels use real SAVEPOINTs.
 User::transaction(function () {
-    // 外层原生事务。
+    // Outer native transaction.
     try {
         User::transaction(function () {
-            // SAVEPOINT sp_2；异常回滚只撤销这一层。
-            throw new DomainException('撤销内层写入');
+            // SAVEPOINT sp_2; an exceptional rollback undoes only this level.
+            throw new DomainException('Undo inner writes');
         });
     } catch (DomainException) {
-        // 内层回滚已成功时，外层可以继续写入并最终提交。
+        // Once inner rollback succeeds, the outer transaction may continue and commit.
     }
 });
 ```
 
-`PdoConnection` 实现 `ManagedConnection`：深度 1 执行 PDO 原生 begin/commit/rollback；深度 2 及以后执行 `SAVEPOINT sp_N`、`RELEASE SAVEPOINT sp_N`、`ROLLBACK TO SAVEPOINT sp_N` 后释放保存点。内层释放不是独立提交，最外层回滚仍会撤销全部工作。不要在此适配器上混用未受管的 `$pdo->beginTransaction()`，混用会被拒绝。
+`PdoConnection` implements `ManagedConnection`: depth 1 uses native PDO begin/commit/rollback; depth 2+ executes `SAVEPOINT sp_N`, `RELEASE SAVEPOINT sp_N`, or `ROLLBACK TO SAVEPOINT sp_N` followed by release. Releasing an inner savepoint is not an independent commit; an outer rollback still undoes all work. Do not mix unmanaged `$pdo->beginTransaction()` with this adapter; such mixing is rejected.
 
-每层 SAVEPOINT 有独立的实体、缓存与身份快照：内层回滚恢复该层首次读取、修改或插入的对象，外层事务可继续；最外层回滚恢复整链基线。只实现旧 `Connection` 的装饰器不强制实现 `ManagedConnection`，其嵌套 `transaction()` 仍复用外层回调，不提供独立保存点回滚；这是兼容路径，不应据此推断 `PdoConnection` 的行为。
+Each SAVEPOINT level has independent entity, cache, and identity snapshots. Inner rollback restores objects first read, changed, or inserted at that level, allowing the outer transaction to continue; outermost rollback restores the whole-chain baseline. A decorator implementing only legacy `Connection` need not implement `ManagedConnection`. Its nested `transaction()` reuses the outer callback without independent savepoint rollback. This compatibility path does not describe `PdoConnection` behavior.
 
-`Session::discard()` 对受管连接调用整链 `forceRollback()`，不是只回滚当前 SAVEPOINT。即使作用域在嵌套事务中提前退出，也不能把还有未确认结果的连接归还连接池。
+`Session::discard()` calls whole-chain `forceRollback()` on a managed connection, not just the current SAVEPOINT. Even when a scope exits early inside a nested transaction, a connection with an unconfirmed result must not be returned to a pool.
 
-最外层事务回滚会恢复当前 Gateway 已交付且仍存活实体的持久化字段、未初始化状态、`isNew()`、原始快照、版本与缓存身份，包括事务内首次从数据库读取的对象。同主键的多个对象恢复事务开始前的共同基线，缓存优先保留事务开始前的 canonical 对象，后查询副本不覆盖它。回滚后旧对象可直接保存，新插入对象可重新插入。
+Outermost rollback restores persistent fields, uninitialized state, `isNew()`, original snapshots, versions, and cache identity for surviving entities delivered by the current Gateway, including entities first read inside the transaction. Multiple objects with the same key return to their common pre-transaction baseline. Cache restoration prioritizes the pre-transaction canonical object rather than a later query copy. After rollback, old objects can be saved and newly inserted objects can be reinserted.
 
-新插入行的重复查询副本在回滚后也会失效，不能利用已读取的生成主键绕过插入保护。删除旧行后重插：若数据库复用旧主键，重插对象和查询副本恢复旧行基线；若分配新主键，则按事务新增行失效。非 `#[Column]` 业务属性和钩子的外部副作用不在恢复范围。
+Duplicate query copies of a newly inserted row also become unpersisted after rollback, so an already-read generated key cannot bypass insertion protection. When an old row is deleted and reinserted: if the database reuses its old key, both the reinserted object and query copies return to the old-row baseline; if a new key is allocated, they become unpersisted as transaction-new rows. Non-`#[Column]` business properties and external hook side effects are not restored.
 
-只有数据库确认回滚成功，才恢复内存并透传业务异常。begin 返回 `false` 或抛异常、commit 失败、rollback 失败都按结果未知处理，抛 `TransactionException`；不能假定物理事务没有开始或提交。异常公开 `operation`（`开始` / `提交` / `回滚`）、`businessException` 和 `previous`。commit 失败不会被后续 rollback 失败覆盖；commit 已尝试后即使 rollback 成功也不恢复内存。
+Memory is restored and the business exception propagated only after the database confirms successful rollback. A `false` return or exception from begin, failed commit, or failed rollback means an unknown outcome and throws `TransactionException`; never assume the physical transaction did not begin or commit. The exception exposes `operation` (`begin` / `commit` / `rollback` in the underlying exception), `businessException`, and `previous`. A commit failure is not replaced by a later rollback failure. Once commit has been attempted, memory is not restored even if rollback succeeds.
 
-事务结果未知后，禁止在原 `Connection` 上继续查询、写入、事务或通过另一个 Gateway/`Session::use()` 复用。必须丢弃连接、Gateway 和关联实体；`Session::discard()` 仍允许解除失败 Session。驱动 begin 之前的连接所有权冲突是确定的 `LogicException`，不会毒化连接。
+After an unknown transaction outcome, do not query, write, transact, or reuse the original `Connection` through another Gateway or `Session::use()`. Discard the connection, Gateway, and associated entities. `Session::discard()` remains available to unbind the failed Session. A connection-ownership conflict before driver begin is a deterministic `LogicException` and does not poison the connection.
 
-当前上下文的同名会话有未结束事务时，`Session::use()` / `Session::scope()` 的隐式换绑会直接抛 `LogicException`，即使传入同一个 Gateway 也一样；不执行回滚、不清理事务状态、不释放连接所有权，原 Session 保持不变。必须先显式 `Session::discard()` 并处理回滚结果，不能把换绑当成静默清理事务的方式。
+If a same-named session in the current context has an unfinished transaction, implicit rebinding by `Session::use()` / `Session::scope()` throws `LogicException`, even with the same Gateway. It does not roll back, clean transaction state, or release connection ownership; the original Session remains unchanged. Explicitly call `Session::discard()` and handle the rollback result first. Rebinding is not silent transaction cleanup.
 
-## 10. 生命周期钩子
+## 10. Lifecycle Hooks
 
-在 Entity 子类中覆盖钩子方法，实现业务逻辑：
+Override hook methods in an Entity subclass to implement business logic:
 
 ```php
 final class Order extends Entity
 {
-    // ... 字段定义 ...
+    // ... field definitions ...
 
     public function beforeInsert(): void
     {
@@ -786,77 +828,77 @@ final class Order extends Entity
     public function beforeSave(): void
     {
         if ($this->amount <= 0) {
-            throw new \InvalidArgumentException('金额必须大于 0');
+            throw new \InvalidArgumentException('Amount must be greater than zero');
         }
     }
 
     public function afterDelete(): void
     {
-        // 清理关联数据、发送通知等
+        // Clean related data, send notifications, and so on
     }
 }
 ```
 
-可用钩子（全部 `public function`）：
+Available hooks (all `public function`):
 
-| 钩子 | 触发时机 |
-|------|---------|
-| `beforeSave()` | insert 或 update 之前 |
-| `afterSave()` | insert 或 update 之后 |
-| `beforeInsert()` | 仅 insert 之前 |
-| `afterInsert()` | 仅 insert 之后 |
-| `beforeUpdate()` | 仅 update 之前 |
-| `afterUpdate()` | 仅 update 之后 |
-| `beforeDelete()` | delete 之前 |
-| `afterDelete()` | delete 之后 |
+| Hook | Timing |
+|------|--------|
+| `beforeSave()` | Before insert or update |
+| `afterSave()` | After insert or update |
+| `beforeInsert()` | Before insert only |
+| `afterInsert()` | After insert only |
+| `beforeUpdate()` | Before update only |
+| `afterUpdate()` | After update only |
+| `beforeDelete()` | Before delete |
+| `afterDelete()` | After delete |
 
-## 11. 行缓存
+## 11. Row Cache
 
-**进程内自动管理**。同一个精确模型 class + 主键的 `find()` 会命中缓存返回同一个对象实例。不同模型即使主键值相同也不会共享缓存身份。
+**Managed automatically in process.** Repeated `find()` calls for the same exact model class + primary key return the same object instance. Different models never share cache identity even if their key values match.
 
 ```php
 $a = Asset::find(['user_id' => 1, 'key' => 'x']);
 $b = Asset::find(['user_id' => 1, 'key' => 'x']);
-// $a === $b（同一个实例）
+// $a === $b (the same instance)
 ```
 
-- 查询结果也会写入缓存（`Builder::get()` 返回的实体）
-- 使用 PHP 有序关联数组维护真正的 O(1) LRU：读取命中也会刷新热度，默认容量 1024 行
-- 条件写与删除按精确模型类失效，避免误标其他模型的存活实体
-- `delete()` 后自动清退缓存；事务每层保存独立快照，回滚恢复该层对应的 LRU 与 canonical 对象，再补齐缺失身份
-- 缓存在进程内有效，不跨进程；不是跨进程一致性或分布式锁机制
+- Query results also populate the cache (entities returned by `Builder::get()`)
+- A PHP ordered associative array provides a true O(1) LRU; read hits refresh recency, and default capacity is 1024 rows
+- Conditional writes and deletes invalidate by exact model class, avoiding accidental changes to other models' live entities
+- `delete()` automatically evicts the row. Each transaction level stores an independent snapshot; rollback restores that level's LRU and canonical object, then fills missing identities
+- Cache is process-local, not cross-process; it is neither a cross-process consistency mechanism nor a distributed lock
 
-## 12. 脏跟踪
+## 12. Dirty Tracking
 
-`save()` 做更新时只生成变了字段的 SET 子句。比较的是 `markPersisted()` 时刻的快照和当前值。标量、null 与同一对象引用走严格相等快路径；对象值不同引用时，经 Caster 规范化到数据库表示再比较，不使用受瞬态属性影响的宽松对象比较。
+On update, `save()` generates SET clauses only for changed fields. It compares current values with the snapshot captured by `markPersisted()`. Scalars, null, and identical object references use a strict-equality fast path. Distinct object instances are normalized by the Caster to their database representation before comparison, avoiding loose object comparison affected by transient state.
 
 ```php
-$u = User::find(['id' => 1]); // 此时快照：age=28, name='张三'
+$u = User::find(['id' => 1]); // Snapshot: age=28, name='Alice'
 $u->age = 29;
 $u->save();
 // SQL: UPDATE user SET age = :set_age WHERE id = :pk_id
-// 不会写 name —— 因为它没变
+// name is not written because it did not change
 
 $invoice->amount = new Money($invoice->amount->cents);
-$invoice->save(); // 等值 Money 新实例：无 UPDATE，也不递增版本
+$invoice->save(); // Equal new Money instance: no UPDATE and no version increment
 ```
 
-自动 `updated_at` 与关系预加载刷新使用同一语义。未发生字段变化时，不会仅为递增 `#[Version]` 执行 UPDATE；值对象的内部非持久化属性不应影响判断。
+Automatic `updated_at` handling and relation eager-load refreshes use the same semantics. With no field changes, no UPDATE is issued merely to increment `#[Version]`. Internal non-persistent properties of a value object should not affect the decision.
 
-## 13. 主键规则
+## 13. Primary-key Rules
 
-| 规则 | 说明 |
-|------|------|
-| 代理键 | `#[PrimaryKey(generated: true)]`，恰好 1 个，插入后回填 |
-| 自然键 | `#[PrimaryKey(order: N)]`，可复合，调用方必须提供 |
-| 不混用 | 一个模型不能同时有 generated 和 order |
-| 键值边界 | `0`、`""`、`false` 都是合法键值；`null` 不可作为主键 |
-| 身份完整 | 任何按主键操作缺少任意一列都会拒绝，不发 SQL |
-| 不可空 | 主键属性不能是可空类型（`?int`） |
+| Rule | Description |
+|------|-------------|
+| Surrogate key | `#[PrimaryKey(generated: true)]`, exactly one, populated after insert |
+| Natural key | `#[PrimaryKey(order: N)]`, optionally composite; caller supplies values |
+| No mixing | One model cannot combine generated and order keys |
+| Value boundaries | `0`, `""`, and `false` are valid key values; `null` is not |
+| Complete identity | Any key-based operation missing a column is rejected before SQL |
+| Non-nullable | A primary-key property cannot have nullable type such as `?int` |
 
-## 14. 独立模型生成器
+## 14. Standalone Model Generator
 
-`pixiaoka/orm` 自带数据库结构读取和模型生成能力，不依赖 webman。生成器只连接调用方明确给出的数据库，并且只向 `--dir` 指定的目录写入模型。
+`pixiaoka/orm` includes database schema inspection and model generation without webman. The generator connects only to the explicitly supplied database and writes models only under `--dir`.
 
 ```bash
 # SQLite
@@ -865,7 +907,7 @@ vendor/bin/pixiaoka-orm generate \
     --dir='/absolute/path/app/model/orm' \
     --namespace='App\\Model\\Orm'
 
-# MySQL；PostgreSQL 将 dsn 换成 pgsql:host=...;port=5432;dbname=...
+# MySQL; for PostgreSQL, replace dsn with pgsql:host=...;port=5432;dbname=...
 vendor/bin/pixiaoka-orm generate \
     --dsn='mysql:host=127.0.0.1;port=3306;dbname=app;charset=utf8mb4' \
     --user=app --password=secret \
@@ -874,21 +916,21 @@ vendor/bin/pixiaoka-orm generate \
     --prefix=pc_ --force pc_order pc_order_item
 ```
 
-- `--dsn`、`--dir`、`--namespace` 必填，`--user` / `--password` 按驱动需要传入；也可用 `ORM_DB_USER`、`ORM_DB_PASSWORD` 环境变量避免在进程参数中暴露密码。
-- 带值选项同时支持 `--name=value` 与 `--name value`；缺值、重复选项、未知选项会明确报错并返回非零状态。
-- 不传表名生成全部用户表；传入一个或多个表名则只处理这些表。
-- `--prefix` 只剥离类名前缀，`table()` 仍返回完整真实表名。
-- 默认不覆盖已有文件；`--force` 才允许覆盖。
-- 支持自增单列主键、复合自然主键、字段可空性、标量默认值和常见数据库类型映射。
-- 无主键表会被拒绝；批量生成先渲染校验全部表，再创建目录和写文件，避免留下部分输出。
-- `CURRENT_TIMESTAMP` 等数据库动态表达式、`NULL` 和对象类型默认值不会生成非法 PHP 属性初始化代码；由插入流程或数据库负责赋值。
-- 无默认值的非空标量使用合法零值，可空属性保留未初始化以区分未赋值和显式 `null`。
-- 默认值按方言处理：MySQL 元数据为已解码文本，SQLite/PostgreSQL 为 SQL 字面量；PostgreSQL `E'...'` 单独解析转义，不折叠普通字符串反斜杠。
-- 仅 SQLite 无精度 `datetime/timestamp` 和 PostgreSQL 无精度 `timestamp without time zone` 映射 `DateTimeImmutable + #[Temporal]`；`DATE`、`TIME`、时区、小数秒及 MySQL `datetime/timestamp` 保守使用 `string`。
-- 表和列名采用受限标识符策略，防止数据库标识符或生成代码被注入；不支持的名称应显式检查、改名，不能通过拼接 SQL 绕过。
-- 生成目录必须位于明确的业务目录中，不能把根目录或当前工作目录作为输出位置。
+- `--dsn`, `--dir`, and `--namespace` are required. Supply `--user` / `--password` as required by the driver, or use `ORM_DB_USER` and `ORM_DB_PASSWORD` to avoid exposing a password in process arguments.
+- Valued options support both `--name=value` and `--name value`. Missing values, duplicate options, and unknown options produce clear errors and a nonzero exit status.
+- With no table names, all user tables are generated; one or more table names restrict generation to those tables.
+- `--prefix` strips only the class-name prefix; `table()` still returns the complete real table name.
+- Existing files are preserved by default; only `--force` permits overwriting.
+- Single-column auto-increment keys, composite natural keys, field nullability, scalar defaults, and common database type mappings are supported.
+- Tables without primary keys are rejected. Batch generation renders and validates every table before creating directories and writing files, avoiding partial output.
+- Dynamic database expressions such as `CURRENT_TIMESTAMP`, `NULL`, and object defaults never produce invalid PHP property initializers; insertion or the database supplies those values.
+- Non-nullable scalars without defaults receive valid zero values, while nullable properties remain uninitialized to distinguish unassigned values from explicit `null`.
+- Defaults are dialect-aware: MySQL metadata is decoded text, while SQLite/PostgreSQL contain SQL literals. PostgreSQL `E'...'` escapes are parsed separately without collapsing ordinary string backslashes.
+- Only SQLite precision-free `datetime/timestamp` and PostgreSQL precision-free `timestamp without time zone` map to `DateTimeImmutable + #[Temporal]`. `DATE`, `TIME`, time zones, fractional seconds, and MySQL `datetime/timestamp` conservatively map to `string`.
+- Table and column names use a restricted identifier policy to prevent injection through database identifiers or generated code. Explicitly inspect or rename unsupported names; never bypass this with concatenated SQL.
+- The output directory must be an explicit application directory, not the filesystem root or current working directory.
 
-例如 `pc_order` 在 `--prefix=pc_` 下生成 `Order.php`：
+For example, `pc_order` with `--prefix=pc_` generates `Order.php`:
 
 ```php
 <?php
@@ -917,7 +959,7 @@ final class Order extends Entity
 }
 ```
 
-公开 PHP API 可直接用于自己的生成工具：
+Use the public PHP API directly in your own generation tools:
 
 ```php
 use Pixiaoka\Orm\ModelGenerator;
@@ -930,31 +972,33 @@ $result = $generator->generate(
     namespace: 'App\\Model',
     prefix: 'pc_',
     force: false,
-    tables: ['pc_order'], // [] 表示全部用户表
+    tables: ['pc_order'], // [] means all user tables
 );
-// 两个键都是表名 => 目标文件路径：
+// Both keys map table names to target paths:
 // ['generated' => ['pc_order' => '/.../Order.php'], 'skipped' => []]
 
 $tableSchema = (new SchemaInspector($pdo))->table('pc_order');
-$code = $generator->render($tableSchema, 'App\\Model'); // 只返回代码，不写文件
+$code = $generator->render($tableSchema, 'App\\Model'); // Return code only; write nothing
 ```
 
-`ModelGenerator::__construct(PDO $pdo, ?TypeMapper $types = null)`；`generate()` 参数如上，返回 `array{generated: array<string, string>, skipped: array<string, string>}`；`render(TableSchema $table, string $namespace, ?string $class = null): string` 可单独渲染已读取的表元数据。
+`ModelGenerator::__construct(PDO $pdo, ?TypeMapper $types = null)`. `generate()` uses the arguments above and returns `array{generated: array<string, string>, skipped: array<string, string>}`. `render(TableSchema $table, string $namespace, ?string $class = null): string` can independently render previously inspected table metadata.
 
-webman 的 `orm:gen` 只负责读取框架配置并调用同一库内 API，不包含另一套 Schema 读取或代码渲染实现。可运行 `php webman orm:gen [tables...]`，使用 `--connection`、`--dir`、`--namespace`、`--prefix`、`--force`；app 外目录必须显式指定 `--namespace`。
+webman's `orm:gen` only reads framework configuration and invokes the same library API; it has no separate schema-inspection or code-rendering implementation. Run `php webman orm:gen [tables...]` with `--connection`, `--dir`, `--namespace`, `--prefix`, and `--force`. An output directory outside app requires explicit `--namespace`.
 
-默认值边界详见 [README](README.md#generate-models-from-a-database)：PHP 8.3 不生成对象属性初始化；PostgreSQL 的 Unicode 转义按码点生成 UTF-8，原始高位字节按服务器编码转换。非 UTF-8 混合转义、SQL_ASCII、未知编码和非法序列均不猜测数据库默认值，而采用安全的 PHP 兜底值。
+The generator rejects unsafe database identifiers, invalid namespaces, ambiguous output locations such as the root/current directory, and unwritable target files. Generated models extend `Pixiaoka\Orm\Entity` and use `#[Column]` and `#[PrimaryKey]`. Single-column auto-increment keys use `generated: true`, while composite keys preserve database declaration order.
 
-## 15. 元数据缓存
+Default-value boundaries: PHP 8.3 does not permit objects as property defaults, so Decimal, DateTime, and dynamic database expressions are never rendered as invalid initializers. Defaults that cannot be represented losslessly as static PHP are omitted. PostgreSQL Unicode escapes produce UTF-8 by code point; raw high bytes are validated and converted according to server encoding. With non-UTF-8 encodings, mixed escape/raw bytes, SQL_ASCII, unknown encodings, and invalid sequences are never guessed; a safe PHP fallback is used instead.
 
-`MetadataReader` 在进程内缓存字段元数据，也支持导出/导入纯 PHP 数组，供 PHP-FPM 部署时复用并通过 OPcache 降低反射成本。缓存不包含 `ReflectionProperty` 等不可序列化对象。
+## 15. Metadata Cache
+
+`MetadataReader` caches field metadata in process and can export/import plain PHP arrays. PHP-FPM deployments can reuse them through OPcache to reduce reflection cost. The cache contains no non-serializable objects such as `ReflectionProperty`.
 
 ```php
 use Pixiaoka\Orm\Gateway\EntityGateway;
 use Pixiaoka\Orm\Gateway\PdoConnection;
 use Pixiaoka\Orm\Metadata\MetadataReader;
 
-// 构建/部署阶段：为实际使用的模型预热。
+// Build/deploy stage: warm the models actually used.
 $reader = new MetadataReader();
 foreach ([User::class, Article::class] as $model) {
     $reader->read($model);
@@ -965,16 +1009,16 @@ file_put_contents(
     '<?php return ' . var_export($cache, true) . ';',
 );
 
-// 请求启动：可将同一个 Reader 注入多个 Gateway。
+// Request bootstrap: the same Reader may be injected into multiple Gateways.
 $metadata = new MetadataReader(require '/path/to/orm-metadata.php');
 $gateway = new EntityGateway(new PdoConnection($pdo), $metadata);
 ```
 
-导出格式为 `['version' => 1, 'models' => [模型类名 => 元数据数组]]`；也可调用 `$reader->import($cache)` 导入已有 Reader。版本、结构或首次读取时的模型定义不一致会抛 `MetadataException`，此时应重新生成缓存，不能手工拼接内部元数据。关系元数据仍按需读取与校验。模型部署和缓存更新必须保持同一版本，缓存不是跨环境自动失效系统。
+The export format is `['version' => 1, 'models' => [model class => metadata array]]`. You may also call `$reader->import($cache)` on an existing Reader. Version, structural, or model-definition mismatches detected on first read throw `MetadataException`; regenerate the cache instead of manually assembling internal metadata. Relation metadata remains lazily read and validated. Model deployment and cache updates must stay on the same version; the cache is not an automatic cross-environment invalidation system.
 
-## 16. 索引声明与 Schema 差异对比
+## 16. Index Declarations and Schema Diffs
 
-模型类可重复声明 `#[Index]`，属性名或真实列名均可，顺序就是索引列顺序：
+A model class may declare repeatable `#[Index]` attributes using property names or real column names. Array order determines index-column order:
 
 ```php
 use Pixiaoka\Orm\Annotation\Index;
@@ -983,11 +1027,11 @@ use Pixiaoka\Orm\Annotation\Index;
 #[Index(['created_at'], name: 'idx_article_created_at')]
 final class Article extends Entity
 {
-    // 字段与主键定义
+    // Field and primary-key definitions
 }
 ```
 
-声明仅参与元数据与 Schema 差异比较，不会在正常查询时自动创建索引。读取数据库实时结构后可生成差异报告：
+Declarations participate only in metadata and schema comparison; normal queries never create indexes automatically. Inspect the live database schema to generate a diff report:
 
 ```php
 use Pixiaoka\Orm\Metadata\MetadataReader;
@@ -1001,7 +1045,7 @@ $report = $differ->compare($meta, $table, 'mysql');
 $statements = $differ->previewSql($meta, $table, 'mysql');
 ```
 
-支持 `mysql`、`pgsql`、`sqlite`，比较字段新增/删除、语义类型、可空性及二级索引。报告结构：
+Supported drivers are `mysql`, `pgsql`, and `sqlite`. Comparisons cover added/removed fields, semantic types, nullability, and secondary indexes. Report structure:
 
 ```php
 [
@@ -1021,7 +1065,7 @@ $statements = $differ->previewSql($meta, $table, 'mysql');
 ]
 ```
 
-自定义 `Castable` 没有通用数据库类型猜测，构造时必须给出完整三方言映射；内置 `Decimal` 实现默认使用 decimal/text 映射，也可按需显式覆盖：
+There is no universal database-type inference for custom `Castable` classes. Supply a complete three-dialect mapping to the constructor. Built-in `Decimal` implementations default to decimal/text mappings and may also be overridden explicitly:
 
 ```php
 $differ = new SchemaDiffer([
@@ -1033,9 +1077,9 @@ $differ = new SchemaDiffer([
 ]);
 ```
 
-SQLite 修改字段类型或可空性需人工重建表，报告将对应项标为不可执行；只要存在不支持项，`previewSql()` 就抛出异常，不返回看似完整但实际残缺的迁移计划。字段删除、索引重建、约束、数据和权限必须由应用迁移流程审核。**Differ 只生成报告和预览 SQL，绝不自动执行 DDL，不替代正式迁移系统。**
+Changing a field type or nullability on SQLite requires manual table rebuilding, and the report marks those entries non-executable. If any unsupported entry exists, `previewSql()` throws rather than returning a seemingly complete but incomplete migration plan. Field removal, index rebuilding, constraints, data, and privileges must be reviewed by the application's migration process. **The Differ only generates reports and preview SQL. It never executes DDL and is not a replacement for a formal migration system.**
 
-## 17. 可观测性
+## 17. Observability
 
 ```php
 use Pixiaoka\Orm\Observability\Event;
@@ -1045,50 +1089,81 @@ use Pixiaoka\Orm\Observability\SessionEvent;
 
 $unsubscribe = $gateway->subscribe(function (Event $event): void {
     if ($event instanceof SqlEvent) {
-        // SQL、operation、model、durationMs、successful、parameterNames、
-        // affectedRows/resultRows、exceptionClass、context。
+        // SQL, operation, model, durationMs, successful, parameterNames,
+        // affectedRows/resultRows, exceptionClass, and context.
     }
     if ($event instanceof TransactionEvent) {
-        // begin/commit/rollback；受管连接的每层 SAVEPOINT 也可能产生事件。
-        // 不应把每个事件都解释为一次独立物理数据库提交。
+        // begin/commit/rollback; each managed SAVEPOINT level may also emit events.
+        // Not every event represents an independent physical database commit.
     }
     if ($event instanceof SessionEvent) {
-        // bind/discard/restore；successful 表示清理结果。
+        // bind/discard/restore; successful indicates the cleanup result.
     }
 });
 ```
 
-也可传入实现 `EventListener::onEvent(Event $event): void` 的对象。返回的闭包可幂等取消订阅。监听器异常不会改变 SQL 或事务结果，默认不输出日志；同一 Dispatcher 重入时丢弃嵌套事件。无监听器时跳过事件构造和执行计时。
+You may also pass an object implementing `EventListener::onEvent(Event $event): void`. The returned closure idempotently unsubscribes. Listener exceptions do not change SQL or transaction outcomes, and nothing is logged by default. Nested events are discarded when the same Dispatcher is reentered. With no listeners, event construction and execution timing are skipped.
 
-观测回调不得重入同一连接执行 ORM 操作，也不得通过 `Session::use()`、`Session::scope()` 或 `Session::discard()` 换绑或清理当前业务 Session。独立连接的嵌套事件保留外层保护，不会提前放开这些限制。
+An observability callback must not reenter the same connection for ORM operations or change/clear the current business Session through `Session::use()`, `Session::scope()`, or `Session::discard()`. Nested events from an independent connection retain the outer protection and do not lift these restrictions early.
 
-可以用完全独立的 Gateway/Connection 直接写观测库；独立写入不加入业务事务，也不保证与业务事务原子提交。直接调用 PDO/Connection 不属于 ORM 重入保护范围。`rollback successful=true` 仅表示回滚清理 API 成功，不证明之前失败的 commit 没有生效。
+A completely independent Gateway/Connection may write directly to an observability database. Those writes neither join the business transaction nor guarantee atomic commit with it. Direct PDO/Connection calls are outside ORM reentry protection. `rollback successful=true` only means the rollback cleanup API succeeded; it does not prove that a previously failed commit had no effect.
 
-`ContextInfo::$type` 为 root/fiber/coroutine，`$id` 是进程内上下文对象 `spl_object_id()`，不是跨请求或分布式追踪 ID。事件不包含参数值、查询结果、实体、连接、原异常对象、消息或堆栈；SQL 原文仍可能含手写字面量秘密，不能视为完全脱敏。只覆盖经过 Gateway 的 SQL、事务与 Session 操作，应用直接调用 PDO/Connection、SchemaInspector 不在范围内。可选 `Clock` 构造参数用于确定性计时测试。
+`ContextInfo::$type` is root/fiber/coroutine, and `$id` is the process-local context object's `spl_object_id()`, not a cross-request or distributed trace ID. Events contain no parameter values, result rows, entities, connections, original exception objects, messages, or stacks. SQL text can still contain handwritten literal secrets and is not fully redacted. Coverage includes SQL, transactions, and Session operations passing through Gateway; direct application PDO/Connection and SchemaInspector calls are excluded. The optional `Clock` constructor argument supports deterministic timing tests.
 
-## 18. 测试与真实数据库验收
+## 18. Testing and Real-database Verification
 
 ```bash
-# 当前已验证基线：395 tests / 11109 assertions（4 项显式 DSN 实连测试默认跳过）
+# Previously verified baseline: 395 tests / 11109 assertions (4 explicit-DSN live tests skipped by default)
 vendor/bin/phpunit
 
-# SQLite / MySQL / PostgreSQL 实连；进程环境变量覆盖 .env
+# SQLite / MySQL / PostgreSQL live verification; process environment overrides .env
 php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql tests/orm_live_verify.php
 ```
 
-MySQL/PostgreSQL 推荐使用独立 Docker 测试实例，例如 `mysql:8.4`、`postgres:16-alpine`。将 `DB_MYSQL_HOST/PORT/NAME/USER/PASSWORD`、`DB_PGSQL_HOST/PORT/NAME/USER/PASSWORD` 指向实例映射端口即可，完整启动示例见 [README](README.md#docker-复验)。`orm_live_verify.php` 使用随机表名，按 PDO 登记并只清理本次创建的表；SQLite 兜底通过不能算真实 MySQL/PostgreSQL 通过。
+Use disposable Docker instances for MySQL/PostgreSQL. Never point these tests at production. The following ports are local examples; adjust them to your mappings:
 
-生成器另有 `tests/SchemaLiveTest.php`，只有显式设置 `PIXIAOKA_ORM_LIVE_MYSQL_DSN`、`PIXIAOKA_ORM_LIVE_PGSQL_DSN` 及对应 `_USER`、`_PASSWORD` 才连接外部数据库；默认跳过，不隐式读取本机服务或 `.env`。该测试使用原生预处理，覆盖主键、默认值、时间类型、生成文件 lint 和元数据，完整示例见 [README](README.md#模型生成器实连测试)。
+```bash
+docker run --name pixiaoka-orm-mysql-test \
+  -e MYSQL_ROOT_PASSWORD=local-only-password -e MYSQL_DATABASE=orm_test \
+  -p 127.0.0.1:32768:3306 -d mysql:8.4
 
-当前已验证的 Docker PHP 8.3 默认 SQLite 完整套件为 **395 tests / 11109 assertions / 4 skipped**，PHPStan 生产代码检查零错误。4 个跳过项均为未配置显式外部 DSN 的既有 MySQL/PostgreSQL 实连测试；本轮不以 SQLite 结果冒充真实双库通过。历史实连结果只作为既有验证记录，不表述为本次文档维护重新执行的结果。CI 继续核验多版本、Composer、lint 和双库服务测试；Swoole/Swow 真实扩展验收未执行。
+docker run --name pixiaoka-orm-pgsql-test \
+  -e POSTGRES_PASSWORD=local-only-password -e POSTGRES_DB=orm_test \
+  -p 127.0.0.1:32770:5432 -d postgres:16-alpine
 
-## 19. 项目集成示例
+# Run after container health checks pass; these variables override .env
+DB_PGSQL_HOST=127.0.0.1 DB_PGSQL_PORT=32770 \
+DB_PGSQL_NAME=orm_test DB_PGSQL_USER=postgres DB_PGSQL_PASSWORD=local-only-password \
+DB_MYSQL_HOST=127.0.0.1 DB_MYSQL_PORT=32768 \
+DB_MYSQL_NAME=orm_test DB_MYSQL_USER=root DB_MYSQL_PASSWORD=local-only-password \
+php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql tests/orm_live_verify.php
+```
 
-当前项目使用 PostgreSQL（见 `config/database.php`），一个典型的模型迁移：
+`DB_MYSQL_HOST/PORT/NAME/USER/PASSWORD` and `DB_PGSQL_HOST/PORT/NAME/USER/PASSWORD` configure the two databases. If neither real database is reachable, the script falls back to SQLite. `orm_live_verify.php` uses random table names, tracks them by PDO, and removes only tables created by that run. SQLite fallback success is not a real MySQL/PostgreSQL pass. Afterwards, stop and remove these dedicated containers; do not reuse other application containers.
+
+### Live model-generator tests
+
+`tests/SchemaLiveTest.php` connects to external databases only when `PIXIAOKA_ORM_LIVE_MYSQL_DSN`, `PIXIAOKA_ORM_LIVE_PGSQL_DSN`, and their corresponding `_USER` and `_PASSWORD` variables are explicitly set. Otherwise it skips and never implicitly reads local services or `.env`.
+
+```bash
+PIXIAOKA_ORM_LIVE_MYSQL_DSN='mysql:host=127.0.0.1;port=32768;dbname=orm_test;charset=utf8mb4' \
+PIXIAOKA_ORM_LIVE_MYSQL_USER=root PIXIAOKA_ORM_LIVE_MYSQL_PASSWORD=local-only-password \
+PIXIAOKA_ORM_LIVE_PGSQL_DSN='pgsql:host=127.0.0.1;port=32770;dbname=orm_test' \
+PIXIAOKA_ORM_LIVE_PGSQL_USER=postgres PIXIAOKA_ORM_LIVE_PGSQL_PASSWORD=local-only-password \
+php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql vendor/bin/phpunit
+```
+
+The test disables PDO emulated prepares and verifies auto-increment/composite keys, static and dynamic defaults, temporal types, generated-file `php -l`, and ORM metadata. It creates and cleans only random test tables.
+
+The previously verified complete default SQLite suite in Docker PHP 8.3 was **395 tests / 11109 assertions / 4 skipped**, with zero PHPStan production-code errors. All four skips were existing MySQL/PostgreSQL live tests without explicit external DSNs; SQLite results are not presented as a real dual-database pass. Historical live results are retained as prior verification records, not represented as having been rerun for this documentation maintenance. CI continues to check multiple PHP versions, Composer, lint, and both database services. Real Swoole/Swow extension verification has not been performed.
+
+## 19. Project Integration Example
+
+This section illustrates integration into a separate application. The example assumes a PostgreSQL connection named `pgsql` in that application's `config/database.php`; it is not configuration shipped by this standalone library. A typical model migration is:
 
 ```php
-// app/model/Product.php —— 旧方式（继承 BaseModel）
-// ↓ 改为 Orm Entity ↓
+// app/model/Product.php — old approach (extends BaseModel)
+// Migrate to an ORM Entity:
 
 namespace app\model;
 
@@ -1109,7 +1184,7 @@ final class Product extends Entity
     public int $category_id;
 
     #[Column]
-    public string $price;  // 用 BcDecimal 可改为: public BcDecimal $price;
+    public string $price;  // For BcDecimal, use: public BcDecimal $price;
 
     #[Column]
     public int $created_at;
@@ -1119,12 +1194,12 @@ final class Product extends Entity
 
     public static function table(): string
     {
-        return 'pc_product';  // 注意 config/database.php 中 prefix 为 'pc_'
+        return 'pc_product';  // This example assumes prefix 'pc_' in config/database.php
     }
 }
 ```
 
-webman 中间件中初始化（伪代码）：
+Initialization in webman middleware (illustrative pseudocode):
 
 ```php
 namespace app\middleware;
@@ -1142,7 +1217,7 @@ class OrmMiddleware implements MiddlewareInterface
 
     public function __construct()
     {
-        // webman 常驻进程，构造一次即可
+        // Construct once for a long-running webman worker
         $config = config('database')['pgsql'];
         $dsn = "pgsql:host={$config['host']};port={$config['port']};dbname={$config['db']}";
         $this->pdo = new \PDO($dsn, $config['username'], $config['password']);
@@ -1164,7 +1239,7 @@ class OrmMiddleware implements MiddlewareInterface
 }
 ```
 
-控制器中使用：
+Usage in a controller:
 
 ```php
 namespace app\controller;
@@ -1178,7 +1253,7 @@ class ProductController
     {
         $product = Product::find(['id' => $id]);
         if (!$product) {
-            return json(['code' => 404, 'msg' => '商品不存在']);
+            return json(['code' => 404, 'msg' => 'Product not found']);
         }
         return json(['code' => 0, 'data' => $product->toArray()]);
     }
