@@ -116,7 +116,7 @@ final class OrmObservabilityTest extends TestCase
         self::assertSame('discard', $this->sessionAction());
     }
 
-    public function testNestedAndRollbackTransactionsEmitOnlyPhysicalEvents(): void
+    public function testNestedSavepointCommitAndOuterRollbackEmitTheirBoundaries(): void
     {
         $events = [];
         $this->gateway->subscribe(function (Event $event) use (&$events): void { $events[] = $event; });
@@ -130,7 +130,7 @@ final class OrmObservabilityTest extends TestCase
             self::assertSame('business rollback', $e->getMessage());
         }
         $phases = array_map(static fn (Event $e): string => $e->phase, array_values(array_filter($events, static fn (Event $e): bool => $e instanceof TransactionEvent)));
-        self::assertSame(['begin', 'rollback'], $phases);
+        self::assertSame(['begin', 'begin', 'commit', 'rollback'], $phases);
     }
 
     public function testFiberEventsCarryOwnContextAndScopeRestoresRoot(): void

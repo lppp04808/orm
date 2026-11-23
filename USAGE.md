@@ -28,7 +28,42 @@ Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
 });
 ```
 
-作用域不关闭 PDO，应用负责创建、重连、健康检查及归还。`Session::discard()` 会回滚当前上下文遗留的外层事务并解除绑定；`Session::scope()` 关闭时先执行同样的清理，再恢复此前的 Session，即使回滚失败也会恢复绑定并透传异常。事务回调内清理 Session 后不能继续提交。同一个 `EntityGateway` 被多个 Fiber/协程同时用于事务会被提前拒绝。
+作用域不关闭 PDO，应用负责创建、重连、健康检查及归还。`Session::discard()` 会回滚当前上下文遗留的整条受管事务链并解除绑定；`Session::scope()` 关闭时先执行同样的清理，再恢复此前的 Session，即使回滚失败也会恢复绑定并透传异常。事务回调内清理 Session 后不能继续提交。
+
+同一个 `EntityGateway` 从绑定成功到 `discard()` / 作用域释放为止，整个活跃读写生命周期都只能属于一个 Context，不限于事务期间。另一个 Fiber/协程尝试绑定会提前抛出 `LogicException`，避免覆盖 `lastInsertId()` 或交错异步驱动协议包。同一 Context 的重复绑定采用引用计数，嵌套作用域会恢复外层归属。
+
+### 命名会话与多数据源
+
+```php
+Session::use($writerGateway);                 // 默认名 default
+Session::use($readerGateway, 'readonly');
+try {
+    $reader = Session::get('readonly')->gateway;
+    // 模型静态 API 默认选择 default；显式 Builder 可选择其他数据源。
+    $rows = (new \Pixiaoka\Orm\Query\Builder(User::class, $reader))
+        ->where('active', true)
+        ->get();
+
+    // default 临时切到 reader，正常返回或异常都恢复 writer。
+    $count = Session::scope($readerGateway, fn (): int => User::query()->count());
+
+    Session::discard('readonly');             // 只清理 readonly
+} finally {
+    Session::discard(null);                    // 清理当前 Context 的全部命名会话
+}
+```
+
+`use()`、`get()` 与 `scope()` 的 `$name` 默认都是 `'default'`；`discard()` 省略参数只清理 `default`，只有显式 `null` 才清理全部。命名会话分别维护事务与回滚状态，跨数据源的实体不能隐式换绑。多个会话需要各自独立的 PDO/Gateway，不能借此共享一个并发物理连接。
+
+### ManagedConnection 与连接池
+
+`PdoConnection` 实现可选的 `ManagedConnection`，除基础 SQL 契约外还提供：
+
+- `ping(): bool`：执行轻量存活探测，断线或失败返回 `false`，不向连接池泄漏驱动异常；
+- `forceRollback(): bool`：回滚整条物理事务链，成功后把嵌套深度重置为零；
+- 嵌套事务：最外层用原生 PDO 事务，后续层级用 SAVEPOINT。
+
+连接池可在借出或归还时调用 `ping()`，但归还前必须先通过 `Session::discard()` 正常清理 ORM 上下文。`ping()` 不证明未提交事务的结果，`forceRollback()` 也不能被用来掩盖 commit/rollback 结果未知；结果未知时仍应废弃连接、Gateway 和关联实体。只实现旧 `Connection` 的装饰器无需添加这两个方法，但它没有物理 SAVEPOINT 能力，嵌套事务行为见[事务](#9-事务)。
 
 **webman 只是可选适配方式**，可在应用中间件中为每个请求调用上述作用域；不要把根 PDO 隐式共享给所有 Fiber。嵌套上下文必须显式选择连接。Session 与事务状态按 Fiber/运行时协程对象弱引用隔离，不依赖可复用的数字 ID。Swoole/Swow 仍应在真实扩展环境验证，不能仅以 Fiber 测试替代。
 
@@ -111,9 +146,43 @@ final class OrderItem extends Entity
 | `bool` | 0/1 | `public bool $active;` |
 | `array` | JSON | `public array $tags;` |
 | `Pixiaoka\Orm\Cast\BcDecimal` | TEXT（高精度十进制） | `public BcDecimal $price;` |
-| `BackedEnum` | 枚举值 | `public SampleStatus $status;` |
+| `BackedEnum` | 枚举的 int/string 值 | `public SampleStatus $status;` |
+| `Castable` 实现 | 自定义标量表示 | `public Money $price;` |
 | `DateTimeImmutable` | `Y-m-d H:i:s` UTC | `#[Temporal] public DateTimeImmutable $at;` |
 | 可空 `?` 形式 | NULL | `public ?string $desc;` |
+
+数组按 JSON 编解码，非法 JSON 或未知枚举值会抛 `CastException`。`BackedEnum` 只支持 int/string backed enum，不接受纯 enum。自定义值对象实现 `Castable`：
+
+```php
+use Pixiaoka\Orm\Annotation\Column;
+use Pixiaoka\Orm\Cast\Castable;
+
+final readonly class Money implements Castable
+{
+    public function __construct(public int $cents) {}
+
+    public function toDatabase(): int
+    {
+        return $this->cents;
+    }
+
+    public static function fromDatabase(int|float|string $value): static
+    {
+        if (filter_var($value, FILTER_VALIDATE_INT) === false) {
+            throw new \InvalidArgumentException('金额格式错误');
+        }
+        return new self((int) $value);
+    }
+}
+
+// 以下属性位于 Entity 模型类内部：
+#[Column]
+public Money $price; // 数据库保存整数分，PHP 保存 Money
+```
+
+`toDatabase()` 可返回 int/float/string/null；非空字段仍按字段可空性约束。`fromDatabase()` 接收数据库标量，读写失败由 Caster 统一包装为 `CastException`。实现类应不可变或自行保证一致性，不要依赖对象中的瞬态属性表达持久化值。
+
+实体更新与关系刷新对对象字段按规范化数据库表示进行语义比较：等值的新 `Money`、`DateTimeImmutable`、Decimal 对象不会被误判为脏字段，也不会因此产生多余 UPDATE 或递增 `#[Version]`。不同时区但同一时刻的时间按其实际存储格式比较。绑定给 Builder 的 Castable 也经同一 Caster 规范化。
 
 ### DateTimeImmutable 的存储格式
 
@@ -179,6 +248,39 @@ try {
 版本字段必须同时声明 `#[Column]`，类型是非空 `int`，每模型仅一个，不能兼任主键、生成列或自动时间字段。插入默认版本 `1`，显式 `0` 保留；负数与 `PHP_INT_MAX` 拒绝。删除同样带版本条件。影响行数不是 `1` 时抛异常，内存版本、快照和缓存不提前推进；无业务变化时不执行无意义的版本递增 UPDATE。不能手改版本属性绕过检查。
 
 带 `#[Version]` 的模型不支持 Builder 条件 UPDATE/DELETE 或 UPSERT（包括冲突忽略），这些操作缺少逐实体旧版本快照。`executeRaw()` 不自动加版本条件或处理冲突，需由调用方控制 SQL、影响行数以及 `refresh()` / `flushCache()`。生成器只对非空、非主键、列名恰为 `version` 的 `int` 字段自动添加 `#[Version]`，其他字段名请显式添加。
+
+### 软删除：#[SoftDelete]
+
+```php
+use Pixiaoka\Orm\Annotation\Column;
+use Pixiaoka\Orm\Annotation\SoftDelete;
+use Pixiaoka\Orm\Annotation\Temporal;
+
+#[Column]
+#[SoftDelete]
+#[Temporal]
+public ?DateTimeImmutable $deleted_at = null;
+```
+
+软删除字段声明位于 Entity 模型类内部，必须同时有 `#[Column]`，类型为可空 `DateTimeImmutable`，且不能兼任主键、生成列、版本字段或自动时间字段；每个模型最多一个。`NULL` 表示未删除，时间统一使用秒级 UTC，单实体与批量软删除后的内存值与数据库刷新值一致。
+
+```php
+$visible = Article::query()->get();                    // 默认 deleted_at IS NULL
+$all = Article::query()->withTrashed()->get();          // 包含回收站
+$deleted = Article::query()->onlyTrashed()->get();      // 仅回收站
+
+$article->delete();                                    // 软删除
+$article->restore();                                   // 实体恢复
+$article->forceDelete();                               // 实体物理删除
+
+$n = Article::query()->where('tenant_id', 7)->delete();
+$n = Article::query()->onlyTrashed()->where('tenant_id', 7)->restore();
+$n = Article::query()->withTrashed()->where('id', 7)->forceDelete();
+```
+
+Builder 的 `delete()` 在声明软删除的模型上写时间戳，`restore()` 只恢复符合当前条件的已删除行，`forceDelete()` 才物理删除。默认 `delete()` / `forceDelete()` 不包含已软删除行，需要时用 `withTrashed()` 或 `onlyTrashed()` 明确范围。软删除范围本身就是写入边界，所以即使没有其他显式 WHERE，也不会像普通模型 DELETE 一样被拒绝；`restore()` 也只针对回收站。特别地，`withTrashed()->forceDelete()` 且没有其他条件可能物理清空整表，应谨慎使用。`restore()` / `forceDelete()` 对未声明软删除的模型会拒绝执行。批量写不触发实体钩子，必要时刷新已持有对象。
+
+普通查询、关系加载、关系过滤与计数都应用目标模型的软删除范围。关系约束闭包中可显式调用 `withTrashed()` 包含目标回收站；软删除不是关联加载的额外全局功能开关，而是目标模型元数据的一部分。
 
 ## 3. 只读关系与预加载
 
@@ -296,7 +398,7 @@ $rows = Customer::query()
 
 关联过滤和计数约束只允许结构化 WHERE/OR、嵌套关联过滤；支持属性名和真实列名，约束列由当前关系自动限定。不支持 whereRaw/Expression、任意普通 Builder 子查询、显式表前缀、投影、withCount、JOIN、GROUP/HAVING、UNION、派生表、DISTINCT、alias、排序、limit/offset、行锁或 with。闭包必须返回 `null` 或传入的同一个 Builder；不得在闭包或其中的 OR 分组内执行 get/first/rows/row/value/count/build/update/delete 等终结操作。非法约束在任何 SQL 之前拒绝。
 
-`whereHas()/whereDoesntHave()/whereRelation()` 可用于实体查询、原始行、父 COUNT 和条件 UPDATE/DELETE（仍遵守乐观锁等原有写入限制）；可与独立 `with()` 组合，过滤不会变成预加载约束。首版 `withCount()` 与关联过滤互斥，不能用于 `get()/first()/count()`、条件 UPDATE/DELETE 或 `with()`。普通 WHERE/OR 与计数的两种调用顺序均可；计数与 OR 分组内的关联过滤仍互斥。这里不包含 `has()` 的数量比较、关联写入、多对多或全局软删除。
+`whereHas()/whereDoesntHave()/whereRelation()` 可用于实体查询、原始行、父 COUNT 和条件 UPDATE/DELETE（仍遵守乐观锁等原有写入限制）；可与独立 `with()` 组合，过滤不会变成预加载约束。首版 `withCount()` 与关联过滤互斥，不能用于 `get()/first()/count()`、条件 UPDATE/DELETE 或 `with()`。普通 WHERE/OR 与计数的两种调用顺序均可；计数与 OR 分组内的关联过滤仍互斥。目标模型声明软删除时，关联过滤与计数默认只统计未删除目标，关系约束中可用 `withTrashed()` 显式放宽。这里不包含 `has()` 的数量比较、关联写入或多对多。
 
 ## 4. Active Record
 
@@ -393,7 +495,14 @@ $user = User::query()
 $count = User::query()
     ->where('age', 28)
     ->count();
+
+// 克隆复用：两个 Builder 的查询结构互不影响。
+$adults = User::query()->whereOp('age', '>=', 18);
+$firstPage = (clone $adults)->orderBy('id')->limit(20);
+$admins = (clone $adults)->where('role', 'admin');
 ```
+
+`clone` 会递归隔离 WHERE/OR、子查询、JOIN、UNION、派生表、排序和分页等 ORM 查询状态；`first()`、`row()`、`value()` 与复杂 `count()` 也通过克隆避免污染原查询。绑定值中的 `DateTimeImmutable`、枚举、Decimal 等业务对象不克隆，调用方应避免修改共享的可变值对象。内部 `QueryState`、SQL/关系编译器不是公共扩展接口，流式 Builder 才是稳定使用入口。
 
 ### 可用条件方法
 
@@ -630,14 +739,25 @@ User::transaction(function () {
     $b->save();
 });
 
-// 嵌套事务只在外层提交/回滚
+// PdoConnection：嵌套层使用真实 SAVEPOINT。
 User::transaction(function () {
-    // ...
-    User::transaction(function () {
-        // 内层不开启真事务
-    });
+    // 外层原生事务。
+    try {
+        User::transaction(function () {
+            // SAVEPOINT sp_2；异常回滚只撤销这一层。
+            throw new DomainException('撤销内层写入');
+        });
+    } catch (DomainException) {
+        // 内层回滚已成功时，外层可以继续写入并最终提交。
+    }
 });
 ```
+
+`PdoConnection` 实现 `ManagedConnection`：深度 1 执行 PDO 原生 begin/commit/rollback；深度 2 及以后执行 `SAVEPOINT sp_N`、`RELEASE SAVEPOINT sp_N`、`ROLLBACK TO SAVEPOINT sp_N` 后释放保存点。内层释放不是独立提交，最外层回滚仍会撤销全部工作。不要在此适配器上混用未受管的 `$pdo->beginTransaction()`，混用会被拒绝。
+
+每层 SAVEPOINT 有独立的实体、缓存与身份快照：内层回滚恢复该层首次读取、修改或插入的对象，外层事务可继续；最外层回滚恢复整链基线。只实现旧 `Connection` 的装饰器不强制实现 `ManagedConnection`，其嵌套 `transaction()` 仍复用外层回调，不提供独立保存点回滚；这是兼容路径，不应据此推断 `PdoConnection` 的行为。
+
+`Session::discard()` 对受管连接调用整链 `forceRollback()`，不是只回滚当前 SAVEPOINT。即使作用域在嵌套事务中提前退出，也不能把还有未确认结果的连接归还连接池。
 
 最外层事务回滚会恢复当前 Gateway 已交付且仍存活实体的持久化字段、未初始化状态、`isNew()`、原始快照、版本与缓存身份，包括事务内首次从数据库读取的对象。同主键的多个对象恢复事务开始前的共同基线，缓存优先保留事务开始前的 canonical 对象，后查询副本不覆盖它。回滚后旧对象可直接保存，新插入对象可重新插入。
 
@@ -647,7 +767,7 @@ User::transaction(function () {
 
 事务结果未知后，禁止在原 `Connection` 上继续查询、写入、事务或通过另一个 Gateway/`Session::use()` 复用。必须丢弃连接、Gateway 和关联实体；`Session::discard()` 仍允许解除失败 Session。驱动 begin 之前的连接所有权冲突是确定的 `LogicException`，不会毒化连接。
 
-当前上下文有未结束事务时，`Session::use()` / `Session::scope()` 的隐式换绑会直接抛 `LogicException`，即使传入同一个 Gateway 也一样；不执行回滚、不清理事务状态、不释放连接所有权，原 Session 保持不变。必须先显式 `Session::discard()` 并处理回滚结果，不能把换绑当成静默清理事务的方式。
+当前上下文的同名会话有未结束事务时，`Session::use()` / `Session::scope()` 的隐式换绑会直接抛 `LogicException`，即使传入同一个 Gateway 也一样；不执行回滚、不清理事务状态、不释放连接所有权，原 Session 保持不变。必须先显式 `Session::discard()` 并处理回滚结果，不能把换绑当成静默清理事务的方式。
 
 ## 10. 生命周期钩子
 
@@ -692,7 +812,7 @@ final class Order extends Entity
 
 ## 11. 行缓存
 
-**进程内自动管理**。同一个 class + 主键的 `find()` 会命中缓存返回同一个对象实例。
+**进程内自动管理**。同一个精确模型 class + 主键的 `find()` 会命中缓存返回同一个对象实例。不同模型即使主键值相同也不会共享缓存身份。
 
 ```php
 $a = Asset::find(['user_id' => 1, 'key' => 'x']);
@@ -701,13 +821,14 @@ $b = Asset::find(['user_id' => 1, 'key' => 'x']);
 ```
 
 - 查询结果也会写入缓存（`Builder::get()` 返回的实体）
-- `delete()` 后自动清退缓存
-- 事务回滚恢复事务开始时的 LRU 快照和 canonical 对象，再补齐缺失身份
-- 缓存在进程内有效，不跨进程
+- 使用 PHP 有序关联数组维护真正的 O(1) LRU：读取命中也会刷新热度，默认容量 1024 行
+- 条件写与删除按精确模型类失效，避免误标其他模型的存活实体
+- `delete()` 后自动清退缓存；事务每层保存独立快照，回滚恢复该层对应的 LRU 与 canonical 对象，再补齐缺失身份
+- 缓存在进程内有效，不跨进程；不是跨进程一致性或分布式锁机制
 
 ## 12. 脏跟踪
 
-`save()` 做更新时只生成变了字段的 SET 子句。比较的是 `markPersisted()` 时刻的快照和当前值。
+`save()` 做更新时只生成变了字段的 SET 子句。比较的是 `markPersisted()` 时刻的快照和当前值。标量、null 与同一对象引用走严格相等快路径；对象值不同引用时，经 Caster 规范化到数据库表示再比较，不使用受瞬态属性影响的宽松对象比较。
 
 ```php
 $u = User::find(['id' => 1]); // 此时快照：age=28, name='张三'
@@ -715,7 +836,12 @@ $u->age = 29;
 $u->save();
 // SQL: UPDATE user SET age = :set_age WHERE id = :pk_id
 // 不会写 name —— 因为它没变
+
+$invoice->amount = new Money($invoice->amount->cents);
+$invoice->save(); // 等值 Money 新实例：无 UPDATE，也不递增版本
 ```
+
+自动 `updated_at` 与关系预加载刷新使用同一语义。未发生字段变化时，不会仅为递增 `#[Version]` 执行 UPDATE；值对象的内部非持久化属性不应影响判断。
 
 ## 13. 主键规则
 
@@ -819,7 +945,97 @@ webman 的 `orm:gen` 只负责读取框架配置并调用同一库内 API，不�
 
 默认值边界详见 [README](README.md#generate-models-from-a-database)：PHP 8.3 不生成对象属性初始化；PostgreSQL 的 Unicode 转义按码点生成 UTF-8，原始高位字节按服务器编码转换。非 UTF-8 混合转义、SQL_ASCII、未知编码和非法序列均不猜测数据库默认值，而采用安全的 PHP 兜底值。
 
-## 15. 可观测性
+## 15. 元数据缓存
+
+`MetadataReader` 在进程内缓存字段元数据，也支持导出/导入纯 PHP 数组，供 PHP-FPM 部署时复用并通过 OPcache 降低反射成本。缓存不包含 `ReflectionProperty` 等不可序列化对象。
+
+```php
+use Pixiaoka\Orm\Gateway\EntityGateway;
+use Pixiaoka\Orm\Gateway\PdoConnection;
+use Pixiaoka\Orm\Metadata\MetadataReader;
+
+// 构建/部署阶段：为实际使用的模型预热。
+$reader = new MetadataReader();
+foreach ([User::class, Article::class] as $model) {
+    $reader->read($model);
+}
+$cache = $reader->export();
+file_put_contents(
+    '/path/to/orm-metadata.php',
+    '<?php return ' . var_export($cache, true) . ';',
+);
+
+// 请求启动：可将同一个 Reader 注入多个 Gateway。
+$metadata = new MetadataReader(require '/path/to/orm-metadata.php');
+$gateway = new EntityGateway(new PdoConnection($pdo), $metadata);
+```
+
+导出格式为 `['version' => 1, 'models' => [模型类名 => 元数据数组]]`；也可调用 `$reader->import($cache)` 导入已有 Reader。版本、结构或首次读取时的模型定义不一致会抛 `MetadataException`，此时应重新生成缓存，不能手工拼接内部元数据。关系元数据仍按需读取与校验。模型部署和缓存更新必须保持同一版本，缓存不是跨环境自动失效系统。
+
+## 16. 索引声明与 Schema 差异对比
+
+模型类可重复声明 `#[Index]`，属性名或真实列名均可，顺序就是索引列顺序：
+
+```php
+use Pixiaoka\Orm\Annotation\Index;
+
+#[Index(['tenant_id', 'email'], name: 'uniq_tenant_email', unique: true)]
+#[Index(['created_at'], name: 'idx_article_created_at')]
+final class Article extends Entity
+{
+    // 字段与主键定义
+}
+```
+
+声明仅参与元数据与 Schema 差异比较，不会在正常查询时自动创建索引。读取数据库实时结构后可生成差异报告：
+
+```php
+use Pixiaoka\Orm\Metadata\MetadataReader;
+use Pixiaoka\Orm\Schema\SchemaDiffer;
+use Pixiaoka\Orm\Schema\SchemaInspector;
+
+$meta = (new MetadataReader())->read(Article::class);
+$table = (new SchemaInspector($pdo))->table('article');
+$differ = new SchemaDiffer();
+$report = $differ->compare($meta, $table, 'mysql');
+$statements = $differ->previewSql($meta, $table, 'mysql');
+```
+
+支持 `mysql`、`pgsql`、`sqlite`，比较字段新增/删除、语义类型、可空性及二级索引。报告结构：
+
+```php
+[
+    'table' => 'article',
+    'driver' => 'mysql',
+    'changes' => [[
+        'kind' => 'add_column',
+        'name' => 'summary',
+        'expected' => 'text',
+        'actual' => null,
+        'sql' => 'ALTER TABLE ...;',
+        'executable' => true,
+        'note' => null,
+    ]],
+    'hasChanges' => true,
+    'hasUnsupported' => false,
+]
+```
+
+自定义 `Castable` 没有通用数据库类型猜测，构造时必须给出完整三方言映射；内置 `Decimal` 实现默认使用 decimal/text 映射，也可按需显式覆盖：
+
+```php
+$differ = new SchemaDiffer([
+    Money::class => [
+        'mysql' => 'bigint',
+        'pgsql' => 'bigint',
+        'sqlite' => 'integer',
+    ],
+]);
+```
+
+SQLite 修改字段类型或可空性需人工重建表，报告将对应项标为不可执行；只要存在不支持项，`previewSql()` 就抛出异常，不返回看似完整但实际残缺的迁移计划。字段删除、索引重建、约束、数据和权限必须由应用迁移流程审核。**Differ 只生成报告和预览 SQL，绝不自动执行 DDL，不替代正式迁移系统。**
+
+## 17. 可观测性
 
 ```php
 use Pixiaoka\Orm\Observability\Event;
@@ -833,7 +1049,8 @@ $unsubscribe = $gateway->subscribe(function (Event $event): void {
         // affectedRows/resultRows、exceptionClass、context。
     }
     if ($event instanceof TransactionEvent) {
-        // 物理 begin/commit/rollback；嵌套事务不重复发出。
+        // begin/commit/rollback；受管连接的每层 SAVEPOINT 也可能产生事件。
+        // 不应把每个事件都解释为一次独立物理数据库提交。
     }
     if ($event instanceof SessionEvent) {
         // bind/discard/restore；successful 表示清理结果。
@@ -849,10 +1066,10 @@ $unsubscribe = $gateway->subscribe(function (Event $event): void {
 
 `ContextInfo::$type` 为 root/fiber/coroutine，`$id` 是进程内上下文对象 `spl_object_id()`，不是跨请求或分布式追踪 ID。事件不包含参数值、查询结果、实体、连接、原异常对象、消息或堆栈；SQL 原文仍可能含手写字面量秘密，不能视为完全脱敏。只覆盖经过 Gateway 的 SQL、事务与 Session 操作，应用直接调用 PDO/Connection、SchemaInspector 不在范围内。可选 `Clock` 构造参数用于确定性计时测试。
 
-## 16. 测试与真实数据库验收
+## 18. 测试与真实数据库验收
 
 ```bash
-# PHP 8.3 完整测试：318 tests / 10654 assertions（2 项显式 DSN 实连测试默认跳过）
+# 当前已验证基线：395 tests / 11109 assertions（4 项显式 DSN 实连测试默认跳过）
 vendor/bin/phpunit
 
 # SQLite / MySQL / PostgreSQL 实连；进程环境变量覆盖 .env
@@ -863,9 +1080,9 @@ MySQL/PostgreSQL 推荐使用独立 Docker 测试实例，例如 `mysql:8.4`、`
 
 生成器另有 `tests/SchemaLiveTest.php`，只有显式设置 `PIXIAOKA_ORM_LIVE_MYSQL_DSN`、`PIXIAOKA_ORM_LIVE_PGSQL_DSN` 及对应 `_USER`、`_PASSWORD` 才连接外部数据库；默认跳过，不隐式读取本机服务或 `.env`。该测试使用原生预处理，覆盖主键、默认值、时间类型、生成文件 lint 和元数据，完整示例见 [README](README.md#模型生成器实连测试)。
 
-本次只读关系阶段的本机 PHP 8.3 默认套件为 318 tests / 10654 assertions（2 项显式 DSN 实连测试跳过）；SQLite 实连通过 118 项、零失败，包含 1001 个不同复合关系键的三批查询及测试表元数据清理核验。显式双库 DSN 下完整套件为 318 tests / 10702 assertions；MySQL 8.4.13 实连通过 96 项、PostgreSQL 16.16 通过 99 项，均零失败。Docker PHP 8.3.36、8.4.27、8.5.12 均完成同一默认套件，PHPStan 生产代码检查零错误。CI 继续核验多版本、Composer、lint 和双库服务测试。Swoole/Swow 真实扩展验收未执行。
+当前已验证的 Docker PHP 8.3 默认 SQLite 完整套件为 **395 tests / 11109 assertions / 4 skipped**，PHPStan 生产代码检查零错误。4 个跳过项均为未配置显式外部 DSN 的既有 MySQL/PostgreSQL 实连测试；本轮不以 SQLite 结果冒充真实双库通过。历史实连结果只作为既有验证记录，不表述为本次文档维护重新执行的结果。CI 继续核验多版本、Composer、lint 和双库服务测试；Swoole/Swow 真实扩展验收未执行。
 
-## 17. 项目集成示例
+## 19. 项目集成示例
 
 当前项目使用 PostgreSQL（见 `config/database.php`），一个典型的模型迁移：
 

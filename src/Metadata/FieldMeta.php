@@ -7,7 +7,7 @@ namespace Pixiaoka\Orm\Metadata;
 use ReflectionNamedType;
 
 /**
- * 一个持久化字段。类型以反射为准，不接受手写的类型字符串映射。
+ * 一个持久化字段。常规读取以反射为准；缓存导入只重建真实属性类型。
  */
 final readonly class FieldMeta
 {

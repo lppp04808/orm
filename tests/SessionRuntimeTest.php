@@ -136,6 +136,46 @@ namespace Tests\Pixiaoka\Orm {
             SwowCoroutine::setCurrent(null);
         }
 
+        public function testRuntimeDetectionIsCachedAndNamedSessionsStayIsolated(): void
+        {
+            $runtime = new SwowCoroutine();
+            SwowCoroutine::setCurrent($runtime);
+            $readonly = self::gateway();
+            Session::use($readonly, 'readonly');
+            self::assertSame($this->root, Session::get()->gateway);
+            self::assertSame($readonly, Session::get('readonly')->gateway);
+            for ($i = 0; $i < 3; $i++) {
+                self::assertSame(Context::coroutine($runtime), Session::context());
+            }
+            foreach (['hasSwoole', 'hasSwow'] as $property) {
+                $cached = new \ReflectionProperty(Session::class, $property);
+                self::assertIsBool($cached->getValue());
+            }
+            Session::discard('readonly');
+            self::assertSame($this->root, Session::get()->gateway);
+            Session::discard();
+            SwowCoroutine::setCurrent(null);
+        }
+
+        public function testAnotherActiveRuntimeCannotUseSameGateway(): void
+        {
+            $first = new SwowCoroutine();
+            $second = new SwowCoroutine();
+            SwowCoroutine::setCurrent($first);
+            $gateway = self::gateway();
+            Session::use($gateway);
+            SwowCoroutine::setCurrent($second);
+            $this->expectException(\LogicException::class);
+            $this->expectExceptionMessage('另一个活跃 Fiber/协程');
+            try {
+                Session::use($gateway);
+            } finally {
+                SwowCoroutine::setCurrent($first);
+                Session::discard();
+                SwowCoroutine::setCurrent(null);
+            }
+        }
+
         public function testRuntimeScopeCannotCloseFromRoot(): void
         {
             SwowCoroutine::setCurrent(new SwowCoroutine());

@@ -290,6 +290,8 @@ final class OrmSqlBehaviorTest extends TestCase
     public function testFiberIsolatedTransactions(): void
     {
         $this->makeItem(41, 'F0')->save();
+        // 此用例显式模拟从根上下文误把活跃网关带进另一个 Fiber。
+        Session::discard();
 
         $results = [];
         $fiberA = new \Fiber(function () use (&$results): void {
@@ -309,7 +311,7 @@ final class OrmSqlBehaviorTest extends TestCase
             });
         });
 
-        // A 开事务后挂起；B 复用同一网关时由 ORM 提前拒绝，不依赖 PDO 驱动错误。
+        // A 绑定网关后挂起；B 即使尚未开启事务也必须拒绝共享同一网关。
         $fiberA->start();
         try {
             $fiberB->start();
@@ -317,24 +319,30 @@ final class OrmSqlBehaviorTest extends TestCase
         } catch (\LogicException $e) {
             self::assertStringContainsString('独立连接', $e->getMessage());
         }
-        Session::discard();
         $fiberA->resume();
         self::assertTrue($fiberA->isTerminated());
+        // 失败 Fiber 的局部网关随对象销毁释放占用，当前默认 Session 仍可独立清理。
+        unset($fiberB);
+        gc_collect_cycles();
+        Session::discard();
     }
 
     public function testFiberSessionIsolationWithoutDbTxn(): void
     {
-        // 纯 Session 隔离：两个 Fiber 各自 use/discard，互不可见
+        // 纯 Session 隔离：两个 Fiber 各自 use/discard，互不可见。
         $seen = [];
-        $fiberA = new \Fiber(function () use (&$seen): void {
-            Session::use($this->gateway);
-            $seen['a'] = Session::get()->gateway === $this->gateway;
+        $first = new EntityGateway(new PdoConnection($this->pdo));
+        $second = new EntityGateway(new PdoConnection($this->pdo));
+        $fiberA = new \Fiber(function () use (&$seen, $first): void {
+            Session::use($first);
+            $seen['a'] = Session::get()->gateway === $first;
             \Fiber::suspend();
-            $seen['a2'] = Session::get()->gateway === $this->gateway;
+            $seen['a2'] = Session::get()->gateway === $first;
+            Session::discard();
         });
-        $fiberB = new \Fiber(function () use (&$seen): void {
-            Session::use($this->gateway);
-            $seen['b'] = Session::get()->gateway === $this->gateway;
+        $fiberB = new \Fiber(function () use (&$seen, $second): void {
+            Session::use($second);
+            $seen['b'] = Session::get()->gateway === $second;
             Session::discard();
         });
 

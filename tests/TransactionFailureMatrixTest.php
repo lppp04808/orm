@@ -10,6 +10,7 @@ use PHPUnit\Framework\TestCase;
 use Pixiaoka\Orm\Exception\TransactionException;
 use Pixiaoka\Orm\Gateway\Connection;
 use Pixiaoka\Orm\Gateway\EntityGateway;
+use Pixiaoka\Orm\Gateway\ManagedConnection;
 use Pixiaoka\Orm\Gateway\PdoConnection;
 use Pixiaoka\Orm\Observability\Event;
 use Pixiaoka\Orm\Observability\SessionEvent;
@@ -252,6 +253,265 @@ final class TransactionFailureMatrixTest extends TestCase
         $this->assertDiscardCleansFailedSession($gateway, $connection);
     }
 
+    public function testCommittedInsertIsNotRolledBackToNewByLaterTransaction(): void
+    {
+        $connection = new MatrixConnection();
+        $gateway = $this->bind($connection);
+        $record = new MatrixRecord();
+        $record->body = 'committed in first transaction';
+        $gateway->transaction(static function () use ($record): void {
+            $record->save();
+        });
+        self::assertFalse($record->isNew());
+
+        try {
+            $gateway->transaction(static function () use ($record): void {
+                $record->body = 'rollback second transaction';
+                $record->save();
+                throw new \DomainException('rollback committed insert');
+            });
+        } catch (\DomainException) {
+        }
+
+        self::assertFalse($record->isNew());
+        self::assertSame('committed in first transaction', $record->body);
+        self::assertSame(1, $record->revision);
+        self::assertSame('committed in first transaction', $record->takeOriginal()['body']);
+    }
+
+    public function testInnerRollbackRestoresEntitiesFirstTouchedInsideSavepoint(): void
+    {
+        $connection = new MatrixConnection();
+        $gateway = $this->bind($connection);
+        $other = $this->persistedRecord($gateway);
+        $other->body = 'before outer transaction';
+        $other->save();
+        $new = new MatrixRecord();
+        $new->body = 'inner only insert';
+        $newId = null;
+
+        $gateway->transaction(function () use ($gateway, $other, $new, &$newId): void {
+            try {
+                $gateway->transaction(static function () use ($other, $new, &$newId): void {
+                    $other->body = 'inner only update';
+                    $other->save();
+                    $new->save();
+                    $newId = $new->id;
+                    throw new \DomainException('rollback new savepoint entities');
+                });
+            } catch (\DomainException) {
+            }
+            self::assertTrue($new->isNew());
+            self::assertSame('before outer transaction', $other->body);
+            self::assertSame('before outer transaction', $other->takeOriginal()['body']);
+        });
+
+        self::assertNotNull($newId);
+        self::assertTrue($new->isNew());
+        self::assertNull(MatrixRecord::find(['id' => $newId]));
+        self::assertSame($other, MatrixRecord::find(['id' => $other->id]));
+        self::assertSame(['before outer transaction', 2], $this->rows($connection)[0]);
+    }
+
+    public function testNestedSavepointBeginFailureRetainsOuterConnectionOwnership(): void
+    {
+        $connection = new SavepointBeginFailureConnection();
+        $gateway = new EntityGateway($connection);
+        Session::use($gateway);
+        try {
+            $gateway->transaction(static function () use ($gateway): void {
+                try {
+                    $gateway->transaction(static fn (): null => null);
+                    self::fail('内层保存点开启必须失败');
+                } catch (TransactionException $e) {
+                    self::assertSame('开始', $e->operation);
+                }
+                $owners = (new \ReflectionProperty(Session::class, 'connectionContexts'))->getValue();
+                self::assertSame(Session::context(), $owners[$gateway->connection()] ?? null);
+                throw new \DomainException('rollback outer after savepoint failure');
+            });
+        } catch (\DomainException $e) {
+            self::assertSame('rollback outer after savepoint failure', $e->getMessage());
+        }
+        self::assertSame(['begin', 'begin', 'rollback'], $connection->calls);
+        $owners = (new \ReflectionProperty(Session::class, 'connectionContexts'))->getValue();
+        self::assertFalse(isset($owners[$gateway->connection()]));
+        Session::discard();
+    }
+
+    public function testNestedTransactionsCommitThroughSavepoints(): void
+    {
+        $connection = new MatrixConnection();
+        $gateway = $this->bind($connection);
+
+        $result = $gateway->transaction(function () use ($gateway): string {
+            $gateway->executeRaw(
+                'INSERT INTO matrix_record (body, revision) VALUES (:body, :revision)',
+                ['body' => 'outer', 'revision' => 1],
+            );
+            $gateway->transaction(function () use ($gateway): void {
+                $gateway->executeRaw(
+                    'INSERT INTO matrix_record (body, revision) VALUES (:body, :revision)',
+                    ['body' => 'inner', 'revision' => 1],
+                );
+                $gateway->transaction(function () use ($gateway): void {
+                    $gateway->executeRaw(
+                        'INSERT INTO matrix_record (body, revision) VALUES (:body, :revision)',
+                        ['body' => 'innermost', 'revision' => 1],
+                    );
+                });
+            });
+
+            return 'committed';
+        });
+
+        self::assertSame('committed', $result);
+        self::assertSame(['outer', 'inner', 'innermost'], array_column($this->rows($connection), 0));
+        self::assertSame([
+            'begin', 'begin', 'begin', 'commit', 'commit', 'commit',
+        ], $connection->transactionCalls);
+        self::assertSame([
+            'SAVEPOINT sp_2',
+            'SAVEPOINT sp_3',
+            'RELEASE SAVEPOINT sp_3',
+            'RELEASE SAVEPOINT sp_2',
+        ], $connection->savepointSql());
+        self::assertFalse($connection->pdo->inTransaction());
+        self::assertTrue($connection->inner()->ping(), '提交后连接深度必须归零且仍可探测');
+    }
+
+    public function testInnerRollbackRestoresDatabaseEntityAndAllowsOuterCommit(): void
+    {
+        $connection = new MatrixConnection();
+        $gateway = $this->bind($connection);
+        $record = $this->persistedRecord($gateway);
+        $business = new \DomainException('rollback only inner');
+
+        $gateway->transaction(function () use ($gateway, $record, $business): void {
+            $record->body = 'outer write';
+            $record->save();
+            try {
+                $gateway->transaction(function () use ($gateway, $record, $business): void {
+                    $record->body = 'inner write';
+                    $record->save();
+                    $inner = new MatrixRecord();
+                    $inner->body = 'inner insert';
+                    $inner->save();
+                    self::assertFalse($inner->isNew());
+                    throw $business;
+                });
+                self::fail('内层业务异常必须在保存点回滚后透传');
+            } catch (\DomainException $e) {
+                self::assertSame($business, $e);
+            }
+
+            self::assertSame('outer write', $record->body);
+            self::assertSame(2, $record->revision);
+            self::assertSame('outer write', $record->takeOriginal()['body']);
+            $gateway->executeRaw(
+                'INSERT INTO matrix_record (body, revision) VALUES (:body, :revision)',
+                ['body' => 'outer after rollback', 'revision' => 1],
+            );
+        });
+
+        self::assertSame(['outer write', 'outer after rollback'], array_column($this->rows($connection), 0));
+        self::assertSame([2, 1], array_map('intval', array_column($this->rows($connection), 1)));
+        self::assertSame([
+            'begin', 'begin', 'rollback', 'commit',
+        ], $connection->transactionCalls);
+        self::assertSame([
+            'SAVEPOINT sp_2',
+            'ROLLBACK TO SAVEPOINT sp_2',
+            'RELEASE SAVEPOINT sp_2',
+        ], $connection->savepointSql());
+        self::assertFalse($connection->pdo->inTransaction());
+        self::assertSame($record, MatrixRecord::find(['id' => $record->id]), '内层回滚不能清掉外层已提交缓存身份');
+    }
+
+    public function testUncaughtInnerBusinessExceptionRollsBackWholeChainAndPropagates(): void
+    {
+        $connection = new MatrixConnection();
+        $gateway = $this->bind($connection);
+        $record = $this->persistedRecord($gateway);
+        $business = new \DomainException('uncaught nested failure');
+
+        try {
+            $gateway->transaction(function () use ($gateway, $record, $business): void {
+                $record->body = 'outer must roll back';
+                $record->save();
+                $gateway->transaction(static function () use ($business): void {
+                    throw $business;
+                });
+            });
+            self::fail('未捕获的内层异常必须传播到调用方');
+        } catch (\DomainException $e) {
+            self::assertSame($business, $e);
+        }
+
+        self::assertSame('committed', $record->body);
+        self::assertSame(1, $record->revision);
+        self::assertSame([['committed', 1]], $this->rows($connection));
+        self::assertSame(['begin', 'begin', 'rollback', 'rollback'], $connection->transactionCalls);
+        self::assertSame([
+            'SAVEPOINT sp_2',
+            'ROLLBACK TO SAVEPOINT sp_2',
+            'RELEASE SAVEPOINT sp_2',
+        ], $connection->savepointSql());
+        self::assertFalse($connection->pdo->inTransaction());
+        self::assertTrue($connection->ping());
+    }
+
+    public function testDiscardInsideNestedTransactionRollsBackEntireChainAndResetsDepth(): void
+    {
+        $connection = new MatrixConnection();
+        $gateway = $this->bind($connection);
+        $record = $this->persistedRecord($gateway);
+
+        try {
+            $gateway->transaction(function () use ($gateway, $record): void {
+                $record->body = 'discard outer';
+                $record->save();
+                $gateway->transaction(function () use ($gateway, $record): void {
+                    $record->body = 'discard inner';
+                    $record->save();
+                    Session::discard();
+                });
+            });
+            self::fail('整条链已被 discard 回滚后，外层不得提交');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('操作已回滚，不能继续提交', $e->getMessage());
+        }
+
+        self::assertSame(['begin', 'begin', 'forceRollback'], $connection->transactionCalls);
+        self::assertSame(['SAVEPOINT sp_2'], $connection->savepointSql());
+        self::assertSame([['committed', 1]], $this->rows($connection));
+        self::assertSame('committed', $record->body);
+        self::assertSame(1, $record->revision);
+        self::assertFalse($connection->pdo->inTransaction());
+        self::assertTrue($connection->ping(), 'discard 后旧连接必须已归零并可被新 Session 复用');
+        Session::use($gateway);
+        $gateway->transaction(function () use ($gateway): void {
+            $gateway->executeRaw(
+                'INSERT INTO matrix_record (body, revision) VALUES (:body, :revision)',
+                ['body' => 'after discard', 'revision' => 1],
+            );
+        });
+        self::assertSame(['committed', 'after discard'], array_column($this->rows($connection), 0));
+    }
+
+    public function testPingReportsConnectionLossAsFalse(): void
+    {
+        $pdo = $this->createMock(PDO::class);
+        $pdo->method('getAttribute')->with(PDO::ATTR_DRIVER_NAME)->willReturn('sqlite');
+        $pdo->expects(self::exactly(2))->method('query')->with('SELECT 1')->willReturnCallback(
+            static fn () => throw new \PDOException('server has gone away'),
+        );
+        $connection = new PdoConnection($pdo);
+
+        self::assertFalse($connection->ping());
+        self::assertFalse($connection->ping());
+    }
+
     /** 新连接、新 Gateway；所有 SQL 监听入口同时尝试真实写入并隔离重入。 */
     private function bind(MatrixConnection $connection): EntityGateway
     {
@@ -361,13 +621,32 @@ final class TransactionFailureMatrixTest extends TestCase
     }
 }
 
-/** 真实 PdoConnection 包装器：驱动操作照常执行，仅指定收尾动作被替换为 false 或原异常。 */
-final class MatrixConnection implements Connection
+/** 记录保存点 SQL，真实执行仍完全交给 PDO SQLite 驱动。 */
+final class MatrixPdo extends PDO
 {
-    public readonly PDO $pdo;
+    /** @var list<string> */
+    public array $loggedSql = [];
+
+    public function prepare(string $query, array $options = []): \PDOStatement|false
+    {
+        if (preg_match('/^(?:SAVEPOINT|RELEASE SAVEPOINT|ROLLBACK TO SAVEPOINT)\b/', $query) === 1) {
+            $this->loggedSql[] = $query;
+        }
+
+        return parent::prepare($query, $options);
+    }
+}
+
+/** 真实 PdoConnection 包装器：驱动操作照常执行，仅指定收尾动作被替换为 false 或原异常。 */
+final class MatrixConnection implements ManagedConnection
+{
+    public readonly MatrixPdo $pdo;
 
     /** @var list<string> */
     public array $transactionCalls = [];
+
+    /** @var list<string> */
+    public array $savepointSql = [];
 
     /** @var list<Event> */
     public array $events = [];
@@ -386,7 +665,7 @@ final class MatrixConnection implements Connection
         private readonly bool $performFailedRollback = true,
         private readonly bool $beginBeforeFailure = false,
     ) {
-        $this->pdo = new PDO('sqlite::memory:');
+        $this->pdo = new MatrixPdo('sqlite::memory:');
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $this->pdo->exec('CREATE TABLE matrix_record (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, revision INTEGER NOT NULL)');
         $this->inner = new PdoConnection($this->pdo);
@@ -415,6 +694,10 @@ final class MatrixConnection implements Connection
 
     public function execute(string $sql, array $params): int
     {
+        if (preg_match('/^(?:SAVEPOINT|RELEASE SAVEPOINT|ROLLBACK TO SAVEPOINT)\b/', $sql) === 1) {
+            $this->savepointSql[] = $sql;
+        }
+
         return $this->inner->execute($sql, $params);
     }
 
@@ -488,6 +771,29 @@ final class MatrixConnection implements Connection
         }
 
         return $this->inner->rollback();
+    }
+
+    public function ping(): bool
+    {
+        return $this->inner->ping();
+    }
+
+    public function forceRollback(): bool
+    {
+        $this->transactionCalls[] = 'forceRollback';
+
+        return $this->inner->forceRollback();
+    }
+
+    public function inner(): PdoConnection
+    {
+        return $this->inner;
+    }
+
+    /** @return list<string> */
+    public function savepointSql(): array
+    {
+        return $this->pdo->loggedSql;
     }
 
 }

@@ -104,6 +104,20 @@ final class BoundaryKey extends Entity
     public static function table(): string { return 'boundary_key'; }
 }
 
+final class NonAlphabeticalCompositeKey extends Entity
+{
+    #[Column, PrimaryKey(order: 1)]
+    public int $tenant_id;
+
+    #[Column, PrimaryKey(order: 2)]
+    public int $app_id;
+
+    #[Column]
+    public string $label;
+
+    public static function table(): string { return 'non_alphabetical_composite_key'; }
+}
+
 final class Flag extends Entity
 {
     #[Column]
@@ -203,6 +217,9 @@ final class OrmKernelTest extends TestCase
         );
         $this->pdo->exec('CREATE TABLE flag ("on" INTEGER NOT NULL PRIMARY KEY, label TEXT NOT NULL, created_at INTEGER NOT NULL)');
         $this->pdo->exec('CREATE TABLE boundary_key (left TEXT NOT NULL, right TEXT NOT NULL, label TEXT NOT NULL, PRIMARY KEY (left, right))');
+        $this->pdo->exec('CREATE TABLE non_alphabetical_composite_key (
+            tenant_id INTEGER NOT NULL, app_id INTEGER NOT NULL, label TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, app_id))');
         $this->pdo->exec('CREATE TABLE hooked_asset (
             user_id INTEGER NOT NULL, key TEXT NOT NULL, val INTEGER NOT NULL,
             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0,
@@ -606,6 +623,120 @@ final class OrmKernelTest extends TestCase
         self::assertSame(5, Asset::find(['user_id' => 9, 'key' => 'vip'])?->val);
     }
 
+    public function testNonAlphabeticalCompositeKeyRollbackRestoresDeleteReinsertDelete(): void
+    {
+        $entity = $this->compositeKeyEntity(7, 3, 'committed');
+        $entity->save();
+        $baseline = $entity->takeOriginal();
+        try {
+            NonAlphabeticalCompositeKey::transaction(function () use ($entity): void {
+                $entity->delete();
+                $entity->label = 'replacement';
+                $entity->save();
+                self::assertFalse($entity->isNew());
+                self::assertSame($entity, $this->findCompositeKey(7, 3));
+                $entity->delete();
+                self::assertTrue($entity->isNew());
+                self::assertNull($this->findCompositeKey(7, 3));
+                throw new \RuntimeException('rollback non-alphabetical reinsert');
+            });
+            self::fail('必须回滚');
+        } catch (\RuntimeException $e) {
+            self::assertSame('rollback non-alphabetical reinsert', $e->getMessage());
+        }
+
+        self::assertFalse($entity->isNew());
+        self::assertSame('committed', $entity->label);
+        self::assertSame($baseline, $entity->takeOriginal());
+        self::assertSame($entity, $this->findCompositeKey(7, 3));
+        self::assertSame([['committed']], $this->pdo->query(
+            'SELECT label FROM non_alphabetical_composite_key WHERE tenant_id = 7 AND app_id = 3',
+        )->fetchAll(PDO::FETCH_NUM));
+    }
+
+    public function testNonAlphabeticalCompositeKeyRollbackRestoresDistinctReplacementAfterSecondDelete(): void
+    {
+        $entity = $this->compositeKeyEntity(9, 1, 'committed');
+        $entity->save();
+        $baseline = $entity->takeOriginal();
+        $replacement = null;
+        $duplicate = null;
+        try {
+            NonAlphabeticalCompositeKey::transaction(function () use ($entity, &$replacement, &$duplicate): void {
+                $entity->delete();
+                $replacement = $this->compositeKeyEntity(9, 1, 'replacement');
+                $replacement->save();
+                $this->gateway->clearCache(NonAlphabeticalCompositeKey::class);
+                $duplicate = $this->findCompositeKey(9, 1);
+                self::assertNotNull($duplicate);
+                self::assertNotSame($replacement, $duplicate);
+                self::assertSame('replacement', $duplicate->label);
+                $replacement->label = 'changed';
+                $replacement->save();
+                $replacement->delete();
+                throw new \RuntimeException('rollback distinct non-alphabetical replacement');
+            });
+            self::fail('必须回滚');
+        } catch (\RuntimeException $e) {
+            self::assertSame('rollback distinct non-alphabetical replacement', $e->getMessage());
+        }
+
+        self::assertNotNull($replacement);
+        self::assertNotNull($duplicate);
+        foreach ([$entity, $replacement, $duplicate] as $restored) {
+            self::assertFalse($restored->isNew());
+            self::assertSame('committed', $restored->label);
+            self::assertSame($baseline, $restored->takeOriginal());
+        }
+        self::assertSame($entity, $this->findCompositeKey(9, 1));
+        self::assertSame([['committed']], $this->pdo->query(
+            'SELECT label FROM non_alphabetical_composite_key WHERE tenant_id = 9 AND app_id = 1',
+        )->fetchAll(PDO::FETCH_NUM));
+    }
+
+    public function testNonAlphabeticalCompositeKeyRollbackRestoresInsertThenDelete(): void
+    {
+        $entity = $this->compositeKeyEntity(8, 2, 'temporary');
+        $queried = null;
+        try {
+            NonAlphabeticalCompositeKey::transaction(function () use ($entity, &$queried): void {
+                $entity->save();
+                self::assertFalse($entity->isNew());
+                self::assertSame($entity, $this->findCompositeKey(8, 2));
+                $this->gateway->clearCache(NonAlphabeticalCompositeKey::class);
+                $queried = $this->findCompositeKey(8, 2);
+                self::assertNotNull($queried);
+                self::assertNotSame($entity, $queried);
+                $entity->delete();
+                self::assertTrue($entity->isNew());
+                self::assertNull($this->findCompositeKey(8, 2));
+                $transactions = new \ReflectionProperty(EntityGateway::class, 'transactions');
+                $manager = $transactions->getValue($this->gateway);
+                $history = new \ReflectionProperty($manager, 'txnNewIdentities');
+                $identityHistory = $history->getValue($manager);
+                self::assertSame([], $identityHistory[Session::context()]);
+                throw new \RuntimeException('rollback non-alphabetical insert');
+            });
+            self::fail('必须回滚');
+        } catch (\RuntimeException $e) {
+            self::assertSame('rollback non-alphabetical insert', $e->getMessage());
+        }
+
+        self::assertTrue($entity->isNew());
+        self::assertSame('temporary', $entity->label);
+        self::assertSame(8, $entity->tenant_id);
+        self::assertSame(2, $entity->app_id);
+        self::assertSame([], $entity->takeOriginal());
+        self::assertNotNull($queried);
+        self::assertTrue($queried->isNew());
+        self::assertSame('temporary', $queried->label);
+        self::assertSame([], $queried->takeOriginal());
+        self::assertNull($this->findCompositeKey(8, 2));
+        self::assertSame(0, (int) $this->pdo->query(
+            'SELECT COUNT(*) FROM non_alphabetical_composite_key WHERE tenant_id = 8 AND app_id = 2',
+        )->fetchColumn());
+    }
+
     // —— 幂等更新 ——
 
     public function testIdempotentUpdateDoesNotThrow(): void
@@ -765,6 +896,21 @@ final class OrmKernelTest extends TestCase
         self::assertCount(2, $all);
         self::assertFalse($a1->isNew());
         self::assertFalse($a2->isNew());
+    }
+
+    private function compositeKeyEntity(int $tenantId, int $appId, string $label): NonAlphabeticalCompositeKey
+    {
+        $entity = new NonAlphabeticalCompositeKey();
+        $entity->tenant_id = $tenantId;
+        $entity->app_id = $appId;
+        $entity->label = $label;
+
+        return $entity;
+    }
+
+    private function findCompositeKey(int $tenantId, int $appId): ?NonAlphabeticalCompositeKey
+    {
+        return NonAlphabeticalCompositeKey::find(['tenant_id' => $tenantId, 'app_id' => $appId]);
     }
 
     private function item(): SurrogateItem

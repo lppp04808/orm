@@ -279,6 +279,102 @@ final class OrmComplexQueryTest extends TestCase
         self::assertSame(9, (int) ComplexOrder::query()->where('id', 3)->value('qty'));
     }
 
+    public function testCloneIsolatesTopLevelStateAndKeepsBusinessValueIdentity(): void
+    {
+        $time = new DateTimeImmutable('2026-01-02 08:00:00', new DateTimeZone('Asia/Shanghai'));
+        $original = ComplexOrder::query()
+            ->where('happened_at', $time)
+            ->where('qty', 2)
+            ->orderBy('id')
+            ->limit(3)
+            ->offset(1);
+        $baseline = $original->build();
+
+        $clone = clone $original;
+        $clone->where('sku', 'B')->orderBy('sku', 'DESC')->limit(1)->offset(0);
+
+        self::assertNotSame($original->state, $clone->state);
+        self::assertSame($time, $original->state->where[0]['value']);
+        self::assertSame($time, $clone->state->where[0]['value'], '业务值对象不应被无意义克隆');
+        self::assertSame($baseline, $original->build());
+        self::assertSame($baseline, $original->build(), '克隆和重复编译都不能改写原查询');
+        self::assertStringNotContainsString(':q2', $baseline['sql']);
+        self::assertStringContainsString(':q2', $clone->build()['sql']);
+        self::assertSame('B', $clone->build()['params']['q2']);
+        self::assertStringEndsWith(' LIMIT 1', $clone->build()['sql']);
+    }
+
+    public function testCloneIsolatesNestedScalarInAndOrSubqueries(): void
+    {
+        $scalar = ComplexOrder::query()->select('id')->where('user_id', 1);
+        $in = ComplexTag::query()->select('order_id')->where('label', 'paid');
+        $exists = ComplexTag::query()->select('order_id')->where('label', 'new');
+        $original = ComplexOrder::query()
+            ->whereOp('id', '>', $scalar)
+            ->whereIn('id', $in)
+            ->orGroup(static function (Builder $group) use ($exists): void {
+                $group->where('sku', 'A')->orGroup(
+                    static fn (Builder $nested): Builder => $nested->whereExists($exists),
+                );
+            });
+        $baseline = $original->build();
+
+        $clone = clone $original;
+        $scalarClone = $clone->state->where[0]['value'];
+        $inClone = $clone->state->where[1]['value'];
+        $existsClone = $clone->state->orGroups[0]['groups'][0]['conditions'][0]['value'];
+        self::assertNotSame($scalar, $scalarClone);
+        self::assertNotSame($in, $inClone);
+        self::assertNotSame($exists, $existsClone);
+
+        $scalarClone->where('sku', 'C');
+        $inClone->where('order_id', 2);
+        $existsClone->where('order_id', 3);
+
+        self::assertSame($baseline, $original->build());
+        $cloneBuild = $clone->build();
+        self::assertContains('C', $cloneBuild['params']);
+        self::assertContains(2, $cloneBuild['params']);
+        self::assertContains(3, $cloneBuild['params']);
+        self::assertNotContains('C', $original->build()['params']);
+        self::assertSame($cloneBuild, $clone->build(), '克隆查询重复编译也必须稳定');
+    }
+
+    public function testCloneIsolatesUnionDerivedTableAndJoinClause(): void
+    {
+        $derived = ComplexOrder::query()->selectAs('sku', 'name')->where('user_id', 1);
+        $branch = ComplexOrder::query()->selectAs('sku', 'name')->where('user_id', 2);
+        $original = ComplexOrder::query()->select('name')->from($derived, 'ranked')->unionAll($branch);
+        $baseline = $original->build();
+
+        $clone = clone $original;
+        $derivedClone = $clone->state->derivedFrom['builder'];
+        $branchClone = $clone->state->unions[0]['builder'];
+        self::assertNotSame($derived, $derivedClone);
+        self::assertNotSame($branch, $branchClone);
+        $derivedClone->where('qty', 2);
+        $branchClone->where('qty', 8);
+
+        self::assertSame($baseline, $original->build());
+        $original->countSql();
+        self::assertSame($baseline, $original->build(), '复杂 COUNT 只能修改自己的编译状态');
+        self::assertContains(2, $clone->build()['params']);
+        self::assertContains(8, $clone->build()['params']);
+        self::assertNotContains(8, $original->build()['params']);
+
+        $joined = ComplexOrder::query()->alias('o')
+            ->leftJoin('complex_tag', 't', static fn (JoinClause $join): JoinClause => $join
+                ->on('o.id', '=', 't.order_id'));
+        $joinBaseline = $joined->build();
+        $joinedClone = clone $joined;
+        self::assertNotSame($joined->state->joins[0]['on'], $joinedClone->state->joins[0]['on']);
+        $joinedClone->state->joins[0]['on']->where('t.label', '=', 'new');
+        self::assertCount(1, $joined->state->joins[0]['on']->conditions());
+        self::assertCount(2, $joinedClone->state->joins[0]['on']->conditions());
+        self::assertSame($joinBaseline, $joined->build());
+        self::assertSame('new', $joinedClone->build()['params']['q0']);
+    }
+
     public function testEmptyOrGroupCannotBypassWriteGuard(): void
     {
         $empty = static function (): void {};

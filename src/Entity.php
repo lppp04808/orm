@@ -23,6 +23,9 @@ abstract class Entity
 {
     private bool $ormNew = true;
 
+    /** @var array<class-string, array<string, \ReflectionProperty>> 反射元数据按实际实体类与属性名复用，不进入持久化元数据。 */
+    private static array $reflectionProperties = [];
+
     /** 弱归属不延长 Gateway/连接生命周期；禁止跨连接隐式切换。 */
     private ?\WeakReference $ormGateway = null;
 
@@ -190,7 +193,7 @@ abstract class Entity
     public function restoreState(array $state, ModelMeta $meta): void
     {
         foreach ($meta->fields as $field) {
-            $property = new \ReflectionProperty($this, $field->property);
+            $property = $this->reflectionProperty($field->property);
             if (array_key_exists($field->property, $state['values'])) {
                 $this->{$field->property} = $state['values'][$field->property];
             } elseif ($property->isInitialized($this)) {
@@ -251,6 +254,22 @@ abstract class Entity
         }
 
         $this->gateway()->delete($this);
+    }
+
+    public function restore(): void
+    {
+        if ($this->ormNew) {
+            throw new IdentityException(static::class . ' 还没入库，不能 restore');
+        }
+        $this->gateway()->restore($this);
+    }
+
+    public function forceDelete(): void
+    {
+        if ($this->ormNew) {
+            throw new IdentityException(static::class . ' 还没入库，不能 forceDelete');
+        }
+        $this->gateway()->forceDelete($this);
     }
 
     /** @return Builder<static> */
@@ -358,6 +377,13 @@ abstract class Entity
     /** @internal 属性是否已初始化 */
     public function propSet(string $property): bool
     {
-        return (new \ReflectionProperty($this, $property))->isInitialized($this);
+        return $this->reflectionProperty($property)->isInitialized($this);
+    }
+
+    /** @throws \ReflectionException 属性不存在时保持原生反射异常语义。 */
+    private function reflectionProperty(string $property): \ReflectionProperty
+    {
+        return self::$reflectionProperties[static::class][$property]
+            ??= new \ReflectionProperty(static::class, $property);
     }
 }

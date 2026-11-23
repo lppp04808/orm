@@ -751,6 +751,30 @@ SQL;
         self::assertStringStartsWith('DELETE FROM `bool_key` WHERE `active` = :q0', $connection->lastSql);
     }
 
+    public function testMysqlConditionalDeletePreselectsOnlyTargetModelIdentities(): void
+    {
+        $connection = new RecordingIdentityConnection();
+        $gateway = new EntityGateway($connection);
+        Session::use($gateway);
+
+        $order = ComplexOrder::find(['id' => 1]);
+        $tag = ComplexTag::find(['order_id' => 1, 'label' => 'new']);
+        self::assertNotNull($order);
+        self::assertNotNull($tag);
+        $cache = (new \ReflectionProperty(EntityGateway::class, 'cache'))->getValue($gateway);
+        $cache->set($tag, ['order_id' => 1, 'label' => 'new']);
+        self::assertSame(1, ComplexOrder::query()->where('id', 1)->delete());
+        self::assertCount(1, $connection->selects);
+        $preselect = $connection->selects[0];
+        self::assertSame(
+            'SELECT `id` FROM `complex_order` WHERE `id` = :q0 AND ((`id` = :q1))',
+            $preselect['sql'],
+        );
+        self::assertSame(['q0' => 1, 'q1' => 1], $preselect['params']);
+        self::assertTrue($order->isNew());
+        self::assertFalse($tag->isNew(), '其他模型的复合身份不能被误标为已删除');
+    }
+
     public function testDeleteReturningNormalizesBoolPrimaryKey(): void
     {
         $connection = new FakeDialectConnection('pgsql');
@@ -808,6 +832,66 @@ SQL;
         $this->expectException(LogicException::class);
         $this->expectExceptionMessage('SQLite');
         ComplexOrder::query()->forShare()->rows();
+    }
+}
+
+final class RecordingIdentityConnection implements \Pixiaoka\Orm\Gateway\Connection
+{
+    /** @var list<array{sql: string, params: array<string, mixed>}> */
+    public array $selects = [];
+
+    public function execute(string $sql, array $params): int
+    {
+        return 1;
+    }
+
+    public function queryOne(string $sql, array $params): ?array
+    {
+        if (str_contains($sql, 'complex_order')) {
+            return [
+                'id' => 1, 'user_id' => 1, 'sku' => 'A', 'qty' => 2, 'price' => '10.50',
+                'happened_at' => '2026-01-01 00:00:00', 'created_at' => 1, 'updated_at' => 1,
+            ];
+        }
+
+        return ['order_id' => 1, 'label' => 'new'];
+    }
+
+    public function queryAll(string $sql, array $params): array
+    {
+        $this->selects[] = ['sql' => $sql, 'params' => $params];
+
+        return [['id' => 1]];
+    }
+
+    public function lastInsertId(): string
+    {
+        return '1';
+    }
+
+    public function quoteIdentifier(string $identifier): string
+    {
+        return '`' . $identifier . '`';
+    }
+
+    public function supportsReturning(): bool
+    {
+        return false;
+    }
+
+    public function beginTransaction(): bool
+    {
+        return true;
+    }
+
+    public function commit(): bool
+    {
+        return true;
+    }
+
+    public function rollback(): bool
+    {
+        return true;
     }
 }
 

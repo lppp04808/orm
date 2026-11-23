@@ -14,22 +14,16 @@ parameters:
         # 公共输入的运行时校验不应因 PHPDoc 中已声明约束而移除。
         -
             identifier: function.alreadyNarrowedType
-            path: src/Query/Builder.php
+            path: src/Query/SqlCompiler.php
         -
             identifier: nullsafe.neverNull
             path: src/Metadata/MetadataReader.php
         -
-            identifier: nullCoalesce.property
-            path: src/Query/Builder.php
-        -
             identifier: return.unusedType
-            path: src/Query/Builder.php
-        -
-            identifier: method.unused
-            path: src/Query/Builder.php
+            path: src/Query/SqlCompiler.php
         -
             identifier: variable.undefined
-            path: src/Query/Builder.php
+            path: src/Query/SqlCompiler.php
         # 构造函数已校验驱动；保留 match 的穷举表达，不引入静默驱动回退。
         -
             identifier: match.unhandled
@@ -39,10 +33,10 @@ parameters:
             path: src/Gateway/EntityGateway.php
         -
             identifier: identical.alwaysFalse
-            path: src/Gateway/EntityGateway.php
+            path: src/Gateway/BulkWriter.php
         -
             identifier: booleanAnd.alwaysFalse
             path: src/Gateway/EntityGateway.php
         -
-            identifier: booleanNot.alwaysTrue
-            path: src/Query/Builder.php
+            identifier: booleanAnd.alwaysFalse
+            path: src/Gateway/BulkWriter.php

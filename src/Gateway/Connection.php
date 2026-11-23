@@ -10,20 +10,20 @@ namespace Pixiaoka\Orm\Gateway;
 interface Connection
 {
     /**
-     * @param array<string, int|float|string|null> $params
+     * @param array<string, int|float|string|bool|null> $params
      */
     public function execute(string $sql, array $params): int;
 
     /**
      * 零行返回 null。多行不是按身份查找该返回的结果，实现应只取第一行。
      *
-     * @param array<string, int|float|string|null> $params
+     * @param array<string, int|float|string|bool|null> $params
      * @return array<string, mixed>|null
      */
     public function queryOne(string $sql, array $params): ?array;
 
     /**
-     * @param array<string, int|float|string|null> $params
+     * @param array<string, int|float|string|bool|null> $params
      * @return list<array<string, mixed>>
      */
     public function queryAll(string $sql, array $params): array;

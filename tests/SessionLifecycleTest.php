@@ -34,6 +34,102 @@ final class SessionLifecycleTest extends TestCase
         Session::discard();
     }
 
+    public function testScopeReleasesGatewayAndPreservesOuterOwnershipAcrossFibers(): void
+    {
+        $scoped = self::gateway(':memory:');
+        foreach ([static fn (): null => null, static function (): void { throw new \DomainException('scope failure'); }] as $operation) {
+            try {
+                Session::scope($scoped, $operation);
+            } catch (\DomainException $e) {
+                self::assertSame('scope failure', $e->getMessage());
+            }
+            $fiber = new \Fiber(static function () use ($scoped): void {
+                Session::use($scoped);
+                Session::discard();
+            });
+            $fiber->start();
+            self::assertTrue($fiber->isTerminated(), '正常和异常作用域都必须完全释放新网关');
+        }
+
+        Session::use($this->rootGateway);
+        $inner = self::gateway(':memory:');
+        $probe = new \Fiber(function (): void {
+            try {
+                Session::use($this->rootGateway);
+                self::fail('外层网关在作用域期间及恢复后均须保持独占');
+            } catch (\LogicException $e) {
+                self::assertStringContainsString('另一个活跃 Fiber/协程', $e->getMessage());
+            }
+        });
+        Session::scope($inner, function () use ($inner, $probe): void {
+            self::assertSame($inner, Session::get()->gateway);
+            $probe->start();
+            self::assertTrue($probe->isTerminated());
+        });
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+        $probe = new \Fiber(function (): void {
+            try {
+                Session::use($this->rootGateway);
+                self::fail('恢复后的外层网关必须重新保持引用');
+            } catch (\LogicException $e) {
+                self::assertStringContainsString('另一个活跃 Fiber/协程', $e->getMessage());
+            }
+        });
+        $probe->start();
+        Session::discard();
+        $fiber = new \Fiber(function (): void {
+            Session::use($this->rootGateway);
+            Session::discard();
+        });
+        $fiber->start();
+        self::assertTrue($fiber->isTerminated());
+    }
+
+    public function testSameGatewayNestedScopesBalanceReferences(): void
+    {
+        Session::use($this->rootGateway);
+        Session::scope($this->rootGateway, function (): void {
+            Session::scope($this->rootGateway, static fn (): null => null);
+            self::assertSame($this->rootGateway, Session::get()->gateway);
+        });
+        $probe = new \Fiber(function (): void {
+            try {
+                Session::use($this->rootGateway);
+                self::fail('同网关嵌套作用域退出后，外层会话仍须保持独占');
+            } catch (\LogicException $e) {
+                self::assertStringContainsString('另一个活跃 Fiber/协程', $e->getMessage());
+            }
+        });
+        $probe->start();
+        self::assertTrue($probe->isTerminated());
+        Session::discard();
+        $fiber = new \Fiber(function (): void {
+            Session::use($this->rootGateway);
+            Session::discard();
+        });
+        $fiber->start();
+        self::assertTrue($fiber->isTerminated(), '外层 discard 后网关必须完全释放');
+    }
+
+    public function testFailedScopeInitializationDoesNotLeakNewGateway(): void
+    {
+        Session::use($this->rootGateway);
+        $replacement = self::gateway(':memory:');
+        try {
+            LifecycleRecord::transaction(static function () use ($replacement): void {
+                Session::scope($replacement, static fn (): null => null);
+            });
+        } catch (\LogicException) {
+        }
+        $fiber = new \Fiber(static function () use ($replacement): void {
+            Session::use($replacement);
+            Session::discard();
+        });
+        $fiber->start();
+        self::assertTrue($fiber->isTerminated());
+        Session::discard();
+    }
+
     public function testStrictFiberMustOwnSessionInsteadOfUsingRoot(): void
     {
         Session::use($this->rootGateway);
@@ -399,6 +495,7 @@ final class SessionLifecycleTest extends TestCase
                 $context = Context::fiber(\Fiber::getCurrent());
                 $id = spl_object_id(\Fiber::getCurrent());
                 LifecycleRecord::transaction(static fn (): null => null);
+                Session::discard();
 
                 return [$id, $context];
             });
@@ -432,6 +529,171 @@ final class SessionLifecycleTest extends TestCase
         $fiber = new \Fiber(static fn (): EntityGateway => Session::get()->gateway);
         $fiber->start();
         self::assertSame($this->rootGateway, $fiber->getReturn());
+    }
+
+    public function testActiveFiberCannotShareGatewayWithoutTransaction(): void
+    {
+        $first = new \Fiber(function (): void {
+            Session::use($this->rootGateway);
+            \Fiber::suspend();
+            Session::discard();
+        });
+        $first->start();
+        $second = new \Fiber(function (): void {
+            try {
+                Session::use($this->rootGateway);
+                self::fail('非事务读写也不能在两个活跃 Fiber 间共享同一网关');
+            } catch (\LogicException $e) {
+                self::assertStringContainsString('另一个活跃 Fiber/协程', $e->getMessage());
+            }
+        });
+        $second->start();
+        self::assertTrue($second->isTerminated());
+        $first->resume();
+        self::assertTrue($first->isTerminated());
+
+        Session::use($this->rootGateway);
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+    }
+
+    public function testNamedSessionsShareFiberWithoutReplacingEachOther(): void
+    {
+        $readonly = self::gateway(':memory:');
+        Session::use($this->rootGateway);
+        Session::use($readonly, 'readonly');
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+        self::assertSame($readonly, Session::get('readonly')->gateway);
+
+        $scoped = self::gateway(':memory:');
+        Session::scope($scoped, static function () use ($scoped, $readonly): void {
+            self::assertSame($scoped, Session::get()->gateway);
+            self::assertSame($readonly, Session::get('readonly')->gateway);
+        });
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+        self::assertSame($readonly, Session::get('readonly')->gateway);
+
+        Session::discard('default');
+        self::assertSame($readonly, Session::get('readonly')->gateway);
+        $this->expectException(\LogicException::class);
+        Session::get();
+    }
+
+    public function testDiscardingOneNamedSessionCannotConfirmAnotherRollback(): void
+    {
+        Session::use($this->rootGateway);
+        $readonly = self::gateway(':memory:');
+        Session::use($readonly, 'readonly');
+        try {
+            $this->rootGateway->transaction(static function (): void {
+                Session::discard('readonly');
+                throw new \DomainException('only default transaction rolls back');
+            });
+            self::fail('default 事务异常必须透传');
+        } catch (\DomainException $e) {
+            self::assertSame('only default transaction rolls back', $e->getMessage());
+        }
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+        $this->expectException(\LogicException::class);
+        Session::get('readonly');
+    }
+
+    public function testDiscardAllNamesRollsBackEachActiveTransaction(): void
+    {
+        // 两个 SQLite 连接不必同时持写事务；验证独立物理回滚链即可。
+        $first = self::gateway(':memory:');
+        $second = self::gateway(':memory:');
+        $firstConnection = new RecordingLifecycleConnection($first->connection());
+        $secondConnection = new RecordingLifecycleConnection($second->connection());
+        $firstGateway = new EntityGateway($firstConnection);
+        $secondGateway = new EntityGateway($secondConnection);
+        Session::use($firstGateway);
+        Session::use($secondGateway, 'readonly');
+        try {
+            $firstGateway->transaction(static function () use ($secondGateway): void {
+                LifecycleRecord::executeRaw('INSERT INTO lifecycle_record (id, name) VALUES (:id, :name)', ['id' => 101, 'name' => 'first']);
+                $secondGateway->transaction(static function (): void {
+                    Session::get('readonly')->gateway->executeRaw(
+                        'INSERT INTO lifecycle_record (id, name) VALUES (:id, :name)',
+                        ['id' => 102, 'name' => 'readonly'],
+                    );
+                    Session::discard();
+                });
+            });
+            self::fail('所有命名会话回滚后不得提交');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('操作已回滚', $e->getMessage());
+        }
+        self::assertSame(1, $firstConnection->rollbacks);
+        self::assertSame(1, $secondConnection->rollbacks);
+        self::assertSame([], $firstConnection->queryAll('SELECT id FROM lifecycle_record', []));
+        self::assertSame([], $secondConnection->queryAll('SELECT id FROM lifecycle_record', []));
+    }
+
+    public function testReplacingOneNameReleasesItsPreviousGateway(): void
+    {
+        Session::use($this->rootGateway);
+        $replacement = self::gateway(':memory:');
+        Session::use($replacement);
+        $fiber = new \Fiber(function (): void {
+            Session::use($this->rootGateway);
+            Session::discard();
+        });
+        $fiber->start();
+        self::assertTrue($fiber->isTerminated());
+        self::assertSame($replacement, Session::get()->gateway);
+    }
+
+    public function testNamedScopeKeepsSameGatewayHeldUnderAnotherName(): void
+    {
+        Session::use($this->rootGateway);
+        Session::use($this->rootGateway, 'readonly');
+        Session::scope(self::gateway(':memory:'), static function (): void {
+            Session::discard('readonly');
+        });
+        self::assertSame($this->rootGateway, Session::get()->gateway);
+        $probe = new \Fiber(function (): void {
+            try {
+                Session::use($this->rootGateway);
+                self::fail('删除另一个命名会话后，恢复的外层会话仍须保持独占');
+            } catch (\LogicException $e) {
+                self::assertStringContainsString('另一个活跃 Fiber/协程', $e->getMessage());
+            }
+        });
+        $probe->start();
+        self::assertTrue($probe->isTerminated());
+        Session::discard();
+        $fiber = new \Fiber(function (): void {
+            Session::use($this->rootGateway);
+            Session::discard();
+        });
+        $fiber->start();
+        self::assertTrue($fiber->isTerminated());
+    }
+
+    public function testDiscardAllNamesOnlyAffectsCurrentFiber(): void
+    {
+        $readonly = self::gateway(':memory:');
+        $fiber = new \Fiber(static function () use ($readonly): void {
+            Session::use(self::gateway(':memory:'));
+            Session::use($readonly, 'readonly');
+            self::assertNotNull(Session::get()->gateway);
+            self::assertSame($readonly, Session::get('readonly')->gateway);
+            Session::discard();
+            self::assertNull(self::lookupSessionsForTest());
+        });
+        $fiber->start();
+        self::assertTrue($fiber->isTerminated());
+        Session::use($this->rootGateway);
+        Session::use($readonly, 'readonly');
+        self::assertSame($readonly, Session::get('readonly')->gateway);
+    }
+
+    private static function lookupSessionsForTest(): ?array
+    {
+        $sessions = new \ReflectionProperty(Session::class, 'contextSessions');
+        $map = $sessions->getValue();
+
+        return $map[Session::context()] ?? null;
     }
 
     private static function gateway(string $path): EntityGateway

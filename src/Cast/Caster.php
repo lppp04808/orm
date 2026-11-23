@@ -99,6 +99,17 @@ final class Caster
             return $value->value;
         }
 
+        if (is_a($name, Castable::class, true)) {
+            if (!$value instanceof $name) {
+                throw $this->fail($model, $field, '写出的 Castable 类型不对');
+            }
+            try {
+                return $value->toDatabase();
+            } catch (\Throwable $e) {
+                throw $this->fail($model, $field, 'Castable 无法序列化: ' . $e->getMessage());
+            }
+        }
+
         if ($name === 'int') {
             if (!is_int($value)) {
                 throw $this->fail($model, $field, '写出的 int 不是整数');
@@ -122,6 +133,36 @@ final class Caster
         }
 
         throw $this->fail($model, $field, '不支持的写出类型');
+    }
+
+    /**
+     * 将实体值或外部标量规范化为数据库值；已是目标值对象时不做无效往返。
+     *
+     * @internal
+     */
+    public function toDbNormalized(string $model, FieldMeta $field, mixed $value): int|float|string|null
+    {
+        $name = $field->typeName();
+        $complex = !$field->type->isBuiltin()
+            && ($name === DateTimeImmutable::class
+                || is_a($name, Decimal::class, true)
+                || is_a($name, \BackedEnum::class, true)
+                || is_a($name, Castable::class, true));
+        if ($complex && $value instanceof $name) {
+            return $this->toDb($model, $field, $value);
+        }
+
+        return $this->toDb($model, $field, $this->toPhp($model, $field, $value));
+    }
+
+    /** @internal 自动时间戳统一使用秒级 UTC 值，供单实体与批量写入共用。 */
+    public function currentTimestamp(FieldMeta $field, ?int $now = null): int|DateTimeImmutable
+    {
+        if ($field->typeName() === 'int') {
+            return $now ?? time();
+        }
+
+        return (new DateTimeImmutable('@' . ($now ?? time())))->setTimezone(new DateTimeZone('UTC'));
     }
 
     private function toInt(string $model, FieldMeta $field, mixed $value): int
@@ -218,8 +259,32 @@ final class Caster
         if (is_a($name, Decimal::class, true)) {
             return $this->toDecimal($model, $field, $value);
         }
+        if (is_a($name, Castable::class, true)) {
+            return $this->toCastable($model, $field, $value);
+        }
 
         return $this->toEnum($model, $field, $value);
+    }
+
+    private function toCastable(string $model, FieldMeta $field, mixed $value): Castable
+    {
+        $name = $field->typeName();
+        if ($value instanceof $name) {
+            return $value;
+        }
+        if (!is_int($value) && !is_float($value) && !is_string($value)) {
+            throw $this->fail($model, $field, 'Castable 只接受标量数据库值');
+        }
+        try {
+            $object = $name::fromDatabase($value);
+        } catch (\Throwable $e) {
+            throw $this->fail($model, $field, 'Castable 无法反序列化: ' . $e->getMessage());
+        }
+        if (!$object instanceof $name) {
+            throw $this->fail($model, $field, 'Castable::fromDatabase() 返回类型不对');
+        }
+
+        return $object;
     }
 
     private function toTime(string $model, FieldMeta $field, mixed $value): DateTimeImmutable

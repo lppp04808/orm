@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Pixiaoka\Orm\Metadata;
 
+use Pixiaoka\Orm\Schema\IndexSchema;
+
 /**
  * 一个模型的字段与主键。主键列已按 order 排好。
  *
@@ -19,6 +21,8 @@ final readonly class ModelMeta
      * @param 'surrogate'|'natural' $identityKind
      * @param array{created_at?: string, updated_at?: string} $timestamps 时间角色 => 属性名
      * @param string|null $version
+     * @param string|null $softDelete 软删除属性名
+     * @param list<IndexSchema> $indexes 声明的二级索引
      */
     public function __construct(
         public string $class,
@@ -28,6 +32,8 @@ final readonly class ModelMeta
         public string $identityKind,
         public array $timestamps,
         public ?string $version = null,
+        public ?string $softDelete = null,
+        public array $indexes = [],
     ) {
     }
 
@@ -50,6 +56,11 @@ final readonly class ModelMeta
     public function versionField(): ?FieldMeta
     {
         return $this->version === null ? null : $this->field($this->version);
+    }
+
+    public function softDeleteField(): ?FieldMeta
+    {
+        return $this->softDelete === null ? null : $this->field($this->softDelete);
     }
 
     public function generatedField(): ?FieldMeta

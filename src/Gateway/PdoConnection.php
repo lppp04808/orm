@@ -7,17 +7,20 @@ namespace Pixiaoka\Orm\Gateway;
 use PDO;
 use PDOStatement;
 
-final readonly class PdoConnection implements Connection, DriverAwareConnection
+final class PdoConnection implements ManagedConnection, DriverAwareConnection
 {
-    private string $driver;
+    private readonly string $driver;
+
+    /** 当前 PDO 物理连接上的事务深度；SAVEPOINT 名称只由这个受控整数生成。 */
+    private int $transactionDepth = 0;
 
     /**
      * @param PDO $pdo
      * @param \Closure|null $insertId 代替 lastInsertId，测试用
      */
     public function __construct(
-        private PDO       $pdo,
-        private ?\Closure $insertId = null,
+        private readonly PDO       $pdo,
+        private readonly ?\Closure $insertId = null,
     ) {
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $this->driver = $this->pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
@@ -225,22 +228,108 @@ final readonly class PdoConnection implements Connection, DriverAwareConnection
         return $this->driver;
     }
 
+    public function ping(): bool
+    {
+        try {
+            $statement = $this->pdo->query('SELECT 1');
+            $alive = $statement !== false && $statement->fetchColumn() !== false;
+            if ($statement !== false) {
+                $statement->closeCursor();
+            }
+
+            return $alive;
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
     public function beginTransaction(): bool
     {
-        return $this->pdo->beginTransaction();
+        if ($this->transactionDepth === 0) {
+            // 未受管的 PDO 事务不能悄悄冒充本适配器的最外层事务。
+            if ($this->pdo->inTransaction()) {
+                throw new \LogicException('PDO 已存在未由 PdoConnection 开启的事务，禁止混用事务边界');
+            }
+            $begun = $this->pdo->beginTransaction();
+            if ($begun) {
+                $this->transactionDepth = 1;
+            }
+
+            return $begun;
+        }
+
+        $depth = $this->transactionDepth + 1;
+        $this->execute('SAVEPOINT sp_' . $depth, []);
+        $this->transactionDepth = $depth;
+
+        return true;
     }
 
     public function commit(): bool
     {
-        return $this->pdo->commit();
+        $depth = $this->transactionDepth;
+        if ($depth === 0) {
+            throw new \LogicException('当前连接没有可提交的事务');
+        }
+        if ($depth > 1) {
+            $this->execute('RELEASE SAVEPOINT sp_' . $depth, []);
+            $this->transactionDepth--;
+
+            return true;
+        }
+
+        $committed = $this->pdo->commit();
+        if ($committed) {
+            $this->transactionDepth = 0;
+        }
+
+        return $committed;
     }
 
     public function rollback(): bool
     {
-        if ($this->pdo->inTransaction()) {
-            return $this->pdo->rollBack();
+        $depth = $this->transactionDepth;
+        if ($depth === 0) {
+            return true;
+        }
+        if ($depth > 1) {
+            // MySQL、PostgreSQL、SQLite 均支持：回滚保存点后释放同名保存点。
+            // 两条语句都成功才减少深度；失败交由 Gateway 禁止复用该连接。
+            $this->execute('ROLLBACK TO SAVEPOINT sp_' . $depth, []);
+            $this->execute('RELEASE SAVEPOINT sp_' . $depth, []);
+            $this->transactionDepth--;
+
+            return true;
         }
 
+        if ($this->pdo->inTransaction()) {
+            $rolledBack = $this->pdo->rollBack();
+            if ($rolledBack) {
+                $this->transactionDepth = 0;
+            }
+
+            return $rolledBack;
+        }
+
+        $this->transactionDepth = 0;
+
         return true;
+    }
+
+    public function forceRollback(): bool
+    {
+        if ($this->transactionDepth === 0) {
+            return true;
+        }
+
+        $rolledBack = true;
+        if ($this->pdo->inTransaction()) {
+            $rolledBack = $this->pdo->rollBack();
+        }
+        if ($rolledBack) {
+            $this->transactionDepth = 0;
+        }
+
+        return $rolledBack;
     }
 }

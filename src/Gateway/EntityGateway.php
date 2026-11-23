@@ -4,16 +4,12 @@ declare(strict_types=1);
 
 namespace Pixiaoka\Orm\Gateway;
 
-use BackedEnum;
-use DateTimeImmutable;
 use Pixiaoka\Orm\Cache\RowCache;
 use Pixiaoka\Orm\Context;
 use Pixiaoka\Orm\Cast\Caster;
-use Pixiaoka\Orm\Cast\Decimal;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Exception\IdentityException;
 use Pixiaoka\Orm\Exception\OptimisticLockException;
-use Pixiaoka\Orm\Exception\TransactionException;
 use Pixiaoka\Orm\Identity\Identity;
 use Pixiaoka\Orm\Metadata\FieldMeta;
 use Pixiaoka\Orm\Metadata\MetadataReader;
@@ -23,71 +19,56 @@ use Pixiaoka\Orm\Observability\Clock;
 use Pixiaoka\Orm\Observability\ContextInfo;
 use Pixiaoka\Orm\Observability\EventDispatcher;
 use Pixiaoka\Orm\Observability\EventListener;
-use Pixiaoka\Orm\Observability\SqlEvent;
 use Pixiaoka\Orm\Observability\SystemClock;
-use Pixiaoka\Orm\Observability\TransactionEvent;
 use Pixiaoka\Orm\Observability\SessionEvent;
 use Pixiaoka\Orm\Query\Builder;
 use Pixiaoka\Orm\Query\Expression;
 use Pixiaoka\Orm\Relation\Loader;
 use Pixiaoka\Orm\Session;
 
-final class EntityGateway
+final readonly class EntityGateway
 {
-    private readonly RowCache $cache;
+    private RowCache $cache;
 
-    /** @var \WeakMap<Context, bool> 对象身份避免 Fiber 销毁后的数字 ID 重用。 */
-    private \WeakMap $inTransactionByContext;
+    private TransactionManager $transactions;
 
-    /** @var \WeakMap<Context, \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}>> */
-    private \WeakMap $txnStatesByContext;
+    private EventDispatcher $events;
 
-    /** @var \WeakMap<Context, array<string, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}>> 同主键共享最外层基线，禁止中途状态覆盖。 */
-    private \WeakMap $txnIdentityStates;
+    private Clock $clock;
 
-    /** @var \WeakMap<Context, array<string, list<array{new: bool, original: array<string, mixed>, values: array<string, mixed>}|null>>> 同身份插入历史，回滚后按删除关系决定保留或失效。 */
-    private \WeakMap $txnNewIdentities;
+    private Loader $relations;
 
-    /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}>|null 插入前身份不完整时的对象快照。 */
-    private ?\WeakMap $pendingInsertStates = null;
+    private SqlExecutor $executor;
 
-    /** @var \WeakMap<Context, array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, keys: list<string>, entities: list<Entity>}> */
-    private \WeakMap $txnCacheSnapshots;
-
-    /** @var \WeakMap<Context, bool>|null discard 返回后读取的回滚确认，下一次事务前清理。 */
-    private ?\WeakMap $confirmedRollbacks = null;
-
-    /** @var \WeakMap<Context, float> 仅用于物理事务开始事件的耗时。 */
-    private \WeakMap $txnStartedAt;
-
-    private readonly EventDispatcher $events;
-
-    private readonly Clock $clock;
-
-    private readonly Loader $relations;
-
-    /** @var \WeakMap<Connection, string> 开始、提交或回滚结果未知后，连接及所有 Gateway 都不可复用。 */
-    private static ?\WeakMap $failedConnections = null;
-
-    /** @var \WeakMap<Connection, int> 观测回调不是查询或业务写入入口，嵌套事件保留外层保护。 */
-    private static ?\WeakMap $observingConnections = null;
+    private BulkWriter $bulk;
 
     public function __construct(
-        private readonly Connection $connection,
-        private readonly MetadataReader $metadata = new MetadataReader(),
-        private readonly Caster $caster = new Caster(),
-        ?Clock $clock = null,
+        private Connection     $connection,
+        private MetadataReader $metadata = new MetadataReader(),
+        private Caster         $caster = new Caster(),
+        ?Clock                 $clock = null,
     ) {
         $this->cache = new RowCache();
-        $this->inTransactionByContext = new \WeakMap();
-        $this->txnStatesByContext = new \WeakMap();
-        $this->txnIdentityStates = new \WeakMap();
-        $this->txnNewIdentities = new \WeakMap();
-        $this->pendingInsertStates ??= new \WeakMap();
-        $this->txnCacheSnapshots = new \WeakMap();
-        $this->txnStartedAt = new \WeakMap();
         $this->events = new EventDispatcher();
         $this->clock = $clock ?? new SystemClock();
+        $this->executor = new SqlExecutor($this->connection, $this->events, $this->clock);
+        $this->transactions = new TransactionManager(
+            $this->connection,
+            $this->cache,
+            $this->metadata,
+            $this->caster,
+            $this->executor,
+            $this->events,
+            $this->clock,
+        );
+        $this->bulk = new BulkWriter(
+            $this->connection,
+            $this->metadata,
+            $this->caster,
+            $this->cache,
+            $this->executor,
+            $this->transactions,
+        );
         $this->relations = new Loader($this);
     }
 
@@ -152,6 +133,18 @@ final class EntityGateway
         return $this->cache->get($class, $identity);
     }
 
+    /** @internal @return array<string, int|float|string|bool|null>|null */
+    public function knownIdentity(Entity $entity): ?array
+    {
+        return $this->cache->knownIdentity($entity);
+    }
+
+    /** @internal @return list<Entity> */
+    public function knownEntities(string $class): array
+    {
+        return $this->cache->knownEntities($class);
+    }
+
     /** @internal 将 Loader 已按主键顺序转换的值映射为 RowCache 的列身份。 */
     public function relationIdentity(string $class, array $values): array
     {
@@ -191,13 +184,13 @@ final class EntityGateway
     /** @internal 在任何字段或关系合并前登记事务基线，而不是登记已经合并的新状态。 */
     public function recordRelationState(Entity $entity): void
     {
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
     }
 
     /** @internal 成功时登记旧状态供事务回滚，再把关系目标设为 canonical 缓存对象。 */
     public function publishRelationTarget(Entity $entity): void
     {
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
         $this->cacheSet($entity);
     }
 
@@ -274,7 +267,7 @@ final class EntityGateway
         $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
         $generated = $meta->generatedField();
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
         $this->fillTimestamp($entity, $meta, 'created_at');
         $this->fillTimestamp($entity, $meta, 'updated_at');
         $this->fillVersion($entity, $meta);
@@ -329,7 +322,7 @@ final class EntityGateway
             $entity->markPersisted($this);
             $entity->afterSave();
             $entity->afterInsert();
-            $this->rememberEntity($entity);
+            $this->transactions->rememberEntity($entity);
             $this->cacheSet($entity, true);
 
             return;
@@ -343,7 +336,7 @@ final class EntityGateway
         $entity->markPersisted($this);
         $entity->afterSave();
         $entity->afterInsert();
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
         $this->cacheSet($entity, true);
     }
 
@@ -353,209 +346,42 @@ final class EntityGateway
      */
     public function batchInsert(string $class, array $rows): void
     {
-        if ($rows === []) {
-            return;
-        }
-
-        $meta = $this->metadata->read($class);
-        $generated = $meta->generatedField();
-        $fieldList = [];
-        foreach ($meta->fields as $field) {
-            if ($field->generated) {
-                continue;
-            }
-            $fieldList[] = $field;
-        }
-        if ($fieldList === []) {
-            return;
-        }
-
-        $rows = array_values($rows);
-        $entities = [];
-        $prepared = [];
-        $now = time();
-        // 数组值、实体类型、新旧状态和归属先预检；失败批次不提前绑定新实体。
-        foreach ($rows as $index => $row) {
-            if (!$row instanceof Entity) {
-                $prepared[$index] = $this->prepareBatchRow($meta, $fieldList, $row, $now);
-                continue;
-            }
-            if (!$row instanceof $class) {
-                throw new \InvalidArgumentException('批量插入实体必须是 ' . $class . '，收到 ' . $row::class);
-            }
-            if (!$row->isNew()) {
-                throw new IdentityException($row::class . ' 已经在库里，不能再批量 insert');
-            }
-            if ($row->hasGatewayBinding()) {
-                $bound = $row->boundGateway()
-                    ?? throw new \LogicException($row::class . ' 原 Gateway 已销毁，请在新 Gateway 上显式重查');
-                $this->assertSame($bound, '批量插入');
-            }
-            $entities[$index] = $row;
-        }
-
-        // P0-3：多行含实体 + 生成列时，RETURNING 是唯一可靠的批量回填途径。
-        if ($generated !== null && $entities !== [] && count($rows) > 1 && !$this->connection->supportsReturning()) {
-            throw new IdentityException(
-                $meta->class . ' 该连接不支持 RETURNING，无法批量回填生成列，请逐行 insert',
-                true,
-            );
-        }
-
-        // 钩子可以补必填字段，但必须在首条 SQL 前完成整批最终值物化。
-        // 事务内先保存钩子及自动填值之前的新实体基线；预检失败不假装撤销业务副作用。
-        foreach ($entities as $index => $row) {
-            $this->rememberEntity($row);
-            $this->fillTimestamp($row, $meta, 'created_at');
-            $this->fillTimestamp($row, $meta, 'updated_at');
-            $this->fillVersion($row, $meta);
-            $row->beforeSave();
-            $row->beforeInsert();
-            $prepared[$index] = $this->prepareBatchRow($meta, $fieldList, $row, $now);
-        }
-        ksort($prepared);
-
-        // SQL 严格保留原始混批行序。RETURNING 的每个结果仍对应全局原始索引，
-        // 所有 SQL 成功后才按输入顺序回填实体、执行后置钩子和发布缓存。
-        $chunkSize = max(1, min(500, intdiv(65535, max(1, count($fieldList)))));
-        $generatedIds = [];
-        foreach (array_chunk($prepared, $chunkSize, true) as $chunk) {
-            $ids = $this->executeBatchChunk($meta, $generated, $fieldList, array_values($chunk));
-            foreach (array_keys($chunk) as $position => $index) {
-                $generatedIds[$index] = $ids[$position] ?? null;
-            }
-        }
-        foreach ($entities as $index => $row) {
-            $this->publishBatchEntity($row, $meta, $generated, $generatedIds[$index] ?? null);
-        }
-    }
-
-    /** @param list<FieldMeta> $fieldList @return list<int|float|string|null> */
-    private function prepareBatchRow(ModelMeta $meta, array $fieldList, array|Entity $row, int $now): array
-    {
-        $isEntity = $row instanceof Entity;
-        $values = [];
-        foreach ($fieldList as $field) {
-            $isTimestamp = in_array($field->property, $meta->timestamps, true);
-            $isVersion = $field->property === $meta->version;
-            $has = $isEntity
-                ? $row->propSet($field->property)
-                : (array_key_exists($field->column, $row) || array_key_exists($field->property, $row));
-            if (($isTimestamp || $isVersion) && !$has) {
-                $value = $isVersion ? 1 : $this->currentTimestamp($field, $now);
-            } elseif ($has) {
-                $value = $isEntity
-                    ? $row->{$field->property}
-                    : (array_key_exists($field->column, $row) ? $row[$field->column] : $row[$field->property]);
-            } else {
-                throw new IdentityException($meta->class . '::' . $field->property . ' 批量插入缺少列');
-            }
-            $values[] = $this->toDbValue($meta, $field, $value);
-            if ($isVersion) {
-                $version = $meta->versionField() ?? throw new \LogicException('版本元数据不一致');
-                $this->versionValue($meta, $version, $this->caster->toPhp($meta->class, $version, $value));
-            }
-        }
-
-        return $values;
-    }
-
-    /** SQL 成功后才建立新实体的 Gateway 归属并发布身份；后置钩子失败不宣称原子撤销。 */
-    private function publishBatchEntity(
-        Entity $row,
-        ModelMeta $meta,
-        ?FieldMeta $generated,
-        ?string $id,
-    ): void {
-        if ($generated !== null && !$row->propSet($generated->property)) {
-            if ($id === null || $id === '' || $id === '0') {
-                throw new IdentityException($meta->class . ' 行可能已写入，但生成列没有回填', true);
-            }
-            $row->{$generated->property} = $this->caster->toPhp($meta->class, $generated, $id);
-        }
-        $row->markPersisted($this);
-        $row->afterSave();
-        $row->afterInsert();
-        $this->rememberEntity($row);
-        $this->cacheSet($row, true);
-    }
-
-    /**
-     * 执行已完整预检的分块；这里不再运行钩子或修改实体。
-     *
-     * @param list<FieldMeta> $fieldList
-     * @param list<list<int|float|string|null>> $chunk
-     * @return list<string|null>
-     */
-    private function executeBatchChunk(
-        ModelMeta $meta,
-        ?FieldMeta $generated,
-        array $fieldList,
-        array $chunk,
-    ): array {
-        $columns = array_map(fn (FieldMeta $f): string => $this->quote($f->column), $fieldList);
-        $paramIndex = 0;
-        $valueGroups = [];
-        $params = [];
-        foreach ($chunk as $values) {
-            $placeholders = [];
-            foreach ($values as $value) {
-                $placeholder = ':b' . $paramIndex++;
-                $placeholders[] = $placeholder;
-                $params[substr($placeholder, 1)] = $value;
-            }
-            $valueGroups[] = '(' . implode(', ', $placeholders) . ')';
-        }
-
-        $sql = sprintf(
-            'INSERT INTO %s (%s) VALUES %s',
-            $this->quote($meta->table),
-            implode(', ', $columns),
-            implode(', ', $valueGroups),
+        $this->bulk->batchInsert(
+            $this,
+            $class,
+            $rows,
+            function (Entity $entity, bool $inserted = false, string $softDeleteMode = 'default'): void {
+                $this->cacheSet($entity, $inserted, $softDeleteMode);
+            },
         );
-
-        if ($generated !== null && $this->connection->supportsReturning()) {
-            // P0-3：RETURNING 拿回本块全部生成列值，行序即结果序
-            $returned = $this->runQueryAll(
-                $sql . ' RETURNING ' . $this->quote($generated->column),
-                $params,
-                $meta->class,
-            );
-
-            return array_map(
-                static fn (array $r): string => (string) ($r[$generated->column] ?? ''),
-                $returned,
-            );
-        }
-
-        // 不支持 RETURNING：多行带生成列已在入口拒绝；单行用 lastInsertId 兜底
-        $this->runExecute($sql, $params, $meta->class);
-        $ids = array_fill(0, count($chunk), null);
-        if ($generated !== null && count($chunk) === 1) {
-            $id = $this->connection->lastInsertId();
-            $ids[0] = ($id === '' || $id === '0') ? null : $id;
-        }
-
-        return $ids;
     }
 
-    /**
-     * P1-2：Decimal / DateTimeImmutable / BackedEnum 不做 toPhp→toDb 双重转换——
-     * 已是目标类型的值直接 toDb；裸值只走一次 toPhp 归一化再 toDb。
-     * 标量（int/float/string/bool/array）保留往返，数组行裸值（如 string '5'）借此归一化，无损。
-     */
-    private function toDbValue(ModelMeta $meta, FieldMeta $field, mixed $value): int|float|string|null
+    /** @internal 脏跟踪与关系合并共用数据库表示的字段值语义。 */
+    public function fieldValuesEqual(ModelMeta $meta, FieldMeta $field, mixed $a, mixed $b): bool
     {
-        $name = $field->typeName();
-        $complex = !$field->type->isBuiltin()
-            && ($name === DateTimeImmutable::class
-                || is_a($name, Decimal::class, true)
-                || is_a($name, BackedEnum::class, true));
-        if ($complex && $value instanceof $name) {
-            return $this->caster->toDb($meta->class, $field, $value);
-        }
+        $databaseValue = null;
 
-        return $this->caster->toDb($meta->class, $field, $this->caster->toPhp($meta->class, $field, $value));
+        return $this->compareFieldValues($meta, $field, $a, $b, $databaseValue);
+    }
+
+    /** @param int|float|string|null $aDatabase 已转换的左侧数据库值，供 UPDATE 复用。 */
+    private function compareFieldValues(
+        ModelMeta $meta,
+        FieldMeta $field,
+        mixed $a,
+        mixed $b,
+        int|float|string|null &$aDatabase,
+    ): bool {
+        $aDatabase = null;
+        if ($a === $b) {
+            return true;
+        }
+        if (!is_object($a) || !is_object($b)) {
+            return false;
+        }
+        $aDatabase = $this->caster->toDb($meta->class, $field, $a);
+
+        return $aDatabase === $this->caster->toDb($meta->class, $field, $b);
     }
 
     // ---- 更新 —— 只改脏字段 ----
@@ -565,7 +391,7 @@ final class EntityGateway
         $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
         $identity = $this->identityOf($entity, $meta);
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
         $entity->beforeSave();
         $entity->beforeUpdate();
 
@@ -583,12 +409,25 @@ final class EntityGateway
                 continue;
             }
             $new = $entity->{$field->property};
-            // 只改真正变了的字段
-            if (array_key_exists($field->property, $original) && $new === $original[$field->property]) {
-                continue;
+            // 只改真正变了的字段；对象以数据库表示比较并复用转换结果。
+            $databaseValue = null;
+            if (array_key_exists($field->property, $original)) {
+                if ($this->compareFieldValues(
+                    $meta,
+                    $field,
+                    $new,
+                    $original[$field->property],
+                    $databaseValue,
+                )) {
+                    continue;
+                }
+            } elseif (is_object($new)) {
+                $databaseValue = $this->caster->toDb($meta->class, $field, $new);
             }
             $sets[] = $this->quote($field->column) . ' = :set_' . $field->column;
-            $params['set_' . $field->column] = $this->caster->toDb($meta->class, $field, $new);
+            $params['set_' . $field->column] = is_object($new)
+                ? $databaseValue
+                : $this->caster->toDb($meta->class, $field, $new);
         }
 
         if ($sets === []) {
@@ -624,27 +463,43 @@ final class EntityGateway
         $entity->markPersisted($this);
         $entity->afterSave();
         $entity->afterUpdate();
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
         $this->cacheSet($entity);
     }
 
     // ---- 删除 ----
 
-    public function delete(Entity $entity): void
+    public function delete(Entity $entity, bool $force = false): void
     {
         $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
         $identity = $this->identityOf($entity, $meta);
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
         $entity->beforeDelete();
         $original = $entity->takeOriginal();
         $expectedVersion = $this->expectedVersion($entity, $meta, $original);
         $params = [];
-        $sql = sprintf(
-            'DELETE FROM %s WHERE %s',
-            $this->quote($meta->table),
-            $this->where($meta, $params, $identity),
-        );
+        $softDelete = !$force ? $meta->softDeleteField() : null;
+        if ($softDelete !== null) {
+            if ($entity->propSet($softDelete->property) && $entity->{$softDelete->property} !== null) {
+                throw new IdentityException($meta->class . ' 已软删除，请使用 restore() 或 forceDelete()');
+            }
+            $deletedAt = $this->caster->currentTimestamp($softDelete);
+            $sql = sprintf(
+                'UPDATE %s SET %s = :orm_deleted_at WHERE %s',
+                $this->quote($meta->table),
+                $this->quote($softDelete->column),
+                $this->where($meta, $params, $identity),
+            );
+            $params['orm_deleted_at'] = $this->caster->toDb($meta->class, $softDelete, $deletedAt);
+            $sql .= ' AND ' . $this->quote($softDelete->column) . ' IS NULL';
+        } else {
+            $sql = sprintf(
+                'DELETE FROM %s WHERE %s',
+                $this->quote($meta->table),
+                $this->where($meta, $params, $identity),
+            );
+        }
         if ($expectedVersion !== null) {
             $version = $meta->versionField() ?? throw new \LogicException('版本元数据不一致');
             $sql .= ' AND ' . $this->quote($version->column) . ' = :orm_version';
@@ -657,26 +512,46 @@ final class EntityGateway
         if ($expectedVersion === null && $affected !== 1) {
             throw new IdentityException($meta->class . ' 删除没有命中恰好一行');
         }
-        $context = Session::context();
-        if ($this->inTransactionByContext[$context] ?? false) {
-            $key = $entity::class . ':' . serialize($identity->parts);
-            $history = $this->txnNewIdentities[$context] ?? [];
-            if (isset($history[$key])) {
-                $baseline = array_pop($history[$key]);
-                if ($history[$key] === []) {
-                    unset($history[$key]);
-                }
-                $this->txnNewIdentities[$context] = $history;
-                if ($baseline !== null) {
-                    $identities = $this->txnIdentityStates[$context] ?? [];
-                    $identities[$key] ??= $baseline;
-                    $this->txnIdentityStates[$context] = $identities;
-                }
-            }
+        $this->transactions->recordDeletedIdentity($entity, $identity->parts);
+        if ($softDelete !== null) {
+            $entity->{$softDelete->property} = $deletedAt;
+            $entity->markPersisted($this);
+        } else {
+            $entity->markDeleted();
         }
-        $entity->markDeleted();
         $entity->afterDelete();
         $this->cacheClear($entity, $identity);
+    }
+
+    public function restore(Entity $entity): void
+    {
+        $this->forEntity($entity);
+        $meta = $this->metadata->read($entity::class);
+        $field = $meta->softDeleteField()
+            ?? throw new \LogicException($meta->class . ' 未声明软删除字段');
+        $identity = $this->identityOf($entity, $meta);
+        $this->transactions->rememberEntity($entity);
+        $params = [];
+        $sql = sprintf(
+            'UPDATE %s SET %s = NULL WHERE %s AND %s IS NOT NULL',
+            $this->quote($meta->table),
+            $this->quote($field->column),
+            $this->where($meta, $params, $identity),
+            $this->quote($field->column),
+        );
+        $affected = $this->runExecute($sql, $params, $meta->class);
+        if ($affected !== 1) {
+            throw new IdentityException($meta->class . ' 恢复没有命中恰好一条软删除记录');
+        }
+        $entity->{$field->property} = null;
+        $entity->markPersisted($this);
+        $this->transactions->rememberEntity($entity);
+        $this->cacheSet($entity);
+    }
+
+    public function forceDelete(Entity $entity): void
+    {
+        $this->delete($entity, true);
     }
 
     // ---- 查找 —— 带缓存 ----
@@ -689,8 +564,12 @@ final class EntityGateway
         $cached = $this->cache->get($class, $identity->parts);
         if ($cached !== null) {
             $this->forEntity($cached);
-
-            return $cached;
+            $softDelete = $meta->softDeleteField();
+            if ($softDelete === null || !$cached->propSet($softDelete->property)
+                || $cached->{$softDelete->property} === null) {
+                return $cached;
+            }
+            $this->cache->clear($class, $identity->parts);
         }
         $params = [];
         $columns = array_map(
@@ -703,6 +582,10 @@ final class EntityGateway
             $this->quote($meta->table),
             $this->where($meta, $params, $identity),
         );
+        $softDelete = $meta->softDeleteField();
+        if ($softDelete !== null) {
+            $sql .= ' AND ' . $this->quote($softDelete->column) . ' IS NULL';
+        }
         $row = $this->runQueryOne($sql, $params, $meta->class);
         if ($row === null) {
             return null;
@@ -710,7 +593,7 @@ final class EntityGateway
 
         $entity = $this->hydrate($meta, $row);
         $this->forEntity($entity);
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
         $this->cacheSet($entity);
 
         return $entity;
@@ -739,7 +622,7 @@ final class EntityGateway
         $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
         $identity = $this->identityOf($entity, $meta);
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
         $params = [];
         $columns = array_map(
             fn (FieldMeta $field): string => $this->quote($field->column),
@@ -764,7 +647,7 @@ final class EntityGateway
         }
         $entity->markPersisted($this);
         $entity->clearLoadedRelations();
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
         $this->cacheSet($entity);
     }
 
@@ -797,13 +680,13 @@ final class EntityGateway
                 return $value;
             }
 
-            return $this->toDbValue($this->meta($class), $field, $value);
+            return $this->caster->toDbNormalized($class, $field, $value);
         }
 
         $field = $this->queryField($class, $column)
             ?? throw new \InvalidArgumentException('对象查询值必须对应一个基表模型字段: ' . $column);
 
-        return $this->toDbValue($this->meta($class), $field, $value);
+        return $this->caster->toDbNormalized($class, $field, $value);
     }
 
     private function queryField(string $class, string $column): ?FieldMeta
@@ -869,237 +752,46 @@ final class EntityGateway
 
     public function executeUpdate(Builder $builder, array $values): int
     {
-        $this->assertVersionWrite($this->metadata->read($builder->modelClass()), '批量条件 UPDATE');
-        $query = $builder->buildUpdate($values);
-        $affected = $this->runExecute($query['sql'], $query['params'], $builder->modelClass());
-        $this->cache->clearClass($this->metadata->read($builder->modelClass())->class);
-
-        return $affected;
+        return $this->bulk->executeUpdate($builder, $values);
     }
 
-    public function executeDelete(Builder $builder): int
+    /** 批量恢复时按主键预查实际命中行，只同步这些已交付给调用方的实体。 */
+    public function executeRestore(Builder $builder): int
     {
-        $meta = $this->metadata->read($builder->modelClass());
-        $this->assertVersionWrite($meta, '批量条件 DELETE');
-        $class = $meta->class;
-        $query = $builder->buildDelete();
-        if ($this->connection->supportsReturning()) {
-            $sql = $query['sql'] . ' RETURNING ' . implode(', ', array_map(
-                $this->quote(...),
-                $meta->primaryColumns(),
-            ));
-            $deleted = $this->runQueryAll($sql, $query['params'], $class);
-            $this->cache->clearDeleted($class, $this->normalizeIdentities($meta, $deleted));
-
-            return count($deleted);
-        }
-
-        // MySQL 没有 DELETE ... RETURNING。按已缓存主键做一次受限预查，
-        // 成功后只失效候选身份；并发插入/更新与缓存一致性边界见使用文档。
-        $candidates = $this->deletedIdentityQuery($meta, $builder);
-        $deleted = $candidates === null
-            ? []
-            : $this->runQueryAll($candidates['sql'], $candidates['params'], $class);
-        $affected = $this->runExecute($query['sql'], $query['params'], $class);
-        if ($affected > 0) {
-            $this->cache->clearDeleted($class, $this->normalizeIdentities($meta, $deleted));
-        }
-
-        return $affected;
+        return $this->bulk->executeRestore(
+            $this,
+            $builder,
+            function (Entity $entity, bool $inserted = false, string $softDeleteMode = 'default'): void {
+                $this->cacheSet($entity, $inserted, $softDeleteMode);
+            },
+        );
     }
 
-    /**
-     * MySQL 回退：只选取当前缓存中、且符合 DELETE 条件的候选主键，不扫描整表。
-     * 原始 DELETE 已提前构建，预查阶段能再被拒绝，就不会执行任何写操作。
-     *
-     * @return array{sql: string, params: array<string, mixed>}|null
-     */
-    private function deletedIdentityQuery(ModelMeta $meta, Builder $builder): ?array
+    public function executeDelete(Builder $builder, bool $force = false): int
     {
-        $identities = $this->cache->identities($meta->class);
-        if ($identities === []) {
-            return null;
-        }
-        $primary = $meta->primaryColumns();
-        $sets = [];
-        $params = [];
-        $index = 0;
-        foreach ($identities as $identity) {
-            $parts = [];
-            foreach ($primary as $column) {
-                $name = 'cached_' . $index++;
-                $parts[] = $this->quote($column) . ' = :' . $name;
-                $params[$name] = $identity[$column];
-            }
-            $sets[] = '(' . implode(' AND ', $parts) . ')';
-        }
-
-        return (clone $builder)->select(...$primary)
-            ->whereRaw('(' . implode(' OR ', $sets) . ')', $params)
-            ->build();
-    }
-
-    /** 将驱动返回的主键值按缓存写入时的同一路径规范化（bool/enum/int 等）。 */
-    private function normalizeIdentities(ModelMeta $meta, array $rows): array
-    {
-        $identities = [];
-        foreach ($rows as $row) {
-            $identity = [];
-            foreach ($meta->primaryKey as $field) {
-                if (!array_key_exists($field->column, $row)) {
-                    throw new IdentityException($meta->class . ' DELETE RETURNING 缺少主键列 ' . $field->column);
-                }
-                $identity[$field->column] = $this->toDbValue($meta, $field, $row[$field->column]);
-            }
-            $identities[] = $identity;
-        }
-
-        return $identities;
+        return $this->bulk->executeDelete($this, $builder, $force);
     }
 
     /** @return list<array<string, mixed>> 原生 SELECT/CTE 查询，调用方负责 SQL 的正确性。 */
     public function selectRaw(string|Expression $sql, array $params = []): array
     {
-        $query = $this->rawQuery($sql, $params);
-
-        return $this->runQueryAll($query['sql'], $query['params']);
+        return $this->executor->selectRaw($sql, $params);
     }
 
     public function selectOneRaw(string|Expression $sql, array $params = []): ?array
     {
-        $query = $this->rawQuery($sql, $params);
-
-        return $this->runQueryOne($query['sql'], $query['params']);
+        return $this->executor->selectOneRaw($sql, $params);
     }
 
     /** 原生 INSERT/UPDATE/DELETE/DDL；SELECT 请使用 selectRaw() 以获取结果。 */
     public function executeRaw(string|Expression $sql, array $params = []): int
     {
-        $query = $this->rawQuery($sql, $params);
-
-        return $this->runExecute($query['sql'], $query['params']);
-    }
-
-    /** @return array{sql: string, params: array<string, mixed>} */
-    private function rawQuery(string|Expression $sql, array $params): array
-    {
-        if ($sql instanceof Expression) {
-            if ($params !== []) {
-                throw new \InvalidArgumentException('Expression 已携带参数，不要再传 $params');
-            }
-            $query = $sql->build();
-            $this->assertNamedParams($query['sql'], $query['params']);
-            foreach ($query['params'] as $value) {
-                if (!is_scalar($value) && $value !== null) {
-                    throw new \InvalidArgumentException('原生 SQL 参数值必须是标量或 null');
-                }
-            }
-
-            return $query;
-        }
-        if (trim($sql) === '') {
-            throw new \InvalidArgumentException('原生 SQL 不能为空');
-        }
-        $this->assertNamedParams($sql, $params);
-        foreach ($params as $value) {
-            if (!is_scalar($value) && $value !== null) {
-                throw new \InvalidArgumentException('原生 SQL 参数值必须是标量或 null');
-            }
-        }
-
-        return ['sql' => $sql, 'params' => $params];
-    }
-
-    private function assertNamedParams(string $sql, array $params): void
-    {
-        foreach ($params as $key => $_) {
-            if (!is_string($key) || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $key) !== 1) {
-                throw new \InvalidArgumentException('原生 SQL 参数必须使用命名占位符');
-            }
-        }
-        // 用于识别命名占位符的状态机：忽略字符串、标识符、注释、PG dollar quote 和 :: 类型转换。
-        $used = [];
-        $length = strlen($sql);
-        $state = 'sql';
-        for ($i = 0; $i < $length; $i++) {
-            $char = $sql[$i];
-            $next = $sql[$i + 1] ?? '';
-            if ($state !== 'sql') {
-                if (str_starts_with($state, '$')) {
-                    if (substr($sql, $i, strlen($state)) === $state) {
-                        $i += strlen($state) - 1;
-                        $state = 'sql';
-                    }
-                    continue;
-                }
-                if ($state === 'line') {
-                    if ($char === "\n" || $char === "\r") {
-                        $state = 'sql';
-                    }
-                    continue;
-                }
-                if ($state === 'block') {
-                    if ($char === '*' && $next === '/') {
-                        $state = 'sql';
-                        $i++;
-                    }
-                    continue;
-                }
-                if ($char === $state) {
-                    if ($next === $char && $state !== '`') {
-                        $i++;
-                    } else {
-                        $state = 'sql';
-                    }
-                }
-                continue;
-            }
-            if ($char === '$' && preg_match('/\$([A-Za-z_][A-Za-z0-9_]*)?\$/', substr($sql, $i), $match) === 1) {
-                $state = $match[0];
-                $i += strlen($state) - 1;
-            } elseif ($char === "'" || $char === '"' || $char === '`') {
-                $state = $char;
-            } elseif ($char === '-' && $next === '-') {
-                $state = 'line';
-                $i++;
-            } elseif ($char === '#') {
-                $state = 'line';
-            } elseif ($char === '/' && $next === '*') {
-                $state = 'block';
-                $i++;
-            } elseif ($char === ':' && $next === ':') {
-                $i++;
-            } elseif ($char === ':' && preg_match('/[A-Za-z_]/', $next) === 1) {
-                $j = $i + 1;
-                while ($j + 1 < $length && preg_match('/[A-Za-z0-9_]/', $sql[$j + 1]) === 1) {
-                    $j++;
-                }
-                $used[] = substr($sql, $i + 1, $j - $i);
-                $i = $j;
-            } elseif ($char === '?') {
-                throw new \InvalidArgumentException('原生 SQL 请使用命名占位符，避免与复杂查询参数合并时错位');
-            }
-        }
-        $used = array_values(array_unique($used));
-        sort($used);
-        $provided = array_keys($params);
-        sort($provided);
-        if ($used !== $provided) {
-            throw new \InvalidArgumentException(sprintf(
-                '原生 SQL 参数不匹配，SQL 需要 [%s]，实际提供 [%s]',
-                implode(', ', $used),
-                implode(', ', $provided),
-            ));
-        }
+        return $this->executor->executeRaw($sql, $params);
     }
 
     private function assertLockSupported(string $sql): void
     {
-        if ($this->connection instanceof DriverAwareConnection
-            && $this->driver() === 'sqlite'
-            && preg_match('/\bFOR\s+(UPDATE|SHARE)\b/i', $sql) === 1) {
-            throw new \LogicException('SQLite 不支持 FOR UPDATE / FOR SHARE，请使用事务');
-        }
+        $this->executor->assertLockSupported($sql);
     }
 
     /**
@@ -1113,525 +805,78 @@ final class EntityGateway
      */
     public function upsert(string $class, array $values, ?array $updateColumns = null, ?array $conflictColumns = null): int
     {
-        $meta = $this->metadata->read($class);
-        $this->assertVersionWrite($meta, 'UPSERT');
-        if ($values === []) {
-            throw new \InvalidArgumentException('UPSERT 至少需要一个字段');
-        }
-        $fields = [];
-        foreach ($meta->fields as $field) {
-            $fields[$field->property] = $field;
-            $fields[$field->column] = $field;
-        }
-        $resolve = static function (string $name) use ($fields, $class): FieldMeta {
-            return $fields[$name] ?? throw new \InvalidArgumentException($class . ' 未知字段: ' . $name);
-        };
-        $conflictColumns ??= $meta->primaryColumns();
-        if ($conflictColumns === []) {
-            throw new \InvalidArgumentException('UPSERT 必须指定冲突键');
-        }
-        $conflicts = [];
-        foreach ($conflictColumns as $column) {
-            $field = $resolve($column);
-            $conflicts[$field->column] = $field;
-        }
-        $insert = [];
-        foreach ($values as $column => $value) {
-            if (!is_string($column)) {
-                throw new \InvalidArgumentException('UPSERT 字段名必须是字符串');
-            }
-            $field = $resolve($column);
-            if (isset($insert[$field->column])) {
-                throw new \InvalidArgumentException('UPSERT 字段重复: ' . $field->column);
-            }
-            if ($field->generated && !isset($conflicts[$field->column])) {
-                throw new IdentityException($class . ' 代理键只有作为显式 UPSERT 冲突键时才可写入');
-            }
-            $insert[$field->column] = $this->toDbValue($meta, $field, $value);
-        }
-        foreach ($conflicts as $column => $_) {
-            if (!array_key_exists($column, $insert)) {
-                throw new IdentityException($class . ' UPSERT 缺少冲突键 ' . $column);
-            }
-        }
-        $updates = [];
-        $createdAtField = $meta->timestampField('created_at');
-        $createdAt = $createdAtField === null ? [] : [$createdAtField->column];
-        foreach (['created_at', 'updated_at'] as $timestamp) {
-            $field = $meta->timestampField($timestamp);
-            if ($field !== null && !array_key_exists($field->column, $insert)) {
-                $insert[$field->column] = $this->toDbValue($meta, $field, $this->currentTimestamp($field));
-            }
-        }
-        foreach ($meta->fields as $field) {
-            if (!array_key_exists($field->column, $insert) && !$field->generated && !$field->nullable()) {
-                throw new IdentityException($class . ' UPSERT 缺少非空字段 ' . $field->column);
-            }
-        }
-        if ($updateColumns !== []) {
-            $updateColumns ??= array_values(array_diff(
-                array_keys($insert),
-                array_keys($conflicts),
-                // 创建时间只在插入时写入；即使显式传值，冲突更新也不覆盖。
-                $createdAt,
-            ));
-            $updateColumns = array_values(array_diff($updateColumns, $createdAt));
-            if ($updateColumns !== []) {
-                $updateColumns = array_map(
-                    static fn (string $column): string => $resolve($column)->column,
-                    $updateColumns,
-                );
-                $updatedAt = $meta->timestampField('updated_at')?->column;
-                if ($updatedAt !== null
-                    && $updateColumns !== [$updatedAt]
-                    && !in_array($updatedAt, $updateColumns, true)) {
-                    $updateColumns[] = $updatedAt;
-                }
-            }
-            foreach ($updateColumns as $column) {
-                $field = $resolve($column);
-                if (isset($conflicts[$field->column]) || $field->generated) {
-                    throw new \InvalidArgumentException('UPSERT 不允许更新冲突键或生成列: ' . $field->column);
-                }
-                if (!array_key_exists($field->column, $insert)) {
-                    throw new \InvalidArgumentException('UPSERT 更新字段没有输入值: ' . $field->column);
-                }
-                $updates[$field->column] = $field;
-            }
-        }
-        if ($updateColumns === null && $updates === []) {
-            throw new \InvalidArgumentException('UPSERT 没有可更新字段；如需冲突时忽略请传 $updateColumns=[]');
-        }
-        $columns = array_keys($insert);
-        $sql = sprintf(
-            'INSERT INTO %s (%s) VALUES (%s)',
-            $this->quote($meta->table),
-            implode(', ', array_map($this->quote(...), $columns)),
-            implode(', ', array_map(static fn (string $column): string => ':upsert_' . $column, $columns)),
-        );
-        $params = [];
-        foreach ($insert as $column => $value) {
-            $params['upsert_' . $column] = $value;
-        }
-        if ($this->driver() === 'mysql') {
-            $sql .= ' ON DUPLICATE KEY UPDATE ';
-            if ($updates === []) {
-                $first = array_key_first($conflicts);
-                $sql .= $this->quote($first) . ' = ' . $this->quote($first);
-            } else {
-                $sets = [];
-                foreach ($updates as $column => $_) {
-                    $sets[] = $this->quote($column) . ' = VALUES(' . $this->quote($column) . ')';
-                }
-                $sql .= implode(', ', $sets);
-            }
-        } else {
-            $sql .= ' ON CONFLICT (' . implode(', ', array_map($this->quote(...), array_keys($conflicts))) . ')';
-            if ($updates === []) {
-                $sql .= ' DO NOTHING';
-            } else {
-                $sets = [];
-                foreach ($updates as $column => $_) {
-                    $sets[] = $this->quote($column) . ' = excluded.' . $this->quote($column);
-                }
-                $sql .= ' DO UPDATE SET ' . implode(', ', $sets);
-            }
-        }
-        $affected = $this->runExecute($sql, $params, $meta->class);
-        $this->cache->clearClass($class);
-
-        return $affected;
+        return $this->bulk->upsert($class, $values, $updateColumns, $conflictColumns);
     }
 
     /** @throws \Throwable */
     public function transaction(callable $func): mixed
     {
-        $this->assertConnectionUsable();
-        $ctx = Session::context();
-        if ($this->inTransactionByContext[$ctx] ?? false) {
-            return $func();
-        }
-
-        Session::clearRollbackStatus($ctx);
-        if ($this->confirmedRollbacks !== null) {
-            unset($this->confirmedRollbacks[$ctx]);
-        }
-        $this->inTransactionByContext[$ctx] = true;
-        if (!isset($this->txnCacheSnapshots[$ctx])) {
-            $this->txnCacheSnapshots[$ctx] = $this->captureTransactionCache();
-        }
-        $this->txnStatesByContext[$ctx] = $this->txnStatesByContext[$ctx] ?? $this->newTransactionStates();
-        $this->txnIdentityStates[$ctx] = $this->txnIdentityStates[$ctx] ?? [];
-        $this->txnNewIdentities[$ctx] = [];
-        foreach ($this->txnCacheSnapshots[$ctx]['entities'] as $entity) {
-            $this->rememberEntity($entity);
-        }
-        $startedAt = $this->clock->now();
-        $this->txnStartedAt[$ctx] = $startedAt;
-        $begun = false;
-        $committed = false;
-        $rolledBack = false;
-        $discardConfirmed = false;
-        $failure = null;
-        $transactionFailure = null;
-        $rollbackFailure = null;
-        $rollbackAttempted = false;
-        $discardAttempted = false;
-        $commitAttempted = false;
-        $result = null;
-        try {
-            try {
-                Session::claimConnection($this, $ctx);
-            try {
-                if (!$this->connection->beginTransaction()) {
-                    throw new \RuntimeException('数据库事务开始失败');
-                }
-                $begun = true;
-            } catch (\Throwable $e) {
-                $failure = $e;
-                $this->invalidateConnection();
-                $transactionFailure = new TransactionException('开始', null, $e);
-                $this->observeTransaction('begin', $ctx, $startedAt, $transactionFailure);
-                throw $transactionFailure;
-            }
-            $this->observeTransaction('begin', $ctx, $startedAt);
-            } catch (\Throwable $e) {
-                Session::releaseConnection($this, $ctx);
-                if ($e instanceof TransactionException) {
-                    throw $e;
-                }
-                throw $e;
-            }
-
-            try {
-                $result = $func();
-                $this->rememberCachedEntities();
-                if (Session::currentContext() !== $ctx) {
-                    throw new \LogicException('事务回调不能切换 Fiber/协程上下文后提交');
-                }
-                if (!isset($this->inTransactionByContext[$ctx])) {
-                    if (!Session::rollbackConfirmed($ctx)) {
-                        $this->invalidateConnection();
-                        throw new \LogicException('事务期间 Session 已被清理，不能继续提交；该连接已禁止复用');
-                    }
-                    $discardConfirmed = true;
-                    throw new \LogicException('事务期间 Session 已被清理，操作已回滚，不能继续提交');
-                }
-                $commitAttempted = true;
-                if (!$this->connection->commit()) {
-                    throw new \RuntimeException('数据库事务提交失败');
-                }
-                $committed = true;
-            } catch (\Throwable $e) {
-                $failure = $e;
-                if ($e instanceof TransactionException && !isset($this->inTransactionByContext[$ctx])) {
-                    $rollbackAttempted = true;
-                    $discardAttempted = true;
-                    $rollbackFailure = $e;
-                    throw $e;
-                }
-                if ($commitAttempted) {
-                    $this->observeTransaction('commit', $ctx, $startedAt, $e);
-                }
-                $discardAttempted = Session::rollbackAttempted($ctx);
-                if (isset($this->inTransactionByContext[$ctx]) && !$discardAttempted) {
-                    $rollbackAttempted = true;
-                    try {
-                        if (!$this->connection->rollback()) {
-                            throw new \RuntimeException('数据库事务回滚失败');
-                        }
-                        $rolledBack = true;
-                        if (!$commitAttempted) {
-                            $this->restoreTransaction($ctx);
-                        }
-                    } catch (\Throwable $rollbackError) {
-                        $rollbackFailure = $rollbackError;
-                        $this->invalidateConnection();
-                    }
-                }
-                if (($rolledBack || $discardConfirmed) && !$commitAttempted) {
-                    throw $failure;
-                }
-                $this->invalidateConnection();
-                $transactionFailure = new TransactionException(
-                    $commitAttempted ? '提交' : '回滚',
-                    $commitAttempted ? null : $failure,
-                    !$commitAttempted && $rollbackFailure !== null ? $rollbackFailure : $failure,
-                );
-                if ($rollbackAttempted) {
-                    $rollbackFailure = $transactionFailure;
-                }
-                throw $transactionFailure;
-            }
-        } finally {
-            if ($begun && !$committed && !$rolledBack && !$discardConfirmed) {
-                $this->invalidateConnection();
-            }
-            if (!$begun && $failure !== null) {
-                $this->invalidateConnection();
-                $this->cache->forgetKnown();
-            }
-            if ($begun && !$committed && $rollbackAttempted && !$discardAttempted) {
-                $this->observeTransaction('rollback', $ctx, $startedAt, $rolledBack ? null : $rollbackFailure);
-            }
-            Session::releaseConnection($this, $ctx);
-            $this->clearTransaction($ctx);
-            if ($committed) {
-                $this->observeTransaction('commit', $ctx, $startedAt);
-            }
-        }
-
-        return $result;
+        return $this->transactions->run($this, $func);
     }
 
     /** @internal 由 Session::discard() 调用，回滚并解除当前上下文的事务所有权。 */
     public function releaseContext(Context $context): void
     {
-        $active = $this->inTransactionByContext[$context] ?? false;
-        $startedAt = $active
-            ? ($this->txnStartedAt[$context] ?? $this->clock->now())
-            : $this->clock->now();
-        $failure = null;
-        $transactionFailure = null;
-        try {
-            if ($active) {
-                if (!$this->connection->rollback()) {
-                    throw new \RuntimeException('数据库事务回滚失败');
-                }
-                $this->restoreTransaction($context);
-                $this->confirmedRollbacks ??= new \WeakMap();
-                $this->confirmedRollbacks[$context] = true;
-            }
-        } catch (\Throwable $e) {
-            $failure = $e;
-            $transactionFailure = new TransactionException('回滚', null, $e);
-        } finally {
-            if ($transactionFailure !== null) {
-                $this->invalidateConnection();
-            }
-            $this->clearTransaction($context);
-            if ($active) {
-                $this->observeTransaction('rollback', $context, $startedAt, $transactionFailure);
-            }
-            Session::releaseConnection($this, $context);
-        }
-        if ($transactionFailure !== null) {
-            throw $transactionFailure;
-        }
+        $this->transactions->releaseContext($this, $context);
     }
 
     /** @internal Session 在清理事务状态之后读取一次确认标记。 */
     public function rollbackWasConfirmed(Context $context): bool
     {
-        return $this->confirmedRollbacks !== null && isset($this->confirmedRollbacks[$context]);
+        return $this->transactions->rollbackWasConfirmed($context);
     }
 
     /** @internal Session::use() 也必须拒绝复用提交结果未知的连接。 */
     public function assertSessionUsable(): void
     {
-        $this->assertConnectionUsable();
+        $this->executor->assertConnectionUsable();
     }
 
     /** @internal 隐式换绑不能代替调用方决定未结束事务的回滚与失败处理。 */
     public function assertSessionReplaceable(Context $context): void
     {
-        if ($this->inTransactionByContext[$context] ?? false) {
-            throw new \LogicException('当前 Session 存在未结束事务，禁止换绑；请先显式 discard 并处理回滚结果');
-        }
+        $this->transactions->assertSessionReplaceable($context);
     }
 
     /** @internal discard() 应继续清理失败 Session，但禁止监听器重入清理。 */
     public function assertObservationBoundary(): void
     {
-        if (self::$observingConnections !== null && isset(self::$observingConnections[$this->connection])) {
-            throw new \LogicException('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期');
-        }
-    }
-
-    /** 每个 SQL 入口统一检查，包含 MySQL 条件 DELETE 的预查和原生 SQL。 */
-    private function assertConnectionUsable(): void
-    {
-        if (self::$failedConnections !== null && isset(self::$failedConnections[$this->connection])) {
-            throw new \LogicException(self::$failedConnections[$this->connection]);
-        }
-        if (self::$observingConnections !== null && isset(self::$observingConnections[$this->connection])) {
-            throw new \LogicException('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期');
-        }
-    }
-
-    private function invalidateConnection(): void
-    {
-        self::$failedConnections ??= new \WeakMap();
-        self::$failedConnections[$this->connection] = '数据库开始、提交或回滚结果未知，禁止复用当前连接；请丢弃该连接、Gateway 和关联实体';
-        $this->cache->flush();
-        $this->cache->forgetKnown();
-    }
-
-    private function clearTransaction(Context $context): void
-    {
-        unset(
-            $this->inTransactionByContext[$context],
-            $this->txnStatesByContext[$context],
-            $this->txnIdentityStates[$context],
-            $this->txnNewIdentities[$context],
-            $this->txnCacheSnapshots[$context],
-            $this->txnStartedAt[$context],
-        );
-    }
-
-    private function restoreTransaction(Context $context): void
-    {
-        foreach ($this->cache->known() as $entity) {
-            $this->rememberEntity($entity, $context);
-        }
-        foreach ($this->txnStatesByContext[$context] ?? [] as $entity => $state) {
-            /**
-             * @var $entity Entity
-             */
-            $entity->restoreState($state, $this->metadata->read($entity::class));
-        }
-        $snapshot = $this->txnCacheSnapshots[$context] ?? null;
-        if ($snapshot !== null) {
-            $this->cache->restoreSnapshot($snapshot);
-        }
-        $cachedKeys = $snapshot === null ? [] : array_fill_keys(array_keys($snapshot['items']), true);
-        foreach ($this->txnStatesByContext[$context] ?? [] as $entity => $state) {
-            if ($state['new']) {
-                continue;
-            }
-            $meta = $this->metadata->read($entity::class);
-            $parts = [];
-            foreach ($meta->primaryKey as $field) {
-                $parts[$field->column] = $this->caster->toDb($meta->class, $field, $entity->{$field->property});
-            }
-            if (!isset($cachedKeys[$this->cache->setKey($entity, $parts)])) {
-                $this->cache->set($entity, $parts);
-            }
-        }
-    }
-
-    private function rememberCachedEntities(): void
-    {
-        foreach ($this->cache->snapshot() as $entity) {
-            $this->rememberEntity($entity);
-        }
-    }
-
-    /** @return array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, keys: list<string>, entities: list<Entity>} */
-    private function captureTransactionCache(): array
-    {
-        /** @var array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, keys: list<string>, entities: list<Entity>} $snapshot */
-        $snapshot = $this->cache->transactionSnapshot();
-        $snapshot['entities'] = array_values(array_merge($snapshot['items'], $this->cache->known()));
-
-        return $snapshot;
-    }
-
-    /** @return \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}> */
-    private function newTransactionStates(): \WeakMap
-    {
-        /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}> $states */
-        $states = new \WeakMap();
-
-        return $states;
-    }
-
-    private function rememberEntity(Entity $entity, ?Context $transactionContext = null): void
-    {
-        $context = $transactionContext ?? Session::context();
-        if (!($this->inTransactionByContext[$context] ?? false)) {
-            return;
-        }
-        /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}> $states */
-        $states = $this->txnStatesByContext[$context] ?? $this->newTransactionStates();
-        if (isset($states[$entity])) {
-            if ($entity->isNew()) {
-                $this->pendingInsertStates ??= new \WeakMap();
-                $this->pendingInsertStates[$entity] = $states[$entity];
-            }
-
-            return;
-        }
-        $meta = $this->metadata->read($entity::class);
-        $pending = $this->txnNewIdentities[$context] ?? [];
-        $identities = $this->txnIdentityStates[$context] ?? [];
-        $key = $this->identityComplete($entity)
-            ? \Pixiaoka\Orm\Cache\RowCache::key($entity::class, $this->identityOf($entity, $meta)->parts)
-            : null;
-        if ($entity->isNew() || $key === null || !isset($pending[$key])) {
-            if (!$entity->isNew()) {
-                $identities[$key] ??= $entity->captureState($meta);
-                $this->txnIdentityStates[$context] = $identities;
-                $states[$entity] = $identities[$key];
-            } else {
-                $states[$entity] = $entity->captureState($meta);
-                $this->pendingInsertStates ??= new \WeakMap();
-                $this->pendingInsertStates[$entity] = $states[$entity];
-            }
-            $this->txnStatesByContext[$context] = $states;
-
-            return;
-        }
-        $states[$entity] = $identities[$key] ?? ['new' => true, 'original' => [], 'values' => $entity->captureState($meta)['values']];
-        $this->txnStatesByContext[$context] = $states;
-    }
-
-    private function observeTransaction(string $phase, Context $context, float $started, ?\Throwable $exception = null): void
-    {
-        $this->dispatchObserved(fn () => $this->events->dispatch(new TransactionEvent(
-            $phase,
-            $this->contextInfo($context),
-            max(0.0, $this->clock->now() - $started),
-            $exception === null,
-            $exception === null ? null : $exception::class,
-        )));
+        $this->executor->assertObservationBoundary();
     }
 
     /** 事件同步发送，但连接级隔离禁止监听器重入 ORM；监听器异常仍由 Dispatcher 隔离。 */
     private function dispatchObserved(callable $dispatch): void
     {
-        if (!$this->events->hasListeners()) {
-            return;
-        }
-        self::$observingConnections ??= new \WeakMap();
-        $depth = (self::$observingConnections[$this->connection] ?? 0) + 1;
-        self::$observingConnections[$this->connection] = $depth;
-        try {
-            Session::observe($dispatch);
-        } finally {
-            if ($depth === 1) {
-                unset(self::$observingConnections[$this->connection]);
-            } else {
-                self::$observingConnections[$this->connection] = $depth - 1;
-            }
-        }
+        $this->executor->dispatchObserved($dispatch);
     }
 
     // ---- 查询执行 —— 带缓存 ----
 
     /** @return list<Entity> */
-    public function executeQuery(string $class, array $query, array $relations = [], bool $cache = true): array
+    public function executeQuery(string $class, array $query, array $relations = [], bool|string $cache = true): array
     {
         $this->assertLockSupported($query['sql']);
         $meta = $this->metadata->read($class);
+        $cacheSoftDeleteMode = is_string($cache) ? $cache : 'default';
+        $cacheEnabled = $cache !== false;
         $cacheSnapshot = $relations !== [] ? $this->cache->transactionSnapshot() : null;
         $rows = $this->runQueryAll($query['sql'], $query['params'], $class);
         $entities = [];
         foreach ($rows as $row) {
             $entity = $this->hydrate($meta, $row);
             $this->forEntity($entity);
-            $this->rememberEntity($entity);
-            if ($cache && $relations === []) {
-                $this->cacheSet($entity);
+            $this->transactions->rememberEntity($entity);
+            if ($cacheEnabled && $relations === []) {
+                $this->cacheSet($entity, softDeleteMode: $cacheSoftDeleteMode);
             }
             $entities[] = $entity;
         }
         if ($relations !== []) {
             try {
                 $this->loadRelations($entities, $relations);
-                if ($cache) {
+                if ($cacheEnabled) {
                     foreach ($entities as $entity) {
-                        $this->cacheSet($entity);
+                        $this->cacheSet($entity, softDeleteMode: $cacheSoftDeleteMode);
                     }
                 }
             } catch (\Throwable $e) {
@@ -1644,7 +889,7 @@ final class EntityGateway
     }
 
     /** @return Entity|null */
-    public function executeQueryOne(string $class, array $query, array $relations = []): ?Entity
+    public function executeQueryOne(string $class, array $query, array $relations = [], string $cacheSoftDeleteMode = 'default'): ?Entity
     {
         $this->assertLockSupported($query['sql']);
         $meta = $this->metadata->read($class);
@@ -1656,13 +901,13 @@ final class EntityGateway
 
         $entity = $this->hydrate($meta, $row);
         $this->forEntity($entity);
-        $this->rememberEntity($entity);
+        $this->transactions->rememberEntity($entity);
         if ($relations === []) {
-            $this->cacheSet($entity);
+            $this->cacheSet($entity, softDeleteMode: $cacheSoftDeleteMode);
         } else {
             try {
                 $this->loadRelations([$entity], $relations);
-                $this->cacheSet($entity);
+                $this->cacheSet($entity, softDeleteMode: $cacheSoftDeleteMode);
             } catch (\Throwable $e) {
                 $this->cache->restoreSnapshot($cacheSnapshot);
                 throw $e;
@@ -1809,19 +1054,12 @@ final class EntityGateway
         return $value;
     }
 
-    private function assertVersionWrite(ModelMeta $meta, string $operation): void
-    {
-        if ($meta->version !== null) {
-            throw new \LogicException($meta->class . " 使用乐观锁，$operation 无法保留逐实体版本语义；请逐实体 save/delete");
-        }
-    }
-
     /** 创建时间仅在未设置时填充，显式提供的值不被覆盖。 */
     private function fillTimestamp(Entity $entity, ModelMeta $meta, string $role): void
     {
         $field = $meta->timestampField($role);
         if ($field !== null && !$entity->propSet($field->property)) {
-            $entity->{$field->property} = $this->currentTimestamp($field);
+            $entity->{$field->property} = $this->caster->currentTimestamp($field);
         }
     }
 
@@ -1839,22 +1077,13 @@ final class EntityGateway
         $property = $field->property;
         if ($entity->propSet($property)
             && array_key_exists($property, $original)
-            && $entity->{$property} != $original[$property]) {
+            && !$this->fieldValuesEqual($meta, $field, $entity->{$property}, $original[$property])) {
             return;
         }
-        $entity->{$property} = $this->currentTimestamp($field);
+        $entity->{$property} = $this->caster->currentTimestamp($field);
     }
 
-    private function currentTimestamp(FieldMeta $field, ?int $now = null): int|DateTimeImmutable
-    {
-        if ($field->typeName() === 'int') {
-            return $now ?? time();
-        }
-
-        return (new DateTimeImmutable('@' . ($now ?? time())))->setTimezone(new \DateTimeZone('UTC'));
-    }
-
-    private function cacheSet(Entity $entity, bool $inserted = false): void
+    private function cacheSet(Entity $entity, bool $inserted = false, string $softDeleteMode = 'default'): void
     {
         $meta = $this->metadata->read($entity::class);
         $parts = [];
@@ -1866,19 +1095,21 @@ final class EntityGateway
         if (count($parts) !== count($meta->primaryKey)) {
             return;
         }
+        $cached = $this->cache->get($entity::class, $parts);
+        if ($cached !== null && $cached !== $entity) {
+            $softDelete = $meta->softDeleteField();
+            if ($softDelete !== null && $cached->propSet($softDelete->property)) {
+                $visibility = $cached->{$softDelete->property} === null ? 'default' : 'only';
+                if ($softDeleteMode !== 'with' && $visibility !== $softDeleteMode) {
+                    // 旧缓存对象代表同一个数据库身份，不让一次不同范围的查询回退其已知状态。
+                    return;
+                }
+            }
+        }
 
-        $this->rememberEntity($entity);
-        $context = Session::context();
-        if ($inserted && ($this->inTransactionByContext[$context] ?? false)) {
-            $key = \Pixiaoka\Orm\Cache\RowCache::key($entity::class, $parts);
-            $baseline = $this->txnIdentityStates[$context][$key] ?? null;
-            $states = $this->txnStatesByContext[$context] ?? $this->newTransactionStates();
-            $states[$entity] = $baseline ?? ($this->pendingInsertStates[$entity] ?? $entity->captureState($meta));
-            $this->txnStatesByContext[$context] = $states;
-            $new = $this->txnNewIdentities[$context] ?? [];
-            $new[$key] ??= [];
-            $new[$key][] = $baseline;
-            $this->txnNewIdentities[$context] = $new;
+        $this->transactions->rememberEntity($entity);
+        if ($inserted) {
+            $this->transactions->recordInsertedIdentity($entity, $meta, $parts);
         }
         $this->cache->set($entity, $parts);
     }
@@ -1893,94 +1124,20 @@ final class EntityGateway
         return $this->connection->quoteIdentifier($identifier);
     }
 
-    private function contextInfo(Context $context): ContextInfo
-    {
-        return new ContextInfo(
-            $context->type(),
-            spl_object_id($context),
-        );
-    }
-
-    /** @return list<string> 只收集键名，不读取、复制或序列化任何参数值。 */
-    private function parameterNames(array $params): array
-    {
-        return array_map(
-            static fn (int|string $name): string => is_int($name) ? (string) ($name + 1) : ltrim($name, ':'),
-            array_keys($params),
-        );
-    }
-
     private function runExecute(string $sql, array $params, ?string $model = null): int
     {
-        $this->assertConnectionUsable();
-        $started = $this->clock->now();
-        try {
-            $affected = $this->connection->execute($sql, $params);
-            $this->observeSql($sql, $params, $model, $started, $affected, null);
-
-            return $affected;
-        } catch (\Throwable $e) {
-            $this->observeSql($sql, $params, $model, $started, null, null, $e);
-            throw $e;
-        }
+        return $this->executor->execute($sql, $params, $model);
     }
 
     /** @return list<array<string, mixed>> */
     private function runQueryAll(string $sql, array $params, ?string $model = null): array
     {
-        $this->assertConnectionUsable();
-        $started = $this->clock->now();
-        try {
-            $rows = $this->connection->queryAll($sql, $params);
-            $this->observeSql($sql, $params, $model, $started, null, count($rows));
-
-            return $rows;
-        } catch (\Throwable $e) {
-            $this->observeSql($sql, $params, $model, $started, null, null, $e);
-            throw $e;
-        }
+        return $this->executor->queryAll($sql, $params, $model);
     }
 
     /** @return array<string, mixed>|null */
     private function runQueryOne(string $sql, array $params, ?string $model = null): ?array
     {
-        $this->assertConnectionUsable();
-        $started = $this->clock->now();
-        try {
-            $row = $this->connection->queryOne($sql, $params);
-            $this->observeSql($sql, $params, $model, $started, null, $row === null ? 0 : 1);
-
-            return $row;
-        } catch (\Throwable $e) {
-            $this->observeSql($sql, $params, $model, $started, null, null, $e);
-            throw $e;
-        }
-    }
-
-    private function observeSql(
-        string $sql,
-        array $params,
-        ?string $model,
-        float $started,
-        ?int $affected,
-        ?int $rows,
-        ?\Throwable $exception = null,
-    ): void {
-        if (!$this->events->hasListeners()) {
-            return;
-        }
-        $operation = strtoupper(strtok(ltrim($sql), " \t\r\n(") ?: 'SQL');
-        $this->dispatchObserved(fn () => $this->events->dispatch(new SqlEvent(
-            $sql,
-            $operation,
-            $model,
-            $this->contextInfo(Session::context()),
-            max(0.0, $this->clock->now() - $started),
-            $exception === null,
-            $this->parameterNames($params),
-            $affected,
-            $rows,
-            $exception === null ? null : $exception::class,
-        )));
+        return $this->executor->queryOne($sql, $params, $model);
     }
 }

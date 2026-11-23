@@ -9,14 +9,18 @@ use Pixiaoka\Orm\Annotation\CreatedAt;
 use Pixiaoka\Orm\Annotation\UpdatedAt;
 use Pixiaoka\Orm\Cast\Decimal;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
+use Pixiaoka\Orm\Annotation\SoftDelete;
 use Pixiaoka\Orm\Annotation\Temporal;
 use Pixiaoka\Orm\Annotation\Version;
+use Pixiaoka\Orm\Cast\Castable;
 use Pixiaoka\Orm\Annotation\BelongsTo;
 use Pixiaoka\Orm\Annotation\HasMany;
 use Pixiaoka\Orm\Annotation\HasOne;
+use Pixiaoka\Orm\Annotation\Index;
 use Pixiaoka\Orm\Annotation\Relation as RelationAnnotation;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Exception\MetadataException;
+use Pixiaoka\Orm\Schema\IndexSchema;
 use ReflectionClass;
 use ReflectionMethod;
 use ReflectionNamedType;
@@ -27,6 +31,49 @@ use ReflectionProperty;
  */
 final class MetadataReader
 {
+    public const int CACHE_VERSION = 1;
+
+    /** @var array<class-string<Entity>, array<string, mixed>> */
+    private array $compiled = [];
+
+    /**
+     * @param array{version?: int, models?: array<class-string<Entity>, array<string, mixed>>} $cache
+     *        可由 var_export() 写入 PHP 文件，并在部署时一次性加载。
+     */
+    public function __construct(array $cache = [])
+    {
+        if ($cache !== []) {
+            $this->import($cache);
+        }
+    }
+
+    /** @return array{version: int, models: array<class-string<Entity>, array<string, mixed>>} */
+    public function export(): array
+    {
+        return ['version' => self::CACHE_VERSION, 'models' => $this->compiled];
+    }
+
+    /** @param array{version?: int, models?: array<class-string<Entity>, array<string, mixed>>} $cache */
+    public function import(array $cache): void
+    {
+        if (($cache['version'] ?? null) !== self::CACHE_VERSION) {
+            throw new MetadataException('元数据缓存版本不兼容，请重新生成');
+        }
+        if (!isset($cache['models']) || !is_array($cache['models'])) {
+            throw new MetadataException('元数据缓存缺少 models');
+        }
+        $compiled = [];
+        foreach ($cache['models'] as $class => $model) {
+            if (!is_string($class) || !is_subclass_of($class, Entity::class) || !is_array($model)) {
+                throw new MetadataException('元数据缓存包含无效模型');
+            }
+            $compiled[$class] = $model;
+        }
+        $this->cache = [];
+        $this->relationCache = [];
+        $this->validatedRelations = [];
+        $this->compiled = $compiled;
+    }
     /** @var array<class-string, ModelMeta> */
     private array $cache = [];
 
@@ -47,6 +94,9 @@ final class MetadataReader
 
         if (!is_subclass_of($class, Entity::class)) {
             throw new MetadataException($class . ' 必须继承 Pixiaoka\Orm\\Entity');
+        }
+        if (isset($this->compiled[$class])) {
+            return $this->cache[$class] = $this->hydrate($class, $this->compiled[$class]);
         }
 
         $reflection = new ReflectionClass($class);
@@ -97,14 +147,44 @@ final class MetadataReader
         }
         $timestamps = $this->timestamps($class, $reflection, $byProperty);
 
+        $version = $this->version($class, $reflection, $byProperty, $timestamps);
+        $softDelete = $this->softDelete($class, $reflection, $byProperty, $timestamps, $version);
+        $indexes = $this->indexes($class, $reflection, $byProperty);
+        $identityKind = $generated === [] ? 'natural' : 'surrogate';
+        $this->compiled[$class] = [
+            'table' => $table,
+            'fields' => array_map(static fn (FieldMeta $field): array => [
+                'property' => $field->property,
+                'column' => $field->column,
+                'type' => $field->typeName(),
+                'nullable' => $field->nullable(),
+                'primary' => $field->primary,
+                'generated' => $field->generated,
+                'order' => $field->order,
+                'temporal' => $field->temporal,
+            ], $byProperty),
+            'primaryKey' => array_map(static fn (FieldMeta $field): string => $field->property, $primary),
+            'identityKind' => $identityKind,
+            'timestamps' => $timestamps,
+            'version' => $version,
+            'softDelete' => $softDelete,
+            'indexes' => array_map(static fn (IndexSchema $index): array => [
+                'name' => $index->name,
+                'columns' => $index->columns,
+                'unique' => $index->unique,
+            ], $indexes),
+        ];
+
         return $this->cache[$class] = new ModelMeta(
             $class,
             $table,
             $byProperty,
             $primary,
-            $generated === [] ? 'natural' : 'surrogate',
+            $identityKind,
             $timestamps,
-            $this->version($class, $reflection, $byProperty, $timestamps),
+            $version,
+            $softDelete,
+            $indexes,
         );
     }
 
@@ -277,6 +357,77 @@ final class MetadataReader
         return $version;
     }
 
+    /**
+     * @param class-string<Entity> $class
+     * @param ReflectionClass<Entity> $reflection
+     * @param array<string, FieldMeta> $fields
+     * @param array{created_at?: string, updated_at?: string} $timestamps
+     */
+    private function softDelete(
+        string $class,
+        ReflectionClass $reflection,
+        array $fields,
+        array $timestamps,
+        ?string $version,
+    ): ?string {
+        $softDelete = null;
+        foreach ($reflection->getProperties() as $property) {
+            if ($property->getAttributes(SoftDelete::class) === []) {
+                continue;
+            }
+            $name = $property->getName();
+            $field = $fields[$name] ?? throw new MetadataException("$class::$name 软删除字段必须同时声明 #[Column]");
+            if ($softDelete !== null) {
+                throw new MetadataException("$class::$name 一个模型只能声明一个软删除字段");
+            }
+            if ($field->primary || $field->generated || $name === $version || in_array($name, $timestamps, true)) {
+                throw new MetadataException("$class::$name 软删除字段不能兼任主键、生成列、版本或自动时间字段");
+            }
+            if ($field->typeName() !== \DateTimeImmutable::class || !$field->nullable()) {
+                throw new MetadataException("$class::$name 软删除字段必须是可空 DateTimeImmutable");
+            }
+            $softDelete = $name;
+        }
+
+        return $softDelete;
+    }
+
+    /**
+     * @param class-string<Entity> $class
+     * @param ReflectionClass<Entity> $reflection
+     * @param array<string, FieldMeta> $fields
+     * @return list<IndexSchema>
+     */
+    private function indexes(string $class, ReflectionClass $reflection, array $fields): array
+    {
+        $indexes = [];
+        foreach ($reflection->getAttributes(Index::class) as $attribute) {
+            $index = $attribute->newInstance();
+            if (isset($indexes[$index->name])) {
+                throw new MetadataException($class . ' 索引名称重复: ' . $index->name);
+            }
+            $columns = [];
+            foreach ($index->columns as $property) {
+                $field = $fields[$property] ?? null;
+                if ($field === null) {
+                    foreach ($fields as $candidate) {
+                        if ($candidate->column === $property) {
+                            $field = $candidate;
+                            break;
+                        }
+                    }
+                }
+                if ($field === null) {
+                    throw new MetadataException($class . ' 索引 ' . $index->name . ' 包含未知字段 ' . $property);
+                }
+                $columns[] = $field->column;
+            }
+            $indexes[$index->name] = new IndexSchema($index->name, $columns, $index->unique);
+        }
+
+        return array_values($indexes);
+    }
+
     private function field(string $class, ReflectionProperty $property, Column $column, int $declaration): FieldMeta
     {
         $type = $property->getType();
@@ -304,7 +455,8 @@ final class MetadataReader
             ? in_array($name, ['int', 'float', 'string', 'bool', 'array'], true)
             : is_a($name, \BackedEnum::class, true)
                 || $name === \DateTimeImmutable::class
-                || is_a($name, Decimal::class, true);
+                || is_a($name, Decimal::class, true)
+                || is_a($name, Castable::class, true);
         if (!$supported) {
             throw new MetadataException($class . '::' . $property->getName() . ' 不支持类型 ' . $name);
         }
@@ -321,5 +473,115 @@ final class MetadataReader
             $primary?->order ?? $declaration,
             $temporal,
         );
+    }
+
+    /**
+     * 缓存仍以实际类定义为最终校验依据，损坏或部署后过期的缓存不会静默生效。
+     *
+     * @param class-string<Entity> $class
+     * @param array<string, mixed> $model
+     */
+    private function hydrate(string $class, array $model): ModelMeta
+    {
+        try {
+            $table = $model['table'] ?? null;
+            $definitions = $model['fields'] ?? null;
+            $primaryNames = $model['primaryKey'] ?? null;
+            $identityKind = $model['identityKind'] ?? null;
+            $timestamps = $model['timestamps'] ?? null;
+            $version = $model['version'] ?? null;
+            $softDelete = $model['softDelete'] ?? null;
+            if (!is_string($table) || $table !== $class::table() || !is_array($definitions)
+                || !is_array($primaryNames) || !in_array($identityKind, ['natural', 'surrogate'], true)
+                || !is_array($timestamps) || (!is_string($version) && $version !== null)
+                || (!is_string($softDelete) && $softDelete !== null)) {
+                throw new MetadataException($class . ' 元数据缓存结构无效或已过期');
+            }
+            $reflection = new ReflectionClass($class);
+            $fields = [];
+            foreach ($definitions as $property => $definition) {
+                if (!is_string($property) || !is_array($definition)) {
+                    throw new MetadataException($class . ' 元数据缓存字段无效');
+                }
+                $type = $definition['type'] ?? null;
+                $column = $definition['column'] ?? null;
+                $nullable = $definition['nullable'] ?? null;
+                $temporal = $definition['temporal'] ?? null;
+                if (!is_string($type) || !is_string($column) || !is_bool($nullable) || !is_string($temporal)) {
+                    throw new MetadataException("$class::$property 元数据缓存字段类型无效");
+                }
+                $propertyReflection = $reflection->getProperty($property);
+                $actualType = $propertyReflection->getType();
+                if (!$actualType instanceof ReflectionNamedType || $actualType->getName() !== $type
+                    || $actualType->allowsNull() !== $nullable) {
+                    throw new MetadataException("$class::$property 元数据缓存与属性类型不一致，请重新生成");
+                }
+                foreach (['primary', 'generated'] as $flag) {
+                    if (!is_bool($definition[$flag] ?? null)) {
+                        throw new MetadataException("$class::$property 元数据缓存标记无效");
+                    }
+                }
+                if (!is_int($definition['order'] ?? null)) {
+                    throw new MetadataException("$class::$property 元数据缓存顺序无效");
+                }
+                $fields[$property] = new FieldMeta(
+                    $property,
+                    $column,
+                    $actualType,
+                    $definition['primary'],
+                    $definition['generated'],
+                    $definition['order'],
+                    $temporal,
+                );
+            }
+            $primary = [];
+            foreach ($primaryNames as $property) {
+                if (!is_string($property) || !isset($fields[$property]) || !$fields[$property]->primary) {
+                    throw new MetadataException($class . ' 元数据缓存主键无效');
+                }
+                $primary[] = $fields[$property];
+            }
+            if ($primary === [] || $fields === []) {
+                throw new MetadataException($class . ' 元数据缓存缺少字段或主键');
+            }
+            /** @var array{created_at?: string, updated_at?: string} $timestamps */
+            foreach ($timestamps as $role => $property) {
+                if (!in_array($role, ['created_at', 'updated_at'], true)
+                    || !is_string($property) || !isset($fields[$property])) {
+                    throw new MetadataException($class . ' 元数据缓存时间字段无效');
+                }
+            }
+            if ($version !== null && (!isset($fields[$version]) || $fields[$version]->primary)) {
+                throw new MetadataException($class . ' 元数据缓存版本字段无效');
+            }
+
+            if ($softDelete !== null && !isset($fields[$softDelete])) {
+                throw new MetadataException($class . ' 元数据缓存软删除字段无效');
+            }
+            $indexes = [];
+            $definitions = $model['indexes'] ?? [];
+            if (!is_array($definitions)) {
+                throw new MetadataException($class . ' 元数据缓存索引无效');
+            }
+            $columns = array_map(static fn (FieldMeta $field): string => $field->column, $fields);
+            foreach ($definitions as $definition) {
+                if (!is_array($definition) || !is_string($definition['name'] ?? null)
+                    || !is_array($definition['columns'] ?? null) || !is_bool($definition['unique'] ?? null)) {
+                    throw new MetadataException($class . ' 元数据缓存索引结构无效');
+                }
+                foreach ($definition['columns'] as $column) {
+                    if (!is_string($column) || !in_array($column, $columns, true)) {
+                        throw new MetadataException($class . ' 元数据缓存索引字段无效');
+                    }
+                }
+                $indexes[] = new IndexSchema($definition['name'], $definition['columns'], $definition['unique']);
+            }
+
+            return new ModelMeta($class, $table, $fields, $primary, $identityKind, $timestamps, $version, $softDelete, $indexes);
+        } catch (MetadataException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            throw new MetadataException($class . ' 元数据缓存无效: ' . $e->getMessage(), 0, $e);
+        }
     }
 }

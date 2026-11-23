@@ -129,18 +129,24 @@ final class Loader
         $values = $current['values'];
         $changed = [];
         foreach ($incoming['values'] as $property => $value) {
+            $field = $meta->field($property);
             // 比较“当前值是否偏离本地原值”，不能比较数据库新值与原值：
             // 外部 UPDATE 可能让二者相等，而调用方另有不等的未保存修改。
             $dirty = !array_key_exists($property, $original)
                 || !array_key_exists($property, $values)
-                || $values[$property] !== $original[$property];
+                || !$this->gateway->fieldValuesEqual($meta, $field, $values[$property], $original[$property]);
             if (!$dirty) {
                 $values[$property] = $value;
             }
             $hadOriginal = array_key_exists($property, $original);
             $hasOriginal = array_key_exists($property, $incoming['original']);
             $changed[$property] = $hadOriginal !== $hasOriginal
-                || ($hadOriginal && $hasOriginal && $original[$property] !== $incoming['original'][$property]);
+                || ($hadOriginal && $hasOriginal && !$this->gateway->fieldValuesEqual(
+                    $meta,
+                    $field,
+                    $original[$property],
+                    $incoming['original'][$property],
+                ));
         }
         $current['values'] = $values;
         $current['original'] = $incoming['original'];

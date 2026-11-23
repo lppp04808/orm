@@ -4,11 +4,15 @@ declare(strict_types=1);
 
 namespace Tests\Pixiaoka\Orm;
 
+use DateTimeImmutable;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use Pixiaoka\Orm\Annotation\Column;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
+use Pixiaoka\Orm\Annotation\UpdatedAt;
 use Pixiaoka\Orm\Annotation\Version;
+use Pixiaoka\Orm\Cast\BcDecimal;
+use Pixiaoka\Orm\Cast\Castable;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Exception\IdentityException;
 use Pixiaoka\Orm\Exception\MetadataException;
@@ -33,6 +37,8 @@ final class OrmOptimisticLockTest extends TestCase
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $this->pdo->exec('CREATE TABLE version_record (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, revision INTEGER NOT NULL)');
         $this->pdo->exec('CREATE TABLE stable_version_record (id INTEGER PRIMARY KEY, body TEXT NOT NULL, revision INTEGER NOT NULL)');
+        $this->pdo->exec('CREATE TABLE value_object_version (id INTEGER PRIMARY KEY AUTOINCREMENT, happened_at TEXT NOT NULL, amount TEXT NOT NULL, token INTEGER NOT NULL, revision INTEGER NOT NULL)');
+        $this->pdo->exec('CREATE TABLE value_object_updated (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, changed_at TEXT NOT NULL)');
         $this->gateway = new EntityGateway(new PdoConnection($this->pdo));
         Session::use($this->gateway);
     }
@@ -411,6 +417,67 @@ final class OrmOptimisticLockTest extends TestCase
         self::assertSame([['committed', 1]], $this->pdo->query('SELECT body, revision FROM stable_version_record')->fetchAll(PDO::FETCH_NUM));
     }
 
+    public function testEquivalentValueObjectsDoNotUpdateOrIncrementVersion(): void
+    {
+        $connection = new VersionRecordingConnection(new PdoConnection($this->pdo));
+        Session::use(new EntityGateway($connection));
+        $record = $this->valueObjectRecord();
+        $connection->log = [];
+
+        $record->happened_at = new DateTimeImmutable('2026-08-03 10:20:30', new \DateTimeZone('UTC'));
+        $record->amount = new BcDecimal('123.45');
+        $record->token = new ValueObjectToken(1299, 'transient-local-state');
+        $record->save();
+
+        self::assertSame([], array_values(array_filter(
+            $connection->log,
+            static fn (array $entry): bool => str_starts_with($entry['sql'], 'UPDATE '),
+        )));
+        self::assertSame(1, $record->revision);
+        self::assertSame(1, (int) $this->pdo->query('SELECT revision FROM value_object_version')->fetchColumn());
+    }
+
+    public function testSameInstantInAnotherTimezoneIsNotDirtyAndRealObjectChangesUpdateOnce(): void
+    {
+        $connection = new VersionRecordingConnection(new PdoConnection($this->pdo));
+        Session::use(new EntityGateway($connection));
+        $record = $this->valueObjectRecord();
+        $record->happened_at = new DateTimeImmutable('2026-08-03 18:20:30', new \DateTimeZone('+08:00'));
+        $connection->log = [];
+        $record->save();
+        self::assertSame([], $connection->log);
+        self::assertSame(1, $record->revision);
+
+        $record->amount = new BcDecimal('124.00');
+        $record->token = new ValueObjectToken(1300);
+        $record->save();
+        self::assertCount(1, $connection->log);
+        self::assertSame('124.00', $connection->log[0]['params']['set_amount']);
+        self::assertSame(1300, $connection->log[0]['params']['set_token']);
+        self::assertSame(1, $record->token->conversions, '脏对象的序列化结果必须复用');
+        self::assertSame(2, $record->revision);
+    }
+
+    public function testUpdatedAtUsesDatabaseValueSemanticsButRespectsRealExplicitChanges(): void
+    {
+        $record = new ValueObjectUpdatedRecord();
+        $record->body = 'before';
+        $record->changed_at = new DateTimeImmutable('2030-01-01 00:00:00', new \DateTimeZone('UTC'));
+        $record->save();
+
+        $record->body = 'equivalent timestamp';
+        $record->changed_at = new DateTimeImmutable('2030-01-01 08:00:00.123456', new \DateTimeZone('+08:00'));
+        $record->save();
+        self::assertNotSame('2030-01-01 00:00:00', $record->changed_at->format('Y-m-d H:i:s'));
+
+        $explicit = new DateTimeImmutable('2040-02-03 04:05:06', new \DateTimeZone('UTC'));
+        $record->body = 'explicit timestamp';
+        $record->changed_at = $explicit;
+        $record->save();
+        self::assertSame($explicit, $record->changed_at);
+        self::assertSame('2040-02-03 04:05:06', $this->pdo->query('SELECT changed_at FROM value_object_updated')->fetchColumn());
+    }
+
     public function testTwoIndependentConnectionsConflict(): void
     {
         $path = tempnam(sys_get_temp_dir(), 'pixiaoka-version-');
@@ -450,18 +517,30 @@ final class OrmOptimisticLockTest extends TestCase
         $cache = new RowCache(2);
         $cacheProperty = new \ReflectionProperty(EntityGateway::class, 'cache');
         $cacheProperty->setValue($gateway, $cache);
-        foreach (['inTransactionByContext', 'txnStatesByContext', 'txnIdentityStates', 'txnNewIdentities', 'txnCacheSnapshots', 'txnStartedAt'] as $property) {
-            $map = new \ReflectionProperty(EntityGateway::class, $property);
-            $map->setValue($gateway, new \WeakMap());
-        }
         $events = new \ReflectionProperty(EntityGateway::class, 'events');
         $events->setValue($gateway, new \Pixiaoka\Orm\Observability\EventDispatcher());
         $clock = new \ReflectionProperty(EntityGateway::class, 'clock');
         $clock->setValue($gateway, new \Pixiaoka\Orm\Observability\SystemClock());
+        $executor = new \ReflectionProperty(EntityGateway::class, 'executor');
+        $executor->setValue($gateway, new \Pixiaoka\Orm\Gateway\SqlExecutor(
+            $gateway->connection(),
+            $events->getValue($gateway),
+            $clock->getValue($gateway),
+        ));
         $metadata = new \ReflectionProperty(EntityGateway::class, 'metadata');
         $metadata->setValue($gateway, new MetadataReader());
         $caster = new \ReflectionProperty(EntityGateway::class, 'caster');
         $caster->setValue($gateway, new \Pixiaoka\Orm\Cast\Caster());
+        $transactions = new \ReflectionProperty(EntityGateway::class, 'transactions');
+        $transactions->setValue($gateway, new \Pixiaoka\Orm\Gateway\TransactionManager(
+            $gateway->connection(),
+            $cache,
+            $metadata->getValue($gateway),
+            $caster->getValue($gateway),
+            $executor->getValue($gateway),
+            $events->getValue($gateway),
+            $clock->getValue($gateway),
+        ));
         Session::use($gateway);
         $first = new VersionRecord();
         $first->body = 'first';
@@ -485,6 +564,17 @@ final class OrmOptimisticLockTest extends TestCase
         $third->save();
         $cacheRows = (new \ReflectionProperty(RowCache::class, 'items'))->getValue($cache);
         self::assertSame([$second, $third], array_values($cacheRows));
+    }
+
+    private function valueObjectRecord(): ValueObjectVersionRecord
+    {
+        $record = new ValueObjectVersionRecord();
+        $record->happened_at = new DateTimeImmutable('2026-08-03 10:20:30', new \DateTimeZone('UTC'));
+        $record->amount = new BcDecimal('123.45');
+        $record->token = new ValueObjectToken(1299);
+        $record->save();
+
+        return $record;
     }
 
     /** @return array<string, array{class-string, string}> */
@@ -534,6 +624,59 @@ class VersionRecord extends Entity
     public function beforeInsert(): void { $this->beforeInsertVersion = $this->revision; }
     public function afterUpdate(): void { $this->afterUpdates++; }
     public static function table(): string { return self::$table; }
+}
+
+final class ValueObjectToken implements Castable
+{
+    public int $conversions = 0;
+
+    public function __construct(public int $value, public string $transient = '')
+    {
+    }
+
+    public function toDatabase(): int
+    {
+        $this->conversions++;
+
+        return $this->value;
+    }
+
+    public static function fromDatabase(int|float|string $value): static
+    {
+        return new self((int) $value);
+    }
+}
+
+final class ValueObjectVersionRecord extends Entity
+{
+    #[Column]
+    #[PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public DateTimeImmutable $happened_at;
+    #[Column]
+    public BcDecimal $amount;
+    #[Column]
+    public ValueObjectToken $token;
+    #[Column]
+    #[Version]
+    public int $revision;
+
+    public static function table(): string { return 'value_object_version'; }
+}
+
+final class ValueObjectUpdatedRecord extends Entity
+{
+    #[Column]
+    #[PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public string $body;
+    #[Column]
+    #[UpdatedAt]
+    public DateTimeImmutable $changed_at;
+
+    public static function table(): string { return 'value_object_updated'; }
 }
 
 class InvalidVersionBase extends VersionRecord

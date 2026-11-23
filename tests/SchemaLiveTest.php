@@ -4,12 +4,37 @@ declare(strict_types=1);
 
 namespace Tests\Pixiaoka\Orm;
 
+use Pixiaoka\Orm\Annotation\Column;
+use Pixiaoka\Orm\Annotation\Index;
+use Pixiaoka\Orm\Annotation\PrimaryKey;
+use Pixiaoka\Orm\Entity;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Pixiaoka\Orm\Metadata\MetadataReader;
 use Pixiaoka\Orm\ModelGenerator;
+use Pixiaoka\Orm\Schema\IndexSchema;
+use Pixiaoka\Orm\Schema\SchemaDiffer;
 use Pixiaoka\Orm\Schema\SchemaInspector;
+
+#[Index(['label'], name: 'idx_live_differ_label')]
+final class LiveDifferEntity extends Entity
+{
+    #[Column]
+    #[PrimaryKey]
+    public int $id;
+
+    #[Column]
+    public string $label;
+
+    #[Column]
+    public ?string $note = null;
+
+    public static function table(): string
+    {
+        return 'live_differ_rows';
+    }
+}
 
 /**
  * 显式配置 PIXIAOKA_ORM_LIVE_MYSQL_DSN / PIXIAOKA_ORM_LIVE_PGSQL_DSN 才执行。
@@ -110,6 +135,70 @@ final class SchemaLiveTest extends TestCase
                 $pdo->exec("DROP TABLE IF EXISTS $quote$table$quote");
             }
         }
+    }
+
+    #[DataProvider('drivers')]
+    public function testRealIndexIntrospectionAndDifferSql(string $driver): void
+    {
+        $pdo = $this->connection($driver);
+        $table = 'schema_differ_' . bin2hex(random_bytes(5));
+        $q = $driver === 'mysql' ? '`' : '"';
+        try {
+            $auto = $driver === 'mysql' ? 'BIGINT NOT NULL AUTO_INCREMENT' : 'BIGINT NOT NULL';
+            $pdo->exec("CREATE TABLE $q$table$q (id $auto PRIMARY KEY, label VARCHAR(255) NOT NULL, note TEXT NULL, obsolete TEXT NULL, tenant_id BIGINT NOT NULL, UNIQUE (tenant_id))");
+            $index = 'idx_' . $table;
+            $pdo->exec("CREATE INDEX $q$index$q ON $q$table$q (tenant_id)");
+            $inspector = new SchemaInspector($pdo);
+            $schema = $inspector->table($table);
+            self::assertSame([$index], array_map(static fn (IndexSchema $item): string => $item->name, $schema->indexes));
+            self::assertSame(['tenant_id'], $schema->indexes[0]->columns);
+
+            $meta = (new MetadataReader())->read(LiveDifferEntity::class);
+            $model = new \Pixiaoka\Orm\Metadata\ModelMeta(
+                $meta->class, $table, $meta->fields, $meta->primaryKey, $meta->identityKind, $meta->timestamps,
+                indexes: [new IndexSchema('idx_live_differ_label', ['label'])],
+            );
+            $differ = new SchemaDiffer();
+            foreach ($differ->previewSql($model, $schema, $driver) as $sql) {
+                try {
+                    $pdo->exec($sql);
+                } catch (\PDOException $e) {
+                    throw new \RuntimeException("Schema 预览执行失败: $sql", 0, $e);
+                }
+            }
+            $actual = $inspector->table($table);
+            self::assertSame([], $differ->compare($model, $actual, $driver)['changes']);
+
+            $expression = 'expr_' . $table;
+            $pdo->exec($driver === 'mysql'
+                ? "CREATE INDEX $q$expression$q ON $q$table$q ((LOWER(label)))"
+                : "CREATE INDEX $q$expression$q ON $q$table$q (LOWER(label))");
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('表达式');
+            $inspector->table($table);
+        } finally {
+            $pdo->exec("DROP TABLE IF EXISTS $q$table$q");
+        }
+    }
+
+    private function connection(string $driver): PDO
+    {
+        $prefix = 'PIXIAOKA_ORM_LIVE_' . strtoupper($driver);
+        $dsn = getenv($prefix . '_DSN');
+        if ($dsn === false || $dsn === '') {
+            self::markTestSkipped('未配置 ' . $prefix . '_DSN');
+        }
+        if (!in_array($driver, PDO::getAvailableDrivers(), true)) {
+            self::markTestSkipped("当前 PHP 未加载 pdo_$driver");
+        }
+        $user = getenv($prefix . '_USER');
+        $password = getenv($prefix . '_PASSWORD');
+
+        return new PDO($dsn, $user === false ? null : $user,
+            $password === false ? null : $password, [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_EMULATE_PREPARES => false,
+            ]);
     }
 
     /** @return array<string, array{string}> */

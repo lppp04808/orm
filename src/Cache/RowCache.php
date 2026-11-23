@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pixiaoka\Orm\Cache;
 
+use InvalidArgumentException;
 use Pixiaoka\Orm\Entity;
 use WeakMap;
 
@@ -16,9 +17,6 @@ final class RowCache
     private array $items = [];
 
     private int $maxSize;
-
-    /** @var list<string> */
-    private array $keys = [];
 
     /** @var array<string, array<string, int|float|string|bool|null>> */
     private array $identities = [];
@@ -33,6 +31,9 @@ final class RowCache
 
     public function __construct(int $maxSize = 1024)
     {
+        if ($maxSize < 0) {
+            throw new InvalidArgumentException('RowCache 容量不能小于 0');
+        }
         $this->maxSize = $maxSize;
     }
 
@@ -41,6 +42,10 @@ final class RowCache
         $key = $this->makeKey($class, $identity);
         $item = $this->items[$key] ?? null;
         if ($item !== null && !$item->isNew()) {
+            // PHP 关联数组保持插入顺序：删除后回写即以 O(1) 移至队尾。
+            unset($this->items[$key]);
+            $this->items[$key] = $item;
+
             return $item;
         }
         $this->clearKey($key);
@@ -48,26 +53,24 @@ final class RowCache
         return null;
     }
 
-    /**
-     * P2-4：key 已存在时先从 LRU 队列移除旧位置再追加，
-     * 保证重复 set 不稀释淘汰顺序、不撑大 keys 数组。
-     */
     /** @param array<string, int|float|string|bool|null> $identity */
     public function set(Entity $entity, array $identity): void
     {
-        $key = $this->makeKey($entity::class, $identity);
-        if (isset($this->items[$key])) {
-            $this->keys = array_values(array_diff($this->keys, [$key]));
-        }
-        $this->items[$key] = $entity;
-        $this->identities[$key] = $identity;
         $this->knownIdentities ??= new WeakMap();
         $this->knownIdentities[$entity] = $identity;
-        $this->keys[] = $key;
+        if ($this->maxSize === 0) {
+            return;
+        }
 
-        while (count($this->items) > $this->maxSize) {
-            $old = array_shift($this->keys);
-            unset($this->items[$old], $this->identities[$old]);
+        $key = $this->makeKey($entity::class, $identity);
+        unset($this->items[$key]);
+        $this->items[$key] = $entity;
+        $this->identities[$key] = $identity;
+        if (count($this->items) > $this->maxSize) {
+            $old = array_key_first($this->items);
+            if ($old !== null) {
+                unset($this->items[$old], $this->identities[$old]);
+            }
         }
     }
 
@@ -86,10 +89,6 @@ final class RowCache
     /** 事务回滚时按 key 精确清除，不清整个缓存。 */
     public function clearKey(string $key): void
     {
-        $position = array_search($key, $this->keys, true);
-        if ($position !== false) {
-            array_splice($this->keys, $position, 1);
-        }
         unset($this->items[$key], $this->identities[$key]);
     }
 
@@ -104,18 +103,37 @@ final class RowCache
         return $entities;
     }
 
-    /** @return array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, keys: list<string>} */
-    public function transactionSnapshot(): array
+    /** 返回已交给调用方的存活实体，包括已从 LRU 清退的对象。 @return list<Entity> */
+    public function knownEntities(string $class): array
     {
-        return ['items' => $this->items, 'identities' => $this->identities, 'keys' => $this->keys];
+        $entities = [];
+        foreach ($this->knownIdentities ?? [] as $entity => $_identity) {
+            if ($entity::class === $class && !$entity->isNew()) {
+                $entities[] = $entity;
+            }
+        }
+
+        return $entities;
     }
 
-    /** @param array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, keys: list<string>} $snapshot */
+    /** @return array<string, int|float|string|bool|null>|null */
+    public function knownIdentity(Entity $entity): ?array
+    {
+        return $this->knownIdentities[$entity] ?? null;
+    }
+
+    /** @return array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>} */
+    public function transactionSnapshot(): array
+    {
+        return ['items' => $this->items, 'identities' => $this->identities];
+    }
+
+    /** @param array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>} $snapshot */
     public function restoreSnapshot(array $snapshot): void
     {
         $known = $this->knownIdentities ?? new WeakMap();
+        // items 自身的插入顺序就是 LRU 顺序。
         $this->items = $snapshot['items'];
-        $this->keys = $snapshot['keys'];
         $this->identities = $snapshot['identities'];
         $this->knownIdentities = $known;
         foreach ($snapshot['identities'] as $key => $identity) {
@@ -153,27 +171,33 @@ final class RowCache
     public function identities(string $class): array
     {
         $identities = [];
-        $prefix = $class . ':';
         foreach ($this->knownIdentities ?? [] as $entity => $identity) {
-            $key = $this->makeKey($class, $identity);
-            if (!$entity->isNew() && str_starts_with($key, $prefix)) {
-                $identities[] = $identity;
+            if ($entity::class !== $class || $entity->isNew()) {
+                continue;
             }
+            $key = $this->makeKey($class, $identity);
+            $identities[$key] = $identity;
         }
 
-        return $identities;
+        return array_values($identities);
     }
 
     /** @param list<array<string, int|float|string|bool|null>> $identities */
     public function clearDeleted(string $class, array $identities): void
     {
+        if ($identities === []) {
+            return;
+        }
         $deletedKeys = [];
         foreach ($identities as $identity) {
             $deletedKeys[$this->makeKey($class, $identity)] = true;
         }
         foreach ($this->knownIdentities ?? [] as $entity => $identity) {
+            if ($entity::class !== $class || $entity->isNew()) {
+                continue;
+            }
             $key = $this->makeKey($class, $identity);
-            if (isset($deletedKeys[$key]) && !$entity->isNew()) {
+            if (isset($deletedKeys[$key])) {
                 $entity->markDeleted();
             }
         }
@@ -185,7 +209,6 @@ final class RowCache
     public function flush(): void
     {
         $this->items = [];
-        $this->keys = [];
         $this->identities = [];
     }
 

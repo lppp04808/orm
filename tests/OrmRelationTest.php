@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Pixiaoka\Orm;
 
+use DateTimeImmutable;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use Pixiaoka\Orm\Annotation\BelongsTo as BelongsToAttribute;
@@ -11,6 +12,7 @@ use Pixiaoka\Orm\Annotation\Column;
 use Pixiaoka\Orm\Annotation\HasMany as HasManyAttribute;
 use Pixiaoka\Orm\Annotation\HasOne as HasOneAttribute;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
+use Pixiaoka\Orm\Cast\BcDecimal;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Exception\MetadataException;
 use Pixiaoka\Orm\Exception\RelationException;
@@ -136,6 +138,33 @@ final class InvalidRelation extends Entity
 
     #[HasManyAttribute(target: RelationOrder::class, localKey: ['id'], foreignKey: ['status'])]
     public function wrongType(): HasMany { return $this->makeRelation(); }
+}
+
+final class RelationValueObjectParent extends Entity
+{
+    #[Column, PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public string $name;
+
+    public static function table(): string { return 'relation_value_parent'; }
+
+    #[HasManyAttribute(target: RelationValueObjectChild::class, localKey: ['id'], foreignKey: ['parent_id'])]
+    public function children(): HasMany { return $this->makeRelation(); }
+}
+
+final class RelationValueObjectChild extends Entity
+{
+    #[Column, PrimaryKey(generated: true)]
+    public int $id;
+    #[Column]
+    public int $parent_id;
+    #[Column]
+    public DateTimeImmutable $happened_at;
+    #[Column]
+    public BcDecimal $amount;
+
+    public static function table(): string { return 'relation_value_child'; }
 }
 
 final class OrmRelationTest extends TestCase
@@ -345,6 +374,35 @@ final class OrmRelationTest extends TestCase
         self::assertSame('database-name', $cached->name);
     }
 
+    public function testEagerRefreshDoesNotTreatEquivalentValueObjectsAsLocalChanges(): void
+    {
+        $this->pdo->exec('CREATE TABLE relation_value_parent (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)');
+        $this->pdo->exec('CREATE TABLE relation_value_child (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER NOT NULL, happened_at TEXT NOT NULL, amount TEXT NOT NULL)');
+        $parent = new RelationValueObjectParent();
+        $parent->name = 'parent';
+        $parent->save();
+        $child = new RelationValueObjectChild();
+        $child->parent_id = $parent->id;
+        $child->happened_at = new DateTimeImmutable('2026-08-03 10:20:30', new \DateTimeZone('UTC'));
+        $child->amount = new BcDecimal('123.45');
+        $child->save();
+
+        $cached = RelationValueObjectChild::find(['id' => $child->id]);
+        self::assertNotNull($cached);
+        $cached->happened_at = new DateTimeImmutable('2026-08-03 18:20:30.987654', new \DateTimeZone('+08:00'));
+        $cached->amount = new BcDecimal('123.45');
+        $this->pdo->exec("UPDATE relation_value_child SET happened_at = '2026-08-03 10:20:31', amount = '456.78' WHERE id = {$child->id}");
+
+        $loaded = RelationValueObjectParent::query()->with('children')->where('id', $parent->id)->first();
+        self::assertNotNull($loaded);
+        $refreshed = $loaded->loadedRelation('children')[0];
+        self::assertSame($cached, $refreshed);
+        self::assertSame('2026-08-03 10:20:31', $refreshed->happened_at->format('Y-m-d H:i:s'));
+        self::assertSame('456.78', (string) $refreshed->amount);
+        self::assertSame('2026-08-03 10:20:31', $refreshed->takeOriginal()['happened_at']->format('Y-m-d H:i:s'));
+        self::assertSame('456.78', (string) $refreshed->takeOriginal()['amount']);
+    }
+
     public function testEntityCannotReadOrWriteAcrossGateways(): void
     {
         $customer = RelationCustomer::find(['id' => 1]);
@@ -497,7 +555,6 @@ final class OrmRelationTest extends TestCase
         $snapshot = $cache->transactionSnapshot();
         self::assertSame([], $snapshot['items']);
         self::assertSame([], $snapshot['identities']);
-        self::assertSame([], $snapshot['keys']);
         unset($customer->id);
         $customer->save();
         self::assertSame(4, $customer->id);

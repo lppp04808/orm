@@ -61,7 +61,13 @@ final class SchemaInspector
             throw new RuntimeException("表不存在或没有字段: $table");
         }
 
-        return new TableSchema($table, $columns);
+        $indexes = match ($this->driver) {
+            'sqlite' => $this->sqliteIndexes($table),
+            'mysql' => $this->mysqlIndexes($table),
+            'pgsql' => $this->pgsqlIndexes($table),
+        };
+
+        return new TableSchema($table, $columns, $indexes);
     }
 
     private function assertIdentifier(string $identifier): void
@@ -197,6 +203,108 @@ final class SchemaInspector
         }
 
         return $columns;
+    }
+
+    /** @return list<IndexSchema> */
+    private function sqliteIndexes(string $table): array
+    {
+        $statement = $this->pdo->prepare('PRAGMA index_list(' . $this->quote($table, '"') . ')');
+        $statement->execute();
+        $indexes = [];
+        foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            if (($row['origin'] ?? '') === 'pk' || str_starts_with((string) $row['name'], 'sqlite_autoindex_')) {
+                continue;
+            }
+            $name = (string) $row['name'];
+            $this->assertIdentifier($name);
+            $info = $this->pdo->prepare('PRAGMA index_info(' . $this->quote($name, '"') . ')');
+            $info->execute();
+            $columns = [];
+            foreach ($info->fetchAll(PDO::FETCH_ASSOC) as $column) {
+                if ($column['name'] === null) {
+                    throw new RuntimeException("索引 $name 包含表达式，无法与模型字段索引安全比较");
+                }
+                $this->assertIdentifier((string) $column['name']);
+                $columns[(int) $column['seqno']] = (string) $column['name'];
+            }
+            ksort($columns);
+            $indexes[] = new IndexSchema($name, array_values($columns), (int) $row['unique'] === 1);
+        }
+        usort($indexes, static fn (IndexSchema $a, IndexSchema $b): int => $a->name <=> $b->name);
+
+        return $indexes;
+    }
+
+    /** @return list<IndexSchema> */
+    private function mysqlIndexes(string $table): array
+    {
+        $statement = $this->pdo->prepare(
+            'SELECT s.INDEX_NAME, s.NON_UNIQUE, s.SEQ_IN_INDEX, s.COLUMN_NAME, s.SUB_PART, s.INDEX_TYPE FROM information_schema.STATISTICS s ' .
+            'LEFT JOIN information_schema.TABLE_CONSTRAINTS c ON c.TABLE_SCHEMA = s.TABLE_SCHEMA ' .
+            'AND c.TABLE_NAME = s.TABLE_NAME AND c.CONSTRAINT_NAME = s.INDEX_NAME ' .
+            'WHERE s.TABLE_SCHEMA = DATABASE() AND s.TABLE_NAME = :table AND s.INDEX_NAME <> \'PRIMARY\' ' .
+            'AND c.CONSTRAINT_NAME IS NULL ORDER BY s.INDEX_NAME, s.SEQ_IN_INDEX',
+        );
+        $statement->execute(['table' => $table]);
+        $definitions = [];
+        foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $name = (string) $row['INDEX_NAME'];
+            $column = $row['COLUMN_NAME'];
+            if ($column === null) {
+                throw new RuntimeException("索引 $name 包含函数表达式，无法与模型字段索引安全比较");
+            }
+            if ($row['SUB_PART'] !== null || strtoupper((string) $row['INDEX_TYPE']) === 'FULLTEXT') {
+                throw new RuntimeException("索引 $name 包含前缀长度或全文定义，无法与模型字段索引安全比较");
+            }
+            $this->assertIdentifier($name);
+            $this->assertIdentifier((string) $column);
+            $definitions[$name]['columns'][(int) $row['SEQ_IN_INDEX']] = (string) $column;
+            $definitions[$name]['unique'] = (int) $row['NON_UNIQUE'] === 0;
+        }
+        $indexes = [];
+        foreach ($definitions as $name => $definition) {
+            ksort($definition['columns']);
+            $indexes[] = new IndexSchema($name, array_values($definition['columns']), $definition['unique']);
+        }
+
+        return $indexes;
+    }
+
+    /** @return list<IndexSchema> */
+    private function pgsqlIndexes(string $table): array
+    {
+        $statement = $this->pdo->prepare(
+            'SELECT i.relname AS index_name, ix.indisunique AS is_unique, a.attname AS column_name, ' .
+            'k.ordinal_position FROM pg_catalog.pg_class t ' .
+            'JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace ' .
+            'JOIN pg_catalog.pg_index ix ON ix.indrelid = t.oid ' .
+            'JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid ' .
+            'CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinal_position) ' .
+            'LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum ' .
+            'WHERE n.nspname = current_schema() AND t.relname = :table AND NOT ix.indisprimary ' .
+            'AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conindid = i.oid) ' .
+            'ORDER BY i.relname, k.ordinal_position',
+        );
+        $statement->execute(['table' => $table]);
+        $definitions = [];
+        foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $name = (string) $row['index_name'];
+            if ($row['column_name'] === null) {
+                throw new RuntimeException("索引 $name 包含表达式或包含列，无法与模型字段索引安全比较");
+            }
+            $column = (string) $row['column_name'];
+            $this->assertIdentifier($name);
+            $this->assertIdentifier($column);
+            $definitions[$name]['columns'][(int) $row['ordinal_position']] = $column;
+            $definitions[$name]['unique'] = in_array($row['is_unique'], [true, 1, '1', 't'], true);
+        }
+        $indexes = [];
+        foreach ($definitions as $name => $definition) {
+            ksort($definition['columns']);
+            $indexes[] = new IndexSchema($name, array_values($definition['columns']), $definition['unique']);
+        }
+
+        return $indexes;
     }
 
     private function quote(string $identifier, string $quote): string

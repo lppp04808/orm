@@ -17,18 +17,29 @@ use WeakMap;
  */
 final class Session
 {
-    /** @var WeakMap<Context, self>|null */
+    /** @var WeakMap<Context, array<string, self>>|null */
     private static ?WeakMap $contextSessions = null;
 
     /** @var WeakMap<Connection, Context>|null 一个连接同时只能被一个事务上下文持有。 */
     private static ?WeakMap $connectionContexts = null;
 
-    private static ?self $mainSession = null;
+    /** @var WeakMap<EntityGateway, Context>|null 活跃上下文持有网关的全部读写生命周期。 */
+    private static ?WeakMap $gatewayContexts = null;
+
+    /** @var WeakMap<Context, WeakMap<EntityGateway, int>>|null 同上下文多次绑定同一网关的引用计数。 */
+    private static ?WeakMap $gatewayReferences = null;
+
+    /** @var array<string, self> */
+    private static array $mainSessions = [];
+
+    private static ?bool $hasSwoole = null;
+
+    private static ?bool $hasSwow = null;
 
     private static bool $strict = false;
 
-    /** @var \WeakMap<Context, array{rolledBack: bool, failed: bool}>|null discard 结束时的事务结果。 */
-    private static ?\WeakMap $confirmedRollbacks = null;
+    /** @var \WeakMap<Context, array<string, array{rolledBack: bool, failed: bool}>>|null 各命名会话的独立回滚结果。 */
+    private static ?\WeakMap $rollbackStatuses = null;
 
     /** @var \WeakMap<Context, true>|null discard 执行期间禁止观测回调重入清理。 */
     private static ?\WeakMap $discardingContexts = null;
@@ -41,20 +52,27 @@ final class Session
     ) {
     }
 
-    /** 为当前上下文登记独立连接对应的网关。 */
-    public static function use(EntityGateway $gateway): self
+    /** 为当前上下文登记指定数据源的独立连接网关。 */
+    public static function use(EntityGateway $gateway, string $name = 'default'): self
     {
+        self::assertSessionName($name);
         self::assertObservationBoundary();
-        self::clearRollbackStatus(self::currentContext());
-        $gateway->assertSessionUsable();
         $context = self::currentContext();
-        $session = new self($gateway);
-        $previous = self::lookup($context);
+        self::clearRollbackStatus($context, $name);
+        $gateway->assertSessionUsable();
+        $previous = self::lookup($context, $name);
         if ($previous !== null) {
             $previous->gateway->assertSessionReplaceable($context);
         }
-        self::install($session);
-        $gateway->observeSession('bind', self::currentContext());
+        if ($previous === null || $previous->gateway !== $gateway) {
+            self::assertGatewayAvailable($gateway, $context);
+        }
+        if ($previous !== null && $previous->gateway !== $gateway) {
+            self::releaseGateway($previous->gateway, $context);
+        }
+        $session = new self($gateway);
+        self::install($session, $name);
+        $gateway->observeSession('bind', $context);
 
         return $session;
     }
@@ -66,28 +84,44 @@ final class Session
      * @param (callable(): T)|null $operation 省略时返回手动关闭的作用域
      * @return ($operation is null ? SessionScope : T)
      */
-    public static function scope(EntityGateway $gateway, ?callable $operation = null): mixed
-    {
+    public static function scope(
+        EntityGateway $gateway,
+        ?callable $operation = null,
+        string $name = 'default',
+    ): mixed {
+        self::assertSessionName($name);
         self::assertObservationBoundary();
         $context = self::currentContext();
-        $previous = self::lookup($context);
+        $previous = self::lookup($context, $name);
         if ($previous !== null) {
             $previous->gateway->assertSessionReplaceable($context);
+            // use() 会释放当前绑定；作用域先保留一份外层引用，恢复时直接接续。
+            self::assertGatewayAvailable($previous->gateway, $context);
         }
-        $scope = new SessionScope($context, static function () use ($previous, $context): void {
+        $scope = new SessionScope($context, static function () use ($previous, $context, $name): void {
+            $exception = null;
             try {
-                self::discard();
+                self::discard($name);
+            } catch (\Throwable $e) {
+                $exception = $e;
             } finally {
                 if ($previous !== null) {
-                    self::install($previous);
+                    // install() 不登记引用，这里接续 scope 创建时保留的外层引用。
+                    self::install($previous, $name);
                     $previous->gateway->observeSession('restore', $context);
                 }
             }
+            if ($exception !== null) {
+                throw $exception;
+            }
         });
         try {
-            self::use($gateway);
+            self::use($gateway, $name);
         } catch (\Throwable $e) {
             $scope->abandon();
+            if ($previous !== null) {
+                self::releaseGateway($previous->gateway, $context);
+            }
             throw $e;
         }
 
@@ -116,82 +150,161 @@ final class Session
         return self::$strict;
     }
 
-    public static function get(): self
+    public static function get(string $name = 'default'): self
     {
+        self::assertSessionName($name);
         $context = self::currentContext();
-        $session = self::lookup($context);
+        $session = self::lookup($context, $name);
         if ($session !== null) {
             return $session;
         }
 
         if (self::$strict && (\Fiber::getCurrent() !== null || self::runtimeCoroutine() !== null)) {
-            throw new LogicException('当前 Fiber/协程还没有 Pixiaoka\Orm\Session::use()；严格模式禁止回退根连接');
+            throw new LogicException('当前 Fiber/协程还没有 Pixiaoka\Orm\Session::use()；严格模式禁止回退根连接：' . $name);
         }
 
-        return self::$mainSession ?? throw new LogicException('还没有 Pixiaoka\Orm\Session::use()');
+        return self::$mainSessions[$name]
+            ?? throw new LogicException($name === 'default'
+                ? '还没有 Pixiaoka\Orm\Session::use()'
+                : "还没有 Pixiaoka\\Orm\\Session::use(..., '$name')");
     }
 
     /**
      * 清理当前上下文。存在未结束事务时先回滚，防止把事务中的连接归还应用或连接池。
      * 即使连接已断开，也继续解除 Session 与网关事务状态，并保留原始异常。
      */
-    public static function discard(): void
+    public static function discard(?string $name = null): void
     {
-        $context = self::currentContext();
-        $session = self::lookup($context);
-        if ($session !== null && ((self::$discardingContexts !== null && isset(self::$discardingContexts[$context]))
-            || (self::$observingContexts !== null && isset(self::$observingContexts[$context])))) {
-            throw new LogicException('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期');
+        if ($name !== null) {
+            self::assertSessionName($name);
         }
-        if ($session === null) {
-            self::clearRollbackStatus($context);
+        $context = self::currentContext();
+        if ((self::$discardingContexts !== null && isset(self::$discardingContexts[$context]))
+            || (self::$observingContexts !== null && isset(self::$observingContexts[$context]))) {
+            if (self::sessions($context, $name) !== []) {
+                throw new LogicException('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期');
+            }
+        }
+        $sessions = self::sessions($context, $name);
+        if ($sessions === []) {
+            self::clearRollbackStatus($context, $name);
             return;
         }
         self::$discardingContexts ??= new WeakMap();
         self::$discardingContexts[$context] = true;
         $exception = null;
         try {
+            foreach ($sessions as $sessionName => $session) {
+                self::discardSession($session, $sessionName, $context, $exception);
+            }
+        } finally {
+            unset(self::$discardingContexts[$context]);
+            // 保留回滚确认供尚未退出的事务栈读取；下一次 use/transaction 再清理。
+            if ($exception !== null) {
+                throw $exception;
+            }
+        }
+    }
+
+    private static function discardSession(
+        self $session,
+        string $name,
+        Context $context,
+        ?\Throwable &$firstException,
+    ): void {
+        $exception = null;
+        try {
             $session->gateway->assertObservationBoundary();
             $session->gateway->releaseContext($context);
             if ($session->gateway->rollbackWasConfirmed($context)) {
-                self::$confirmedRollbacks ??= new WeakMap();
-                self::$confirmedRollbacks[$context] = ['rolledBack' => true, 'failed' => false];
+                self::recordRollbackStatus($context, $name, true, false);
             }
         } catch (\Throwable $e) {
             $exception = $e;
-            self::$confirmedRollbacks ??= new WeakMap();
-            self::$confirmedRollbacks[$context] = ['rolledBack' => false, 'failed' => true];
-            throw $e;
+            $firstException ??= $e;
+            self::recordRollbackStatus($context, $name, false, true);
         } finally {
-            if (self::$contextSessions !== null) {
-                unset(self::$contextSessions[$context]);
+            if (self::$contextSessions !== null && isset(self::$contextSessions[$context])) {
+                $sessions = self::$contextSessions[$context];
+                unset($sessions[$name]);
+                if ($sessions === []) {
+                    unset(self::$contextSessions[$context]);
+                } else {
+                    self::$contextSessions[$context] = $sessions;
+                }
             }
+            self::releaseGateway($session->gateway, $context);
             if ($context === Context::root()) {
-                self::$mainSession = null;
+                unset(self::$mainSessions[$name]);
             }
             $session->gateway->observeSession('discard', $context, $exception);
-            unset(self::$discardingContexts[$context]);
         }
     }
 
     /** @internal 仅由事务边界确认 discard 是否已经完成数据库回滚。 */
-    public static function rollbackConfirmed(Context $context): bool
+    public static function rollbackConfirmed(Context $context, string $name = 'default'): bool
     {
-        return (self::$confirmedRollbacks[$context]['rolledBack'] ?? false) === true;
+        return (self::$rollbackStatuses[$context][$name]['rolledBack'] ?? false) === true;
     }
 
     /** @internal 已尝试 discard 但回滚失败，外层事务不得重复回滚或伪造业务异常。 */
-    public static function rollbackAttempted(Context $context): bool
+    public static function rollbackAttempted(Context $context, string $name = 'default'): bool
     {
-        return self::$confirmedRollbacks !== null && isset(self::$confirmedRollbacks[$context]);
+        return isset(self::$rollbackStatuses[$context][$name]);
+    }
+
+    /** @internal 当前网关的命名会话在事务开始时确定，并传递到最终事务边界。 */
+    public static function transactionName(EntityGateway $gateway, Context $context): string
+    {
+        if (self::$contextSessions !== null && isset(self::$contextSessions[$context])) {
+            foreach (self::$contextSessions[$context] as $name => $session) {
+                if ($session->gateway === $gateway) {
+                    return $name;
+                }
+            }
+        }
+        if ($context === Context::root()) {
+            foreach (self::$mainSessions as $name => $session) {
+                if ($session->gateway === $gateway) {
+                    return $name;
+                }
+            }
+        }
+
+        // 兼容历史上直接通过 Gateway 开事务的调用；没有命名绑定时仍是 default。
+        return 'default';
     }
 
     /** @internal 新物理事务不得继承上次 discard 的结果。 */
-    public static function clearRollbackStatus(Context $context): void
+    public static function clearRollbackStatus(Context $context, ?string $name = null): void
     {
-        if (self::$confirmedRollbacks !== null) {
-            unset(self::$confirmedRollbacks[$context]);
+        if (self::$rollbackStatuses === null) {
+            return;
         }
+        if ($name === null) {
+            unset(self::$rollbackStatuses[$context]);
+
+            return;
+        }
+        $statuses = self::$rollbackStatuses[$context] ?? [];
+        unset($statuses[$name]);
+        if ($statuses === []) {
+            unset(self::$rollbackStatuses[$context]);
+        } else {
+            self::$rollbackStatuses[$context] = $statuses;
+        }
+    }
+
+    private static function recordRollbackStatus(
+        Context $context,
+        string $name,
+        bool $rolledBack,
+        bool $failed,
+    ): void {
+        self::$rollbackStatuses ??= new WeakMap();
+        $statuses = self::$rollbackStatuses[$context] ?? [];
+        $statuses[$name] = ['rolledBack' => $rolledBack, 'failed' => $failed];
+        self::$rollbackStatuses[$context] = $statuses;
     }
 
     /** @internal 独立连接可执行观测 SQL，但不能改变当前上下文的 Session 生命周期。 */
@@ -262,32 +375,91 @@ final class Session
         }
     }
 
-    private static function install(self $session): void
+    private static function install(self $session, string $name): void
     {
         $context = self::currentContext();
         self::$contextSessions ??= new WeakMap();
-        self::$contextSessions[$context] = $session;
+        $sessions = self::$contextSessions[$context] ?? [];
+        $sessions[$name] = $session;
+        self::$contextSessions[$context] = $sessions;
         if ($context === Context::root()) {
-            self::$mainSession = $session;
+            self::$mainSessions[$name] = $session;
         }
     }
 
-    private static function lookup(Context $context): ?self
+    private static function lookup(Context $context, string $name): ?self
     {
-        return self::$contextSessions === null ? null : (self::$contextSessions[$context] ?? null);
+        return self::$contextSessions === null ? null : (self::$contextSessions[$context][$name] ?? null);
+    }
+
+    /** @return array<string, self> */
+    private static function sessions(Context $context, ?string $name): array
+    {
+        $sessions = self::$contextSessions[$context] ?? [];
+
+        return $name === null ? $sessions : (isset($sessions[$name]) ? [$name => $sessions[$name]] : []);
+    }
+
+    private static function assertSessionName(string $name): void
+    {
+        if ($name === '') {
+            throw new \InvalidArgumentException('Session 名称不能为空字符串');
+        }
+    }
+
+    private static function assertGatewayAvailable(EntityGateway $gateway, Context $context): void
+    {
+        $owner = self::$gatewayContexts[$gateway] ?? null;
+        if ($owner !== null && $owner !== $context) {
+            throw new LogicException('同一网关已被另一个活跃 Fiber/协程持有，请 discard 原上下文会话或使用独立连接');
+        }
+        self::$gatewayContexts ??= new WeakMap();
+        self::$gatewayContexts[$gateway] = $context;
+        self::$gatewayReferences ??= new WeakMap();
+        $references = self::$gatewayReferences[$context] ?? null;
+        if (!$references instanceof WeakMap) {
+            /** @var WeakMap<EntityGateway, int> $references */
+            $references = new WeakMap();
+        }
+        $references[$gateway] = ($references[$gateway] ?? 0) + 1;
+        self::$gatewayReferences[$context] = $references;
+    }
+
+    private static function releaseGateway(EntityGateway $gateway, Context $context): void
+    {
+        $references = self::$gatewayReferences[$context] ?? null;
+        if ($references !== null && isset($references[$gateway])) {
+            $count = $references[$gateway] - 1;
+            if ($count === 0) {
+                unset($references[$gateway]);
+            } else {
+                $references[$gateway] = $count;
+            }
+        }
+        if (($references === null || !isset($references[$gateway]))
+            && (self::$gatewayContexts[$gateway] ?? null) === $context) {
+            unset(self::$gatewayContexts[$gateway]);
+        }
     }
 
     /** Swoole 使用其 Context 对象，Swow 使用 Coroutine 对象作为弱引用身份。 */
     private static function runtimeCoroutine(): ?object
     {
-        if (class_exists('Swoole\Coroutine') && \Swoole\Coroutine::getCid() > 0) {
+        // 运行时不会在一次 PHP 进程内安装或卸载扩展，能力检测结果只需计算一次。
+        self::$hasSwoole ??= class_exists('Swoole\\Coroutine');
+        self::$hasSwow ??= class_exists('Swow\\Coroutine');
+        if (self::$hasSwoole && \Swoole\Coroutine::getCid() > 0) {
             $context = \Swoole\Coroutine::getContext();
             if (is_object($context)) {
                 return $context;
             }
         }
-        if (class_exists('Swow\Coroutine') && \Swow\Coroutine::getCurrent() !== null) {
-            return \Swow\Coroutine::getCurrent();
+        if (self::$hasSwow) {
+            /** @var object|null $coroutine */
+            $coroutine = call_user_func(['Swow\\Coroutine', 'getCurrent']);
+            if (is_object($coroutine)) {
+                return $coroutine;
+            }
         }
 
         return null;

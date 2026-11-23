@@ -6,7 +6,7 @@ namespace Pixiaoka\Orm\Schema;
 
 use InvalidArgumentException;
 
-/** 一张表的列及有序主键定义。 */
+/** 一张表的列、有序主键及二级索引定义。 */
 final readonly class TableSchema
 {
     /** @var list<ColumnSchema> */
@@ -17,10 +17,12 @@ final readonly class TableSchema
 
     /**
      * @param list<ColumnSchema> $columns
+     * @param list<IndexSchema> $indexes
      */
     public function __construct(
         public string $name,
         array $columns,
+        public array $indexes = [],
     ) {
         if ($columns === []) {
             throw new InvalidArgumentException("表 $name 没有可生成的字段");
