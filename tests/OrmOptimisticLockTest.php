@@ -229,6 +229,112 @@ final class OrmOptimisticLockTest extends TestCase
         self::assertSame(2, $loaded->revision);
     }
 
+    public function testLegacyConnectionRollbackRestoresOriginalStateAndCanonicalObjectsAfterCacheClear(): void
+    {
+        $path = tempnam(sys_get_temp_dir(), 'pixiaoka-version-rollback-');
+        self::assertIsString($path);
+        $leftPdo = new PDO('sqlite:' . $path);
+        $rightPdo = new PDO('sqlite:' . $path);
+        try {
+            $leftPdo->exec('CREATE TABLE version_record (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, revision INTEGER NOT NULL)');
+            $leftGateway = new EntityGateway(new VersionRecordingConnection(new PdoConnection($leftPdo)));
+            $rightGateway = new EntityGateway(new PdoConnection($rightPdo));
+
+            Session::use($leftGateway);
+            $left = new VersionRecord();
+            $left->body = 'initial';
+            $left->save();
+            $id = $left->id;
+            Session::use($rightGateway);
+            $right = VersionRecord::find(['id' => $id]);
+            self::assertNotNull($right);
+            Session::use($leftGateway);
+            $left->body = 'left-winner';
+            $left->save();
+            Session::use($rightGateway);
+            $right->body = 'stale-update';
+            try {
+                $right->save();
+                self::fail('陈旧版本不能保存');
+            } catch (OptimisticLockException) {
+            }
+            try {
+                $right->delete();
+                self::fail('陈旧版本不能删除');
+            } catch (OptimisticLockException) {
+            }
+            $right->refresh();
+            $right->body = 'refreshed-update';
+            $right->save();
+            $right->delete();
+
+            Session::use($leftGateway);
+            $record = new VersionRecord();
+            $record->body = 'committed';
+            $record->save();
+            $recordOriginal = $record->takeOriginal();
+            $readBefore = new VersionRecord();
+            $readBefore->body = 'read-before';
+            $readBefore->save();
+            $readId = $readBefore->id;
+            $leftGateway->clearCache(VersionRecord::class);
+
+            $fresh = new VersionRecord();
+            $fresh->body = 'new-row';
+            $freshId = null;
+            $readInTransaction = null;
+            try {
+                VersionRecord::transaction(function () use ($record, $fresh, $readId, &$freshId, &$readInTransaction): void {
+                    $record->body = 'first-transient';
+                    $record->save();
+                    $record->body = 'second-transient';
+                    $record->save();
+                    $fresh->save();
+                    $freshId = $fresh->id;
+                    $readInTransaction = VersionRecord::query()->where('id', $readId)->first();
+                    self::assertNotNull($readInTransaction);
+                    $readInTransaction->body = 'read-transient';
+                    $readInTransaction->save();
+                    throw new \RuntimeException('version rollback');
+                });
+                self::fail('必须回滚');
+            } catch (\RuntimeException $e) {
+                self::assertSame('version rollback', $e->getMessage());
+            }
+
+            self::assertFalse($record->isNew());
+            self::assertSame('committed', $record->body);
+            self::assertSame(1, $record->revision);
+            self::assertSame($recordOriginal, $record->takeOriginal());
+            self::assertSame($record, VersionRecord::find(['id' => $record->id]));
+            self::assertTrue($fresh->isNew());
+            self::assertFalse($fresh->propSet('id'));
+            self::assertFalse($fresh->propSet('revision'));
+            self::assertNotNull($readInTransaction);
+            self::assertFalse($readInTransaction->isNew());
+            self::assertSame('read-before', $readInTransaction->body);
+            self::assertSame(1, $readInTransaction->revision);
+            self::assertSame(['body' => 'read-before', 'revision' => 1], $readInTransaction->takeOriginal());
+            self::assertSame($readInTransaction, VersionRecord::find(['id' => $readId]));
+            self::assertSame(
+                [['committed', 1], ['read-before', 1]],
+                $leftPdo->query('SELECT body, revision FROM version_record ORDER BY id')->fetchAll(PDO::FETCH_NUM),
+            );
+            self::assertNotNull($freshId);
+            self::assertNull(VersionRecord::query()->where('id', $freshId)->row());
+
+            $record->body = 'after-rollback';
+            $record->save();
+            self::assertSame(2, $record->revision);
+            $fresh->save();
+            self::assertSame(1, $fresh->revision);
+        } finally {
+            Session::discard();
+            unset($leftGateway, $rightGateway, $leftPdo, $rightPdo);
+            @unlink($path);
+        }
+    }
+
     public function testRollbackRestoresAllInstancesOfTheSameIdentity(): void
     {
         $record = new VersionRecord();

@@ -475,8 +475,10 @@ final class TransactionManager
             }
             $meta = $this->metadata->read($entity::class);
             $parts = $this->identityParts($entity, $meta);
-            if (!isset($cachedKeys[$this->cache->setKey($entity, $parts)])) {
+            $key = $this->cache->setKey($entity, $parts);
+            if (!isset($cachedKeys[$key])) {
                 $this->cache->set($entity, $parts);
+                $cachedKeys[$key] = true;
             }
         }
     }
@@ -553,8 +555,10 @@ final class TransactionManager
             }
             $meta = $this->metadata->read($entity::class);
             $parts = $this->identityParts($entity, $meta);
-            if (!isset($cachedKeys[$this->cache->setKey($entity, $parts)])) {
+            $key = $this->cache->setKey($entity, $parts);
+            if (!isset($cachedKeys[$key])) {
                 $this->cache->set($entity, $parts);
+                $cachedKeys[$key] = true;
             }
         }
     }
@@ -614,9 +618,9 @@ final class TransactionManager
         $key = $this->completeIdentityKey($entity, $meta);
         if ($entity->isNew() || $key === null || !isset($pending[$key])) {
             if (!$entity->isNew()) {
-                $identities[$key] ??= $entity->captureState($meta);
+                $states[$entity] = $this->captureOuterState($entity, $context);
+                $identities[$key] ??= $states[$entity];
                 $this->txnIdentityStates[$context] = $identities;
-                $states[$entity] = $identities[$key];
             } else {
                 $states[$entity] = $entity->captureState($meta);
                 $this->pendingInsertStates ??= new \WeakMap();
