@@ -26,27 +26,30 @@ use Pixiaoka\Orm\Query\Expression;
 use Pixiaoka\Orm\Relation\Loader;
 use Pixiaoka\Orm\Session;
 
-final readonly class EntityGateway
+final class EntityGateway
 {
-    private RowCache $cache;
+    /** @var array<class-string<Entity>, \ReflectionClass<Entity>> */
+    private static array $reflectionClasses = [];
 
-    private TransactionManager $transactions;
+    private readonly RowCache $cache;
 
-    private EventDispatcher $events;
+    private readonly TransactionManager $transactions;
 
-    private Clock $clock;
+    private readonly EventDispatcher $events;
 
-    private Loader $relations;
+    private readonly Clock $clock;
 
-    private SqlExecutor $executor;
+    private readonly Loader $relations;
 
-    private BulkWriter $bulk;
+    private readonly SqlExecutor $executor;
+
+    private readonly BulkWriter $bulk;
 
     public function __construct(
-        private Connection     $connection,
-        private MetadataReader $metadata = new MetadataReader(),
-        private Caster         $caster = new Caster(),
-        ?Clock                 $clock = null,
+        private readonly Connection     $connection,
+        private readonly MetadataReader $metadata = new MetadataReader(),
+        private readonly Caster         $caster = new Caster(),
+        ?Clock                          $clock = null,
     ) {
         $this->cache = new RowCache();
         $this->events = new EventDispatcher();
@@ -941,10 +944,15 @@ final readonly class EntityGateway
 
     // ---- 内部 ----
 
+    /** @param class-string<Entity> $class @return \ReflectionClass<Entity> */
+    private function reflectionClass(string $class): \ReflectionClass
+    {
+        return self::$reflectionClasses[$class] ??= new \ReflectionClass($class);
+    }
+
     private function hydrate(ModelMeta $meta, array $row): Entity
     {
-        /** @var Entity $entity */
-        $entity = (new \ReflectionClass($meta->class))->newInstanceWithoutConstructor();
+        $entity = $this->reflectionClass($meta->class)->newInstanceWithoutConstructor();
 
         foreach ($meta->fields as $field) {
             if (!array_key_exists($field->column, $row)) {

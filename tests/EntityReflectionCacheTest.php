@@ -26,6 +26,13 @@ class ReflectionStateRecord extends Entity
     #[Column]
     public ?string $note = null;
 
+    public static int $constructorCalls = 0;
+
+    public function __construct()
+    {
+        ++self::$constructorCalls;
+    }
+
     public static function table(): string
     {
         return 'entity_reflection_state';
@@ -131,6 +138,85 @@ final class EntityReflectionCacheTest extends TestCase
         self::assertSame($childReflection, $method->invoke($child, 'body'));
         self::assertSame('child', $child->body);
         self::assertSame('parent', $parent->body);
+    }
+
+    public function testGatewayHydrationReusesReflectionClassesAcrossGatewaysAndSkipsConstructors(): void
+    {
+        $cacheProperty = new \ReflectionProperty(EntityGateway::class, 'reflectionClasses');
+        $cacheProperty->setValue(null, []);
+        $originalCache = [];
+        ReflectionStateRecord::$constructorCalls = 0;
+        $reader = new MetadataReader();
+
+        try {
+            $gateway = new EntityGateway(new PdoConnection(new PDO('sqlite::memory:')), $reader);
+            $method = new \ReflectionMethod(EntityGateway::class, 'hydrate');
+            $meta = $reader->read(ReflectionStateRecord::class);
+            $entities = [];
+            for ($id = 1; $id <= 120; ++$id) {
+                $entities[] = $method->invoke($gateway, $meta, [
+                    'id' => $id,
+                    'body' => 'batch-' . $id,
+                    'note' => null,
+                ]);
+            }
+            self::assertCount(120, $entities);
+            self::assertSame(0, ReflectionStateRecord::$constructorCalls);
+            self::assertSame('batch-1', $entities[0]->body);
+            self::assertSame('batch-120', $entities[119]->body);
+            self::assertNull($entities[119]->note);
+
+            $cached = $cacheProperty->getValue();
+            self::assertSame([ReflectionStateRecord::class], array_keys($cached));
+            self::assertSame(ReflectionStateRecord::class, $cached[ReflectionStateRecord::class]->getName());
+
+            $otherPdo = new PDO('sqlite::memory:');
+            $otherPdo->exec('CREATE TABLE entity_reflection_state (id INTEGER PRIMARY KEY, body TEXT NOT NULL, note TEXT NULL)');
+            $otherPdo->exec("INSERT INTO entity_reflection_state VALUES (1, 'other gateway', NULL)");
+            $otherGateway = new EntityGateway(new PdoConnection($otherPdo), new MetadataReader($reader->export()));
+            /** @var ReflectionStateRecord $other */
+            $other = $otherGateway->executeQueryOne(ReflectionStateRecord::class, [
+                'sql' => 'SELECT * FROM entity_reflection_state WHERE id = 1',
+                'params' => [],
+            ]);
+            self::assertSame('other gateway', $other->body);
+            self::assertSame($cached[ReflectionStateRecord::class], $cacheProperty->getValue()[ReflectionStateRecord::class]);
+            self::assertSame(0, ReflectionStateRecord::$constructorCalls);
+
+            $exported = $reader->export();
+            self::assertSame($exported, unserialize(serialize($exported), ['allowed_classes' => false]));
+            self::assertStringNotContainsString('ReflectionClass', var_export($exported, true));
+            self::assertSame($exported, (new MetadataReader($reader->export()))->export());
+        } finally {
+            $cacheProperty->setValue(null, $originalCache);
+        }
+    }
+
+    public function testGatewayHydrationSeparatesInheritedEntityReflectionClasses(): void
+    {
+        $cacheProperty = new \ReflectionProperty(EntityGateway::class, 'reflectionClasses');
+        $cacheProperty->setValue(null, []);
+        $originalCache = [];
+        ReflectionStateRecord::$constructorCalls = 0;
+
+        try {
+            $gateway = new EntityGateway(new PdoConnection(new PDO('sqlite::memory:')));
+            $method = new \ReflectionMethod(EntityGateway::class, 'hydrate');
+            $row = ['id' => 1, 'body' => 'hydrated', 'note' => null];
+            $parent = $method->invoke($gateway, $gateway->meta(ReflectionStateRecord::class), $row);
+            $child = $method->invoke($gateway, $gateway->meta(ReflectionInheritedStateRecord::class), $row);
+            self::assertInstanceOf(ReflectionStateRecord::class, $parent);
+            self::assertInstanceOf(ReflectionInheritedStateRecord::class, $child);
+            self::assertSame('hydrated', $child->body);
+            self::assertSame(0, ReflectionStateRecord::$constructorCalls);
+
+            $cached = $cacheProperty->getValue();
+            self::assertSame([ReflectionStateRecord::class, ReflectionInheritedStateRecord::class], array_keys($cached));
+            self::assertNotSame($cached[ReflectionStateRecord::class], $cached[ReflectionInheritedStateRecord::class]);
+            self::assertSame(ReflectionInheritedStateRecord::class, $cached[ReflectionInheritedStateRecord::class]->getName());
+        } finally {
+            $cacheProperty->setValue(null, $originalCache);
+        }
     }
 
     public function testMetadataArrayExportImportRemainsSerializableAfterReflectionCacheUse(): void
