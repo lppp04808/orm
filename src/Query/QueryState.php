@@ -86,12 +86,9 @@ final class QueryState
     private function copyValue(mixed $value): mixed
     {
         if (is_array($value)) {
-            $copy = [];
-            foreach ($value as $key => $item) {
-                $copy[$key] = $this->copyValue($item);
-            }
-
-            return $copy;
+            return array_map(function ($item) {
+                return $this->copyValue($item);
+            }, $value);
         }
         if ($value instanceof Builder || $value instanceof JoinClause || $value instanceof Subquery) {
             return clone $value;
