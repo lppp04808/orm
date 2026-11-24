@@ -71,7 +71,7 @@ final readonly class SqlCompiler
                 continue;
             }
 
-            if ($char === '$' && preg_match('/\$([A-Za-z_][A-Za-z0-9_]*)?\$/', substr($sql, $i), $match) === 1) {
+            if ($char === '$' && preg_match('/\G\$([A-Za-z_][A-Za-z0-9_]*)?\$/', $sql, $match, 0, $i) === 1) {
                 $state = $match[0];
                 $out .= $state;
                 $i += strlen($state) - 1;

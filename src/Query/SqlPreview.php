@@ -102,11 +102,12 @@ final readonly class SqlPreview
 
     public function restore(): string
     {
-        $this->assertWrite('conditional UPDATE');
+        $this->builder->assertTerminal();
         $field = $this->gateway->meta($this->class)->softDeleteField();
         if ($field === null) {
             throw new InvalidArgumentException($this->class . ' does not declare a soft-delete field');
         }
+        $this->assertWrite('conditional UPDATE');
         $clone = clone $this->builder;
         $clone->state->softDeleteMode = 'only';
         $clone->state->cacheSoftDeleteMode = 'only';
@@ -128,6 +129,7 @@ final readonly class SqlPreview
         return $this->render($this->builder->buildDeltaUpdate($column, $operator, $amount, $extra));
     }
 
+    /** @return Builder<T> */
     private function limited(): Builder
     {
         $clone = clone $this->builder;

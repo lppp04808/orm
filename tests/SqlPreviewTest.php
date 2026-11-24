@@ -23,6 +23,7 @@ use Pixiaoka\Orm\Gateway\DriverAwareConnection;
 use Pixiaoka\Orm\Gateway\EntityGateway;
 use Pixiaoka\Orm\Observability\Event;
 use Pixiaoka\Orm\Query\Builder;
+use Pixiaoka\Orm\Query\RenderContext;
 use Pixiaoka\Orm\Query\SqlCompiler;
 use Pixiaoka\Orm\Query\SqlPreview;
 use Pixiaoka\Orm\Session;
@@ -220,6 +221,23 @@ final class SqlPreviewTest extends TestCase
         self::assertSame([], $this->connection->operations);
     }
 
+    public function testVersionedModelWithoutSoftDeleteChecksRestoreFieldFirst(): void
+    {
+        $query = PreviewVersionedPlainRecord::query()->where('id', 1);
+        foreach ([
+            static fn (): string => $query->preview()->restore(),
+            static fn (): int => $query->restore(),
+        ] as $restore) {
+            try {
+                $restore();
+                self::fail('restore() requires a soft-delete field before optimistic-lock validation');
+            } catch (InvalidArgumentException $e) {
+                self::assertStringContainsString('does not declare a soft-delete field', $e->getMessage());
+            }
+        }
+        self::assertSame([], $this->connection->operations);
+    }
+
     public function testRelationConstraintRejectsPreviewAndTerminalCalls(): void
     {
         try {
@@ -322,6 +340,33 @@ SQL;
         self::assertStringContainsString('-- :q0', $sql);
         self::assertStringContainsString('# :q0', $sql);
         self::assertSame([], $this->connection->operations);
+    }
+
+    public function testDollarQuotesStartOnlyAtTheCurrentOffset(): void
+    {
+        $sql = <<<'SQL'
+SELECT col$1, $1, :q0, $$:q0$$, $tag$:q0$tag$
+SQL;
+        self::assertSame(
+            'SELECT col$1, $1, 7, $$:q0$$, $tag$:q0$tag$',
+            SqlCompiler::interpolate($sql, ['q0' => 7], 'pgsql'),
+        );
+
+        $raw = 'SELECT col$1, $1, :actual, $$:q0$$, $tag$:q0$tag$';
+        $context = new RenderContext();
+        self::assertSame(
+            'SELECT col$1, $1, :q0, $$:q0$$, $tag$:q0$tag$',
+            $context->mergeRaw($raw, ['actual' => 7]),
+        );
+        self::assertSame(['q0' => 7], $context->params());
+        self::assertSame(
+            'SELECT col$1, $1, 7, $$:q0$$, $tag$:q0$tag$',
+            SqlCompiler::interpolate(
+                $context->mergeRaw($raw, ['actual' => 7]),
+                $context->params(),
+                'pgsql',
+            ),
+        );
     }
 
     public function testBackslashEscapesAreOnlyActiveInsideMysqlQuotedText(): void
@@ -433,6 +478,22 @@ final class PreviewVersionedRecord extends Entity
     public static function table(): string
     {
         return 'preview_versioned_record';
+    }
+}
+
+final class PreviewVersionedPlainRecord extends Entity
+{
+    #[Column]
+    #[PrimaryKey]
+    public int $id;
+
+    #[Column]
+    #[Version]
+    public int $revision;
+
+    public static function table(): string
+    {
+        return 'preview_versioned_plain_record';
     }
 }
 

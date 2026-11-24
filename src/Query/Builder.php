@@ -605,6 +605,8 @@ final class Builder
 
     /**
      * 创建无副作用的 SQL 调试预览代理；代理持有独立的查询状态快照。
+     *
+     * @return SqlPreview<T>
      */
     public function preview(): SqlPreview
     {
