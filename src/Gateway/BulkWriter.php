@@ -228,7 +228,7 @@ final readonly class BulkWriter
 
     public function executeUpdate(Builder $builder, array $values): int
     {
-        $this->assertVersionWrite($this->metadata->read($builder->modelClass()), 'conditional UPDATE');
+        $builder->gateway()->assertConditionalWrite($builder->modelClass(), 'conditional UPDATE');
         $query = $builder->buildUpdate($values);
         $affected = $this->executor->execute($query['sql'], $query['params'], $builder->modelClass());
         $this->cache->clearClass($this->metadata->read($builder->modelClass())->class);
@@ -245,7 +245,7 @@ final readonly class BulkWriter
         array $extra = [],
     ): int {
         $meta = $this->metadata->read($builder->modelClass());
-        $this->assertVersionWrite($meta, 'conditional UPDATE');
+        $builder->gateway()->assertConditionalWrite($builder->modelClass(), 'conditional UPDATE');
         $query = $builder->buildDeltaUpdate($column, $operator, $amount, $extra);
         $affected = $this->executor->execute($query['sql'], $query['params'], $meta->class);
         $this->cache->clearClass($meta->class);
@@ -265,7 +265,7 @@ final readonly class BulkWriter
         $meta = $this->metadata->read($builder->modelClass());
         $field = $meta->softDeleteField()
             ?? throw new \InvalidArgumentException($meta->class . ' does not declare a soft-delete field');
-        $this->assertVersionWrite($meta, 'conditional UPDATE');
+        $builder->gateway()->assertConditionalWrite($builder->modelClass(), 'conditional UPDATE');
         $known = $this->knownMatchingEntities($meta, $builder);
         $query = $builder->buildUpdate([$field->property => null]);
         $affected = $this->executor->execute($query['sql'], $query['params'], $meta->class);
@@ -291,7 +291,7 @@ final readonly class BulkWriter
     public function executeDelete(EntityGateway $gateway, Builder $builder, bool $force = false): int
     {
         $meta = $this->metadata->read($builder->modelClass());
-        $this->assertVersionWrite($meta, 'conditional DELETE');
+        $builder->gateway()->assertConditionalWrite($builder->modelClass(), 'conditional DELETE', $force);
         $class = $meta->class;
         $softDelete = $force ? null : $meta->softDeleteField();
         if ($softDelete !== null) {
@@ -429,7 +429,7 @@ final readonly class BulkWriter
     public function upsert(string $class, array $values, ?array $updateColumns = null, ?array $conflictColumns = null): int
     {
         $meta = $this->metadata->read($class);
-        $this->assertVersionWrite($meta, 'UPSERT');
+        $this->assertConditionalWrite($meta, 'UPSERT');
         if ($values === []) {
             throw new \InvalidArgumentException('UPSERT requires at least one field');
         }
@@ -575,10 +575,14 @@ final readonly class BulkWriter
         return $value;
     }
 
-    private function assertVersionWrite(ModelMeta $meta, string $operation): void
+    /** @internal 真实条件写和 SQL 预览都通过 EntityGateway 复用本校验。 */
+    public static function assertConditionalWrite(ModelMeta $meta, string $operation, bool $forceDelete = false): void
     {
         if ($meta->version !== null) {
             throw new \LogicException($meta->class . " uses optimistic locking; $operation cannot preserve per-entity version semantics; use save/delete per entity");
+        }
+        if ($forceDelete && $meta->softDeleteField() === null) {
+            throw new \InvalidArgumentException($meta->class . ' does not declare a soft-delete field');
         }
     }
 

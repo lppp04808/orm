@@ -495,7 +495,7 @@ $rows = Customer::query()
 
 `withCount()` adds a raw output column through a correlated `COUNT(*)` scalar subquery. It does not hydrate entities, modify entity fields, relation state, or cache, or cause N+1 queries. The default alias replaces dots in the path with underscores and appends `_count`. The same path may be counted under different aliases, and an array declares multiple paths and final-level constraints. Output-name conflicts with default model columns, explicit projections, or other count aliases are rejected when building SQL. Read counts with `rows()`, `row()`, or `value('orders_count')`; the PDO raw type is not guaranteed to be PHP int.
 
-Relation filters and count constraints allow only structured WHERE/OR and nested relation filters. Property names and real column names are supported, and constraint columns are automatically qualified for the current relation. Raw conditions/expressions, arbitrary ordinary Builder subqueries, explicit table prefixes, projections, withCount, JOIN, GROUP/HAVING, UNION, derived tables, DISTINCT, aliases, ordering, limit/offset, row locks, and with are unsupported. A closure must return `null` or the same Builder passed to it. Do not execute get/first/rows/row/value/count/build/update/delete or other terminal operations in a closure or its OR groups. Invalid constraints are rejected before any SQL.
+Relation filters and count constraints allow only structured WHERE/OR and nested relation filters. Property names and real column names are supported, and constraint columns are automatically qualified for the current relation. Raw conditions/expressions, arbitrary ordinary Builder subqueries, explicit table prefixes, projections, withCount, JOIN, GROUP/HAVING, UNION, derived tables, DISTINCT, aliases, ordering, limit/offset, row locks, and with are unsupported. A closure must return `null` or the same Builder passed to it. Do not execute get/first/rows/row/value/count/build/preview/update/delete or other terminal operations in a closure or its OR groups. Invalid constraints are rejected before any SQL.
 
 `whereHas()/whereDoesntHave()/whereRelation()` work with entity queries, raw rows, parent COUNT, and conditional UPDATE/DELETE, subject to existing restrictions such as optimistic locking. They may be combined with independent `with()`; filters do not become eager-load constraints. In the current version, `withCount()` is mutually exclusive with relation filters and cannot be used with `get()/first()/count()`, conditional UPDATE/DELETE, or `with()`. Ordinary WHERE/OR may be called before or after a count, but a count cannot be combined with relation filters inside an OR group. If the target model uses soft deletion, relation filters and counts include only non-deleted targets by default; a relation constraint may explicitly call `withTrashed()`. Quantity comparisons through `has()`, relation writes, and many-to-many relations are not included.
 
@@ -602,6 +602,43 @@ $admins = (clone $adults)->where('role', 'admin');
 ```
 
 `clone` recursively isolates ORM query state including WHERE/OR, subqueries, JOIN, UNION, derived tables, ordering, and pagination. `first()`, `row()`, `value()`, and complex `count()` also clone to avoid contaminating the original query. Business objects in bindings, such as `DateTimeImmutable`, enums, and Decimal, are not cloned; avoid modifying shared mutable value objects. Internal `QueryState` and SQL/relation compilers are not public extension points; the fluent Builder is the stable API.
+
+### SQL debugging preview: preview()
+
+```php
+$query = User::query()
+    ->where('name', "O'Reilly")
+    ->whereOp('age', '>=', 18)
+    ->orderBy('id')
+    ->limit(20);
+
+// Every preview terminal returns a string. No database I/O, cache access, or entity hooks occur.
+echo $query->preview()->get();
+echo $query->preview()->first();   // LIMIT 1 is applied only to a preview clone
+echo $query->preview()->count();
+
+// Raw-row and scalar previews retain their corresponding Builder validation.
+echo $query->preview()->rows();
+echo $query->preview()->row();
+echo User::query()->select('name')->where('id', 7)->preview()->value();
+
+// Conditional writes produce diagnostic text too; normal write validation still applies.
+echo User::query()->where('id', 7)->preview()->update(['name' => 'next']);
+echo User::query()->where('id', 7)->preview()->increment('age', 1, ['name' => 'next']);
+echo User::query()->where('id', 7)->preview()->decrement('age');
+echo User::query()->where('id', 7)->preview()->delete();
+
+// Soft-deleting models: UPDATE for delete/restore and DELETE for forceDelete.
+echo Article::query()->where('id', 7)->preview()->delete();
+echo Article::query()->where('id', 7)->preview()->restore();
+echo Article::query()->onlyTrashed()->where('id', 7)->preview()->forceDelete();
+```
+
+`preview()` owns a `clone $this`, so `first()` and `restore()` cannot change the original Builder's `limit`, `softDeleteMode`, or cache scope. With `with()`, `get()` and `first()` return only the main SELECT and do not invent eager-loading subqueries. The other read previews retain their real terminal checks. Conditional-write previews remain forbidden for `#[Version]` models; models without soft deletion reject `restore()` / `forceDelete()` previews; relation-constraint closures reject preview terminals as well.
+
+Interpolation uses a lexical state machine. It replaces only actual named placeholders and skips paired quotes, comments, PostgreSQL dollar-quoted strings, and `::type` casts. Booleans follow the current driver, while non-finite floats and missing parameters are rejected. NUL, newlines, tabs, and other control characters are rendered as readable `\0`, `\n`, and `\t` escapes; MySQL string literals also escape backslashes.
+
+**For debugging and inspection only. Never execute the returned string as a substitute for parameterized Builder execution. The output contains plaintext parameter values; redact it before writing logs, reporting errors, or sharing screenshots.**
 
 ### Available condition methods
 

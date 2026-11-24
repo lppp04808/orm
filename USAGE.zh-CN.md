@@ -495,7 +495,7 @@ $rows = Customer::query()
 
 `withCount()` 以相关 `COUNT(*)` 标量子查询添加原始输出列，不水合实体、不修改实体字段、关系状态或缓存，不产生 N+1 查询。默认别名是路径点替换为下划线再加 `_count`；相同路径可用不同别名重复计数，数组可声明多个路径和末级约束。最终输出名与默认模型列、显式投影或其他计数别名冲突会在构建 SQL 时拒绝。计数结果必须通过 `rows()`、`row()` 或 `value('orders_count')` 读取，不承诺 PDO 原始类型一定是 PHP int。
 
-关联过滤和计数约束只允许结构化 WHERE/OR、嵌套关联过滤；支持属性名和真实列名，约束列由当前关系自动限定。不支持 whereRaw/Expression、任意普通 Builder 子查询、显式表前缀、投影、withCount、JOIN、GROUP/HAVING、UNION、派生表、DISTINCT、alias、排序、limit/offset、行锁或 with。闭包必须返回 `null` 或传入的同一个 Builder；不得在闭包或其中的 OR 分组内执行 get/first/rows/row/value/count/build/update/delete 等终结操作。非法约束在任何 SQL 之前拒绝。
+关联过滤和计数约束只允许结构化 WHERE/OR、嵌套关联过滤；支持属性名和真实列名，约束列由当前关系自动限定。不支持 whereRaw/Expression、任意普通 Builder 子查询、显式表前缀、投影、withCount、JOIN、GROUP/HAVING、UNION、派生表、DISTINCT、alias、排序、limit/offset、行锁或 with。闭包必须返回 `null` 或传入的同一个 Builder；不得在闭包或其中的 OR 分组内执行 get/first/rows/row/value/count/build/preview/update/delete 等终结操作。非法约束在任何 SQL 之前拒绝。
 
 `whereHas()/whereDoesntHave()/whereRelation()` 可用于实体查询、原始行、父 COUNT 和条件 UPDATE/DELETE（仍遵守乐观锁等原有写入限制）；可与独立 `with()` 组合，过滤不会变成预加载约束。首版 `withCount()` 与关联过滤互斥，不能用于 `get()/first()/count()`、条件 UPDATE/DELETE 或 `with()`。普通 WHERE/OR 与计数的两种调用顺序均可；计数与 OR 分组内的关联过滤仍互斥。目标模型声明软删除时，关联过滤与计数默认只统计未删除目标，关系约束中可用 `withTrashed()` 显式放宽。这里不包含 `has()` 的数量比较、关联写入或多对多。
 
@@ -602,6 +602,43 @@ $admins = (clone $adults)->where('role', 'admin');
 ```
 
 `clone` 会递归隔离 WHERE/OR、子查询、JOIN、UNION、派生表、排序和分页等 ORM 查询状态；`first()`、`row()`、`value()` 与复杂 `count()` 也通过克隆避免污染原查询。绑定值中的 `DateTimeImmutable`、枚举、Decimal 等业务对象不克隆，调用方应避免修改共享的可变值对象。内部 `QueryState`、SQL/关系编译器不是公共扩展接口，流式 Builder 才是稳定使用入口。
+
+### SQL 调试预览：preview()
+
+```php
+$query = User::query()
+    ->where('name', "O'Reilly")
+    ->whereOp('age', '>=', 18)
+    ->orderBy('id')
+    ->limit(20);
+
+// 所有预览终结方法均返回 string，不查询数据库、不触碰缓存、不触发实体钩子。
+echo $query->preview()->get();
+echo $query->preview()->first();   // 仅在预览克隆上添加 LIMIT 1
+echo $query->preview()->count();
+
+// 原始行与标量查询遵循对应真实方法的结构校验。
+echo $query->preview()->rows();
+echo $query->preview()->row();
+echo User::query()->select('name')->where('id', 7)->preview()->value();
+
+// 条件写也只生成诊断文本；仍拒绝无 WHERE、主键更新、非法增量等操作。
+echo User::query()->where('id', 7)->preview()->update(['name' => 'next']);
+echo User::query()->where('id', 7)->preview()->increment('age', 1, ['name' => 'next']);
+echo User::query()->where('id', 7)->preview()->decrement('age');
+echo User::query()->where('id', 7)->preview()->delete();
+
+// 软删除模型：delete() 预览 UPDATE，restore() 自动限定 onlyTrashed，forceDelete() 预览 DELETE。
+echo Article::query()->where('id', 7)->preview()->delete();
+echo Article::query()->where('id', 7)->preview()->restore();
+echo Article::query()->onlyTrashed()->where('id', 7)->preview()->forceDelete();
+```
+
+`preview()` 持有 `clone $this`，因此 `first()`、`restore()` 等操作不会改变原 Builder 的 `limit`、`softDeleteMode` 或缓存范围。带 `with()` 的 `get()` / `first()` 只返回主查询 SQL，不伪造预加载子查询。`rows()`、`row()`、`value()`、`count()` 保留真实终结方法的校验；`#[Version]` 模型的条件写预览仍会被拒绝，非软删除模型不能预览 `restore()` / `forceDelete()`，关系约束闭包内也不能调用预览终结操作。
+
+插值使用词法状态机，只替换真正的命名参数，跳过成对引号、注释、PostgreSQL dollar-quoted 字符串和 `::type`。布尔值按当前驱动输出，非有限浮点数与缺失参数会被拒绝；字符串中的 NUL、换行、制表符等控制字符会显示为 `\0`、`\n`、`\t` 等可读转义，MySQL 字符串还会转义反斜杠。
+
+**仅用于调试查看，不可把返回字符串直接拼接执行；实际读写仍应使用原来的参数化 Builder 方法。输出包含参数明文，写日志、上报异常或分享截图时必须脱敏。**
 
 ### 可用条件方法
 

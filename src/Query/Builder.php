@@ -603,11 +603,47 @@ final class Builder
 
     // ==================== 执行 ====================
 
-    /** @return list<T> */
-    public function get(): array
+    /**
+     * 创建无副作用的 SQL 调试预览代理；代理持有独立的查询状态快照。
+     */
+    public function preview(): SqlPreview
+    {
+        $this->compiler->assertDeferredRelationExecution($this->state);
+
+        return new SqlPreview(clone $this);
+    }
+
+    /** @internal 实体读取与对应预览共用的终结操作校验。 */
+    public function assertHydratableTerminal(): void
     {
         $this->compiler->assertDeferredRelationExecution($this->state);
         $this->compiler->assertHydratable($this->state);
+    }
+
+    /** @internal 原始行读取与对应预览共用的终结操作校验。 */
+    public function assertRawTerminal(string $operation): void
+    {
+        $this->compiler->assertDeferredRelationExecution($this->state);
+        $this->compiler->assertNoEagerRelations($this->state, $operation);
+    }
+
+    /** @internal COUNT 执行与预览共用的终结操作校验。 */
+    public function assertCountTerminal(): void
+    {
+        $this->assertRawTerminal('count()');
+        $this->relations->assertNoRelationCounts($this->state, 'count()');
+    }
+
+    /** @internal 条件写入与对应预览共用的关系约束校验。 */
+    public function assertTerminal(): void
+    {
+        $this->compiler->assertDeferredRelationExecution($this->state);
+    }
+
+    /** @return list<T> */
+    public function get(): array
+    {
+        $this->assertHydratableTerminal();
 
         return $this->gateway->executeQuery(
             $this->class,
@@ -620,8 +656,7 @@ final class Builder
     /** @return T|null */
     public function first(): ?Entity
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
-        $this->compiler->assertHydratable($this->state);
+        $this->assertHydratableTerminal();
         $clone = clone $this;
         $clone->state->limit = 1;
 
@@ -636,8 +671,7 @@ final class Builder
     /** @return list<array<string, mixed>> */
     public function rows(): array
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
-        $this->compiler->assertNoEagerRelations($this->state, 'rows()');
+        $this->assertRawTerminal('rows()');
 
         return $this->gateway->executeRows($this->class, $this->build());
     }
@@ -645,8 +679,7 @@ final class Builder
     /** 单行原始结果（强制 LIMIT 1 clone）。 */
     public function row(): ?array
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
-        $this->compiler->assertNoEagerRelations($this->state, 'row()');
+        $this->assertRawTerminal('row()');
         $clone = clone $this;
         $clone->state->limit = 1;
 
@@ -656,8 +689,7 @@ final class Builder
     /** 标量值（COUNT/SUM/单值列）。$column 指定返回列，null 取首列。 */
     public function value(?string $column = null): mixed
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
-        $this->compiler->assertNoEagerRelations($this->state, 'value()');
+        $this->assertRawTerminal('value()');
         $clone = clone $this;
         $clone->state->limit = 1;
 
@@ -666,9 +698,7 @@ final class Builder
 
     public function count(string $column = '*'): int
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
-        $this->compiler->assertNoEagerRelations($this->state, 'count()');
-        $this->relations->assertNoRelationCounts($this->state, 'count()');
+        $this->assertCountTerminal();
 
         return $this->gateway->executeCountQuery($this->countSql($column));
     }
@@ -676,7 +706,7 @@ final class Builder
     /** 按条件更新，返回受影响行数。无 WHERE、空 SET 或主键更新会被拒绝。 */
     public function update(array $values): int
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
+        $this->assertTerminal();
 
         return $this->gateway->executeUpdate($this, $values);
     }
@@ -684,7 +714,7 @@ final class Builder
     /** 按条件原子增加数值字段，可附带更新其他字段，返回受影响行数。 */
     public function increment(string $column, int|float $amount = 1, array $extra = []): int
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
+        $this->assertTerminal();
 
         return $this->gateway->executeDeltaUpdate($this, $column, '+', $amount, $extra);
     }
@@ -692,7 +722,7 @@ final class Builder
     /** 按条件原子减少数值字段，可附带更新其他字段，返回受影响行数。 */
     public function decrement(string $column, int|float $amount = 1, array $extra = []): int
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
+        $this->assertTerminal();
 
         return $this->gateway->executeDeltaUpdate($this, $column, '-', $amount, $extra);
     }
@@ -700,7 +730,7 @@ final class Builder
     /** 按条件删除，返回受影响行数。无 WHERE 会被拒绝。 */
     public function delete(): int
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
+        $this->assertTerminal();
 
         return $this->gateway->executeDelete($this);
     }
@@ -729,7 +759,7 @@ final class Builder
     /** 批量恢复符合当前条件的软删除行；不会触碰未删除行。 */
     public function restore(): int
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
+        $this->assertTerminal();
         $field = $this->gateway->meta($this->class)->softDeleteField();
         if ($field === null) {
             throw new InvalidArgumentException($this->class . ' does not declare a soft-delete field');
@@ -743,7 +773,7 @@ final class Builder
     /** 强制物理删除符合当前条件的行，默认仍只针对未软删除的行。 */
     public function forceDelete(): int
     {
-        $this->compiler->assertDeferredRelationExecution($this->state);
+        $this->assertTerminal();
 
         return $this->gateway->executeDelete($this, true);
     }

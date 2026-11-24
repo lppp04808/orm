@@ -22,6 +22,135 @@ final readonly class SqlCompiler
     ) {
     }
 
+    /** 仅供 SQL 调试预览使用；输出不得作为参数化执行的替代。 @param array<string, int|float|string|bool|null> $params */
+    public static function interpolate(string $sql, array $params, string $driver): string
+    {
+        $out = '';
+        $length = strlen($sql);
+        $state = 'sql';
+        for ($i = 0; $i < $length; $i++) {
+            $char = $sql[$i];
+            $next = $sql[$i + 1] ?? '';
+            if ($state !== 'sql') {
+                $out .= $char;
+                if (str_starts_with($state, '$')) {
+                    if (substr($sql, $i, strlen($state)) === $state) {
+                        $out .= substr($state, 1);
+                        $i += strlen($state) - 1;
+                        $state = 'sql';
+                    }
+                    continue;
+                }
+                if ($state === 'line') {
+                    if ($char === "\n" || $char === "\r") {
+                        $state = 'sql';
+                    }
+                    continue;
+                }
+                if ($state === 'block') {
+                    if ($char === '*' && $next === '/') {
+                        $out .= $next;
+                        $i++;
+                        $state = 'sql';
+                    }
+                    continue;
+                }
+                if ($char === '\\' && $driver === 'mysql' && ($state === "'" || $state === '"') && $next !== '') {
+                    $out .= $next;
+                    $i++;
+                    continue;
+                }
+                if ($char === $state) {
+                    if ($next === $char) {
+                        $out .= $next;
+                        $i++;
+                    } else {
+                        $state = 'sql';
+                    }
+                }
+                continue;
+            }
+
+            if ($char === '$' && preg_match('/\$([A-Za-z_][A-Za-z0-9_]*)?\$/', substr($sql, $i), $match) === 1) {
+                $state = $match[0];
+                $out .= $state;
+                $i += strlen($state) - 1;
+            } elseif ($char === "'" || $char === '"' || $char === '`') {
+                $state = $char;
+                $out .= $char;
+            } elseif ($char === '-' && $next === '-') {
+                $state = 'line';
+                $out .= '--';
+                $i++;
+            } elseif ($char === '#') {
+                $state = 'line';
+                $out .= $char;
+            } elseif ($char === '/' && $next === '*') {
+                $state = 'block';
+                $out .= '/*';
+                $i++;
+            } elseif ($char === ':' && $next === ':') {
+                $out .= '::';
+                $i++;
+            } elseif ($char === ':' && preg_match('/[A-Za-z_]/', $next) === 1) {
+                $end = $i + 1;
+                while ($end + 1 < $length && preg_match('/[A-Za-z0-9_]/', $sql[$end + 1]) === 1) {
+                    $end++;
+                }
+                $name = substr($sql, $i + 1, $end - $i);
+                if (!array_key_exists($name, $params)) {
+                    throw new InvalidArgumentException('SQL preview is missing parameter: ' . $name);
+                }
+                $out .= self::literal($params[$name], $driver);
+                $i = $end;
+            } else {
+                $out .= $char;
+            }
+        }
+
+        return $out;
+    }
+
+    private static function literal(int|float|string|bool|null $value, string $driver): string
+    {
+        if ($value === null) {
+            return 'NULL';
+        }
+        if (is_bool($value)) {
+            return $driver === 'pgsql' ? ($value ? 'TRUE' : 'FALSE') : ($value ? '1' : '0');
+        }
+        if (is_int($value)) {
+            return (string) $value;
+        }
+        if (is_float($value)) {
+            if (is_nan($value) || is_infinite($value)) {
+                throw new InvalidArgumentException('SQL preview requires finite floating-point parameters');
+            }
+            $literal = (string) $value;
+
+            // 保留浮点类型，避免把 1.0 悄悄变成整数字面量。
+            return preg_match('/^[+-]?\d+$/', $literal) === 1 ? $literal . '.0' : $literal;
+        }
+
+        $escaped = '';
+        $length = strlen($value);
+        for ($i = 0; $i < $length; $i++) {
+            $ord = ord($value[$i]);
+            $escaped .= match (true) {
+                $ord === 0 => '\\0',
+                $ord === 9 => '\\t',
+                $ord === 10 => '\\n',
+                $ord === 13 => '\\r',
+                $ord < 32 || $ord === 127 => sprintf('\\x%02X', $ord),
+                $value[$i] === "'" => "''",
+                $value[$i] === '\\' && $driver === 'mysql' => '\\\\',
+                default => $value[$i],
+            };
+        }
+
+        return "'" . $escaped . "'";
+    }
+
     /** @return array{sql: string, params: array<string, int|float|string|bool|null>} */
     public function buildSelect(string $class, QueryState $state): array
     {

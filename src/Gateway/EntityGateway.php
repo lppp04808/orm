@@ -786,6 +786,20 @@ final class EntityGateway
         return $this->bulk->executeDelete($this, $builder, $force);
     }
 
+    /** @internal 条件写执行与 SQL 预览共用软删除时间戳的类型转换边界。 */
+    public function currentTimestamp(string $class, string $property): int|\DateTimeImmutable
+    {
+        $meta = $this->metadata->read($class);
+
+        return $this->caster->currentTimestamp($meta->field($property));
+    }
+
+    /** @internal 执行与 SQL 预览共用条件写约束，不能产生两套写权限。 */
+    public function assertConditionalWrite(string $class, string $operation, bool $forceDelete = false): void
+    {
+        BulkWriter::assertConditionalWrite($this->metadata->read($class), $operation, $forceDelete);
+    }
+
     /** @return list<array<string, mixed>> 原生 SELECT/CTE 查询，调用方负责 SQL 的正确性。 */
     public function selectRaw(string|Expression $sql, array $params = []): array
     {
