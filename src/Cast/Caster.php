@@ -25,7 +25,7 @@ final class Caster
             if ($field->nullable()) {
                 return null;
             }
-            throw $this->fail($model, $field, '非空字段收到 NULL');
+            throw $this->fail($model, $field, 'Non-nullable field received NULL');
         }
 
         $name = $field->typeName();
@@ -46,14 +46,14 @@ final class Caster
             if ($field->nullable()) {
                 return null;
             }
-            throw $this->fail($model, $field, '非空字段写出 null');
+            throw $this->fail($model, $field, 'Cannot write null to a non-nullable field');
         }
 
         $name = $field->typeName();
 
         if ($name === 'bool') {
             if (!is_bool($value)) {
-                throw $this->fail($model, $field, '写出的 bool 不是布尔');
+                throw $this->fail($model, $field, 'Expected a bool value for database output');
             }
 
             return $value ? 1 : 0;
@@ -61,11 +61,11 @@ final class Caster
 
         if ($name === 'array') {
             if (!is_array($value)) {
-                throw $this->fail($model, $field, '写出的 array 不是数组');
+                throw $this->fail($model, $field, 'Expected an array value for database output');
             }
             $json = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
             if ($json === false) {
-                throw $this->fail($model, $field, '数组无法编码为 JSON');
+                throw $this->fail($model, $field, 'Failed to encode array as JSON');
             }
 
             return $json;
@@ -73,7 +73,7 @@ final class Caster
 
         if (is_a($name, Decimal::class, true)) {
             if (!$value instanceof Decimal) {
-                throw $this->fail($model, $field, '写出的十进数类型不对');
+                throw $this->fail($model, $field, 'Expected a Decimal value for database output');
             }
 
             return (string) $value;
@@ -81,7 +81,7 @@ final class Caster
 
         if ($name === DateTimeImmutable::class) {
             if (!$value instanceof DateTimeImmutable) {
-                throw $this->fail($model, $field, '写出的时间不是 DateTimeImmutable');
+                throw $this->fail($model, $field, 'Expected a DateTimeImmutable value for database output');
             }
             $utc = $value->setTimezone(new DateTimeZone('UTC'));
             if ($field->temporal === Temporal::UNIX) {
@@ -93,7 +93,7 @@ final class Caster
 
         if (is_a($name, \BackedEnum::class, true)) {
             if (!$value instanceof \BackedEnum) {
-                throw $this->fail($model, $field, '写出的枚举类型不对');
+                throw $this->fail($model, $field, 'Expected a BackedEnum value for database output');
             }
 
             return $value->value;
@@ -101,38 +101,38 @@ final class Caster
 
         if (is_a($name, Castable::class, true)) {
             if (!$value instanceof $name) {
-                throw $this->fail($model, $field, '写出的 Castable 类型不对');
+                throw $this->fail($model, $field, 'Invalid Castable value for database output');
             }
             try {
                 return $value->toDatabase();
             } catch (\Throwable $e) {
-                throw $this->fail($model, $field, 'Castable 无法序列化: ' . $e->getMessage());
+                throw $this->fail($model, $field, 'Failed to serialize Castable: ' . $e->getMessage());
             }
         }
 
         if ($name === 'int') {
             if (!is_int($value)) {
-                throw $this->fail($model, $field, '写出的 int 不是整数');
+                throw $this->fail($model, $field, 'Expected an int value for database output');
             }
 
             return $value;
         }
         if ($name === 'float') {
             if (!is_float($value) && !is_int($value)) {
-                throw $this->fail($model, $field, '写出的 float 不是数字');
+                throw $this->fail($model, $field, 'Expected a numeric value for database output');
             }
 
             return (float) $value;
         }
         if ($name === 'string') {
             if (!is_string($value)) {
-                throw $this->fail($model, $field, '写出的 string 不是字符串');
+                throw $this->fail($model, $field, 'Expected a string value for database output');
             }
 
             return $value;
         }
 
-        throw $this->fail($model, $field, '不支持的写出类型');
+        throw $this->fail($model, $field, 'Unsupported database output type');
     }
 
     /**
@@ -173,7 +173,7 @@ final class Caster
         if (is_string($value) && preg_match('/^-?\d+$/', $value) === 1) {
             return (int) $value;
         }
-        throw $this->fail($model, $field, '无法解析为 int');
+        throw $this->fail($model, $field, 'Cannot parse value as int');
     }
 
     private function toFloat(string $model, FieldMeta $field, mixed $value): float
@@ -184,7 +184,7 @@ final class Caster
         if (is_string($value) && is_numeric($value)) {
             return (float) $value;
         }
-        throw $this->fail($model, $field, '无法解析为 float');
+        throw $this->fail($model, $field, 'Cannot parse value as float');
     }
 
     private function toString(string $model, FieldMeta $field, mixed $value): string
@@ -195,7 +195,7 @@ final class Caster
         if (is_int($value) || is_float($value)) {
             return (string) $value;
         }
-        throw $this->fail($model, $field, '无法解析为 string');
+        throw $this->fail($model, $field, 'Cannot parse value as string');
     }
 
     private function toBool(string $model, FieldMeta $field, mixed $value): bool
@@ -206,7 +206,7 @@ final class Caster
         if ($value === 0 || $value === 1 || $value === '0' || $value === '1') {
             return $value === 1 || $value === '1';
         }
-        throw $this->fail($model, $field, 'bool 只接受 0/1/true/false');
+        throw $this->fail($model, $field, 'bool accepts only 0/1/true/false');
     }
 
     private function toArray(string $model, FieldMeta $field, mixed $value): array
@@ -215,15 +215,15 @@ final class Caster
             return $value;
         }
         if (!is_string($value)) {
-            throw $this->fail($model, $field, 'array 只接受 JSON 文本或数组');
+            throw $this->fail($model, $field, 'array accepts only JSON text or an array');
         }
         try {
             $decoded = json_decode($value, true, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException) {
-            throw $this->fail($model, $field, 'JSON 无法解码');
+            throw $this->fail($model, $field, 'Failed to decode JSON');
         }
         if (!is_array($decoded)) {
-            throw $this->fail($model, $field, 'JSON 解码结果不是数组');
+            throw $this->fail($model, $field, 'Decoded JSON value is not an array');
         }
 
         return $decoded;
@@ -236,15 +236,18 @@ final class Caster
             return $value;
         }
         if (!is_int($value) && !(is_string($value) && preg_match('/^-?\d+(\.\d+)?$/', $value) === 1)) {
-            throw $this->fail($model, $field, '无法解析为十进数');
+            throw $this->fail($model, $field, 'Cannot parse value as a decimal number');
         }
         try {
+            /**
+             * @var class-string $name
+             */
             $decimal = $name::fromString((string) $value);
         } catch (\Throwable) {
-            throw $this->fail($model, $field, '无法解析为十进数');
+            throw $this->fail($model, $field, 'Cannot parse value as a decimal number');
         }
         if (!$decimal instanceof Decimal) {
-            throw $this->fail($model, $field, '十进数类型没有实现 Decimal');
+            throw $this->fail($model, $field, 'Decimal type does not implement Decimal');
         }
 
         return $decimal;
@@ -273,15 +276,18 @@ final class Caster
             return $value;
         }
         if (!is_int($value) && !is_float($value) && !is_string($value)) {
-            throw $this->fail($model, $field, 'Castable 只接受标量数据库值');
+            throw $this->fail($model, $field, 'Castable accepts only scalar database values');
         }
         try {
+            /**
+             * @var class-string<Castable> $name
+             */
             $object = $name::fromDatabase($value);
         } catch (\Throwable $e) {
-            throw $this->fail($model, $field, 'Castable 无法反序列化: ' . $e->getMessage());
+            throw $this->fail($model, $field, 'Failed to deserialize Castable: ' . $e->getMessage());
         }
         if (!$object instanceof $name) {
-            throw $this->fail($model, $field, 'Castable::fromDatabase() 返回类型不对');
+            throw $this->fail($model, $field, 'Castable::fromDatabase() returned an invalid type');
         }
 
         return $object;
@@ -296,15 +302,15 @@ final class Caster
             if (is_int($value) || (is_string($value) && preg_match('/^-?\d+$/', $value) === 1)) {
                 return (new DateTimeImmutable('@' . (int) $value))->setTimezone(new DateTimeZone('UTC'));
             }
-            throw $this->fail($model, $field, '无法解析为 Unix 时间');
+            throw $this->fail($model, $field, 'Cannot parse value as a Unix timestamp');
         }
         if (!is_string($value)) {
-            throw $this->fail($model, $field, '时间文本不是字符串');
+            throw $this->fail($model, $field, 'Temporal database value must be a string');
         }
         $parsed = DateTimeImmutable::createFromFormat('!' . self::TIME_FORMAT, $value, new DateTimeZone('UTC'));
         $errors = DateTimeImmutable::getLastErrors();
         if ($parsed === false || ($errors['warning_count'] ?? 0) > 0 || ($errors['error_count'] ?? 0) > 0) {
-            throw $this->fail($model, $field, '时间文本无法解析');
+            throw $this->fail($model, $field, 'Cannot parse temporal text');
         }
 
         return $parsed;
@@ -314,13 +320,13 @@ final class Caster
     {
         $name = $field->typeName();
         if (!is_a($name, \BackedEnum::class, true)) {
-            throw $this->fail($model, $field, '不支持的类型 ' . $name);
+            throw $this->fail($model, $field, 'Unsupported type ' . $name);
         }
         if ($value instanceof $name) {
             return $value;
         }
         if (!is_int($value) && !is_string($value)) {
-            throw $this->fail($model, $field, '枚举 backing value 类型不对');
+            throw $this->fail($model, $field, 'Invalid enum backing value type');
         }
         // backing type 是 int 而传了数字字符串（SQLite/PG 驱动常见）时，
         // tryFrom('1') 对 int 枚举直接 TypeError 而非返回 null，须捕获后转 int 重试
@@ -337,7 +343,7 @@ final class Caster
             }
         }
         if (!$enum instanceof \BackedEnum) {
-            throw $this->fail($model, $field, '枚举值无法还原');
+            throw $this->fail($model, $field, 'Cannot restore enum from its backing value');
         }
 
         return $enum;

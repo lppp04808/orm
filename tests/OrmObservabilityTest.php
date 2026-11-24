@@ -170,8 +170,8 @@ final class OrmObservabilityTest extends TestCase
             $gateway->transaction(static fn (): null => null);
             self::fail('begin 返回 false 必须拒绝');
         } catch (TransactionException $e) {
-            self::assertSame('开始', $e->operation);
-            self::assertSame('数据库事务开始失败', $e->getPrevious()?->getMessage());
+            self::assertSame('begin', $e->operation);
+            self::assertSame('Failed to begin database transaction', $e->getPrevious()?->getMessage());
         }
         $transactions = array_values(array_filter($events, static fn (Event $e): bool => $e instanceof TransactionEvent));
         self::assertCount(1, $transactions);
@@ -180,7 +180,7 @@ final class OrmObservabilityTest extends TestCase
         self::assertSame(TransactionException::class, $transactions[0]->exceptionClass);
         self::assertSame([], array_values(array_filter($events, static fn (Event $e): bool => $e instanceof SqlEvent)));
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessage('禁止复用');
+        $this->expectExceptionMessage('do not reuse this connection');
         $gateway->selectRaw('SELECT 1');
     }
 
@@ -198,8 +198,8 @@ final class OrmObservabilityTest extends TestCase
             $gateway->transaction(static fn (): null => null);
             self::fail('commit 返回 false 必须拒绝');
         } catch (TransactionException $e) {
-            self::assertSame('提交', $e->operation);
-            self::assertSame('数据库事务提交失败', $e->getPrevious()?->getMessage());
+            self::assertSame('commit', $e->operation);
+            self::assertSame('Failed to commit database transaction', $e->getPrevious()?->getMessage());
         }
         $transactions = array_values(array_filter($events, static fn (Event $e): bool => $e instanceof TransactionEvent));
         self::assertSame(['begin', 'commit', 'rollback'], array_map(static fn (TransactionEvent $e): string => $e->phase, $transactions));
@@ -209,7 +209,7 @@ final class OrmObservabilityTest extends TestCase
         self::assertNull($transactions[2]->exceptionClass);
         self::assertSame([], array_values(array_filter($events, static fn (Event $e): bool => $e instanceof SqlEvent)));
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessage('禁止复用');
+        $this->expectExceptionMessage('do not reuse this connection');
         $gateway->selectRaw('SELECT 1');
     }
 
@@ -231,7 +231,7 @@ final class OrmObservabilityTest extends TestCase
             });
             self::fail('回滚失败必须优先于业务异常');
         } catch (TransactionException $e) {
-            self::assertSame('回滚', $e->operation);
+            self::assertSame('rollback', $e->operation);
             self::assertSame($business, $e->businessException);
             self::assertInstanceOf(\RuntimeException::class, $e->getPrevious());
         }
@@ -248,7 +248,7 @@ final class OrmObservabilityTest extends TestCase
                 $operation();
                 self::fail('未知事务状态禁止重新读取或绑定');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('禁止复用', $e->getMessage());
+                self::assertStringContainsString('do not reuse this connection', $e->getMessage());
             }
         }
         self::assertSame('transient', $this->pdo->query('SELECT body FROM version_record')->fetchColumn());
@@ -266,7 +266,7 @@ final class OrmObservabilityTest extends TestCase
             $gateway->transaction(static function (): void { Session::discard(); });
             self::fail('Session 清理后不能继续提交');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('Session 已被清理', $e->getMessage());
+            self::assertStringContainsString('The Session was discarded during the transaction', $e->getMessage());
         }
         $scope->close();
         self::assertInstanceOf(SessionEvent::class, $events[array_key_last($events)]);
@@ -278,9 +278,9 @@ final class OrmObservabilityTest extends TestCase
             $gateway->transaction(static function (): void { Session::discard(); });
             self::fail('回滚失败必须透传');
         } catch (TransactionException $e) {
-            self::assertSame('回滚', $e->operation);
+            self::assertSame('rollback', $e->operation);
             self::assertNull($e->businessException);
-            self::assertSame('数据库事务回滚失败', $e->getPrevious()?->getMessage());
+            self::assertSame('Failed to roll back database transaction', $e->getPrevious()?->getMessage());
         } finally {
             $scope->close();
         }
@@ -306,7 +306,7 @@ final class OrmObservabilityTest extends TestCase
                 VersionRecord::query()->where('id', 1)->first();
                 self::fail('失败连接在 discard 事件内也必须保持禁止复用');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('禁止复用', $e->getMessage());
+                self::assertStringContainsString('do not reuse this connection', $e->getMessage());
             }
         });
         Session::use($gateway);
@@ -315,14 +315,14 @@ final class OrmObservabilityTest extends TestCase
             VersionRecord::transaction(static function (): void { Session::discard(); });
             self::fail('discard 回滚失败必须报告');
         } catch (TransactionException $e) {
-            self::assertSame('回滚', $e->operation);
+            self::assertSame('rollback', $e->operation);
         }
         self::assertSame(1, $attempts);
         try {
             Session::get();
             self::fail('失败 Session 必须已解绑');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('还没有', $e->getMessage());
+            self::assertStringContainsString('No Pixiaoka\Orm\Session::use() registration exists', $e->getMessage());
         }
         $replacement = new EntityGateway(new PdoConnection(new PDO('sqlite::memory:')));
         Session::use($replacement);
@@ -342,9 +342,9 @@ final class OrmObservabilityTest extends TestCase
             $gateway->transaction(static fn () => $record->save());
             self::fail('提交失败必须报告未知结果');
         } catch (TransactionException $e) {
-            self::assertSame('提交', $e->operation);
+            self::assertSame('commit', $e->operation);
             self::assertNull($e->businessException);
-            self::assertSame('数据库事务提交失败', $e->getPrevious()?->getMessage());
+            self::assertSame('Failed to commit database transaction', $e->getPrevious()?->getMessage());
         }
         self::assertSame('uncommitted', $record->body);
         self::assertSame(2, $record->revision);
@@ -352,7 +352,7 @@ final class OrmObservabilityTest extends TestCase
             $gateway->transaction(static fn (): null => null);
             self::fail('提交结果未知后不能盲目重试');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('禁止复用', $e->getMessage());
+            self::assertStringContainsString('do not reuse this connection', $e->getMessage());
         }
         $events = [];
         $gateway->subscribe(function (Event $event) use (&$events): void { $events[] = $event; });
@@ -373,7 +373,7 @@ final class OrmObservabilityTest extends TestCase
                 $this->gateway->executeRaw('INSERT INTO version_record (body, revision) VALUES (:body, 1)', ['body' => 'observer side effect']);
                 self::fail('监听器不能重入写库');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('观测监听器', $e->getMessage());
+                self::assertStringContainsString('observability listener', $e->getMessage());
             }
             if ($event instanceof TransactionEvent) {
                 Session::discard();
@@ -402,7 +402,7 @@ final class OrmObservabilityTest extends TestCase
         Session::use($this->gateway);
         Session::discard();
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessage('还没有');
+        $this->expectExceptionMessage('No Pixiaoka\Orm\Session::use() registration exists');
         Session::get();
     }
 
@@ -441,7 +441,7 @@ final class OrmObservabilityTest extends TestCase
                     $operation();
                     self::fail('所有事件都必须禁止改变当前 Session 生命周期');
                 } catch (\LogicException $e) {
-                    self::assertStringContainsString('观测监听器', $e->getMessage());
+                    self::assertStringContainsString('observability listener', $e->getMessage());
                 }
             }
         });
@@ -482,7 +482,7 @@ final class OrmObservabilityTest extends TestCase
                     $operation();
                     self::fail('回滚失败事件不能换绑或清理 Session');
                 } catch (\LogicException $e) {
-                    self::assertStringContainsString('观测监听器', $e->getMessage());
+                    self::assertStringContainsString('observability listener', $e->getMessage());
                 }
             }
         });
@@ -494,7 +494,7 @@ final class OrmObservabilityTest extends TestCase
             });
             self::fail('回滚失败必须优先报告');
         } catch (TransactionException $e) {
-            self::assertSame('回滚', $e->operation);
+            self::assertSame('rollback', $e->operation);
             self::assertSame('business rollback', $e->businessException?->getMessage());
         }
         $events = array_values(array_filter($events, static fn (TransactionEvent $event): bool => !$event->successful));
@@ -523,7 +523,7 @@ final class OrmObservabilityTest extends TestCase
                         $operation();
                         self::fail('开始或提交失败事件不能换绑或清理 Session');
                     } catch (\LogicException $e) {
-                        self::assertStringContainsString('观测监听器', $e->getMessage());
+                        self::assertStringContainsString('observability listener', $e->getMessage());
                     }
                 }
             });
@@ -533,7 +533,7 @@ final class OrmObservabilityTest extends TestCase
                 $gateway->transaction(static fn (): null => null);
                 self::fail('事务边界失败必须报告');
             } catch (TransactionException $e) {
-                self::assertSame($phase === 'begin' ? '开始' : '提交', $e->operation);
+                self::assertSame($phase, $e->operation);
             }
             self::assertSame([$phase], array_map(static fn (TransactionEvent $event): string => $event->phase, $events));
             self::assertSame($gateway, Session::get()->gateway);
@@ -562,7 +562,7 @@ final class OrmObservabilityTest extends TestCase
                     $operation();
                     self::fail('嵌套观测不能换绑或清理业务 Session');
                 } catch (\LogicException $e) {
-                    self::assertStringContainsString('观测监听器', $e->getMessage());
+                    self::assertStringContainsString('observability listener', $e->getMessage());
                 }
             }
         });
@@ -591,7 +591,7 @@ final class OrmObservabilityTest extends TestCase
                     $operation();
                     self::fail('discard 完成事件不能重新绑定 Session');
                 } catch (\LogicException $e) {
-                    self::assertStringContainsString('观测监听器', $e->getMessage());
+                    self::assertStringContainsString('observability listener', $e->getMessage());
                 }
             }
         });
@@ -599,7 +599,7 @@ final class OrmObservabilityTest extends TestCase
         Session::discard();
         self::assertSame(1, $attempts);
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessage('还没有');
+        $this->expectExceptionMessage('No Pixiaoka\Orm\Session::use() registration exists');
         Session::get();
     }
 

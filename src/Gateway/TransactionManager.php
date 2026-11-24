@@ -143,13 +143,13 @@ final class TransactionManager
                 Session::claimConnection($gateway, $ctx);
                 try {
                     if (!$this->connection->beginTransaction()) {
-                        throw new \RuntimeException('数据库事务开始失败');
+                        throw new \RuntimeException('Failed to begin database transaction');
                     }
                     $begun = true;
                 } catch (\Throwable $e) {
                     $failure = $e;
                     $this->invalidateConnection();
-                    $transactionFailure = new TransactionException('开始', null, $e);
+                    $transactionFailure = new TransactionException('begin', null, $e);
                     $this->observeTransaction('begin', $ctx, $startedAt, $transactionFailure);
                     throw $transactionFailure;
                 }
@@ -164,19 +164,19 @@ final class TransactionManager
                 $result = $func();
                 $this->rememberCachedEntities();
                 if (Session::currentContext() !== $ctx) {
-                    throw new \LogicException('事务回调不能切换 Fiber/协程上下文后提交');
+                    throw new \LogicException('A transaction callback must not switch Fiber/coroutine context before committing');
                 }
                 if ($this->transactionDepth($ctx) !== $depth + 1) {
                     if (!Session::rollbackConfirmed($ctx, $sessionName)) {
                         $this->invalidateConnection();
-                        throw new \LogicException('事务期间 Session 已被清理，不能继续提交；该连接已禁止复用');
+                        throw new \LogicException('The Session was discarded during the transaction; commit is forbidden and the connection must not be reused');
                     }
                     $discardConfirmed = true;
-                    throw new \LogicException('事务期间 Session 已被清理，操作已回滚，不能继续提交');
+                    throw new \LogicException('The Session was discarded during the transaction; the work was rolled back and cannot be committed');
                 }
                 $commitAttempted = true;
                 if (!$this->connection->commit()) {
-                    throw new \RuntimeException('数据库事务提交失败');
+                    throw new \RuntimeException('Failed to commit database transaction');
                 }
                 $committed = true;
             } catch (\Throwable $e) {
@@ -199,7 +199,7 @@ final class TransactionManager
                     $rollbackAttempted = true;
                     try {
                         if (!$this->connection->rollback()) {
-                            throw new \RuntimeException('数据库事务回滚失败');
+                            throw new \RuntimeException('Failed to roll back database transaction');
                         }
                         $rolledBack = true;
                         if (!$commitAttempted) {
@@ -219,7 +219,7 @@ final class TransactionManager
                 }
                 $this->invalidateConnection();
                 $transactionFailure = new TransactionException(
-                    $commitAttempted ? '提交' : '回滚',
+                    $commitAttempted ? 'commit' : 'rollback',
                     $commitAttempted ? null : $failure,
                     !$commitAttempted && $rollbackFailure !== null ? $rollbackFailure : $failure,
                 );
@@ -267,7 +267,7 @@ final class TransactionManager
                     ? $this->connection->forceRollback()
                     : $this->connection->rollback();
                 if (!$rolledBack) {
-                    throw new \RuntimeException('数据库事务回滚失败');
+                    throw new \RuntimeException('Failed to roll back database transaction');
                 }
                 $this->restoreOuterTransaction($context);
                 $this->confirmedRollbacks ??= new \WeakMap();
@@ -275,7 +275,7 @@ final class TransactionManager
             }
         } catch (\Throwable $e) {
             $failure = $e;
-            $transactionFailure = new TransactionException('回滚', null, $e);
+            $transactionFailure = new TransactionException('rollback', null, $e);
         } finally {
             if ($transactionFailure !== null) {
                 $this->invalidateConnection();
@@ -301,7 +301,7 @@ final class TransactionManager
     public function assertSessionReplaceable(Context $context): void
     {
         if ($this->inTransactionByContext[$context] ?? false) {
-            throw new \LogicException('当前 Session 存在未结束事务，禁止换绑；请先显式 discard 并处理回滚结果');
+            throw new \LogicException('The current Session has an active transaction; explicitly discard it and handle rollback before rebinding');
         }
     }
 
@@ -681,11 +681,11 @@ final class TransactionManager
         $parts = [];
         foreach ($meta->primaryKey as $field) {
             if (!$entity->propSet($field->property)) {
-                throw new IdentityException($meta->class . ' 缺少主键列 ' . $field->column);
+                throw new IdentityException($meta->class . ' is missing primary key column ' . $field->column);
             }
             $value = $entity->{$field->property};
             if ($value === null) {
-                throw new IdentityException($meta->class . ' 主键列 ' . $field->column . ' 不可空');
+                throw new IdentityException($meta->class . ' primary key column ' . $field->column . ' must not be null');
             }
             $parts[$field->column] = $this->caster->toDb($meta->class, $field, $value);
         }

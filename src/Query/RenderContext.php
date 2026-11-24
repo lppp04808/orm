@@ -32,7 +32,7 @@ final class RenderContext
         $normalized = strtolower($qualifier);
         if ($this->hasRelationAlias($qualifier) || preg_match('/^_orm_relation_[1-9][0-9]*$/i', $qualifier) === 1) {
             // 外部父表不得占用内部保留命名空间；更深层展开也必须能安全分配别名。
-            throw new InvalidArgumentException('表名或别名与已分配的 ORM 内部关联别名冲突: ' . $qualifier);
+            throw new InvalidArgumentException('Table name or alias conflicts with an allocated ORM relation alias: ' . $qualifier);
         }
         $this->relationQualifiers[$normalized] = true;
     }
@@ -52,7 +52,7 @@ final class RenderContext
         $next = $this->relationAlias + 1;
         $alias = '_orm_relation_' . $next;
         if ($this->hasRelationQualifier($alias)) {
-            throw new InvalidArgumentException('父表别名或真实表名与 ORM 内部关联别名冲突: ' . $alias);
+            throw new InvalidArgumentException('Parent table alias or actual table name conflicts with an ORM relation alias: ' . $alias);
         }
         $this->relationAlias = $next;
         $this->relationAliases[strtolower($alias)] = true;
@@ -84,10 +84,10 @@ final class RenderContext
     {
         foreach ($rawParams as $name => $value) {
             if (!is_string($name) || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1) {
-                throw new InvalidArgumentException('Raw SQL 参数名必须对应命名占位符');
+                throw new InvalidArgumentException('Raw SQL parameter names must match named placeholders');
             }
             if (!is_scalar($value) && $value !== null) {
-                throw new InvalidArgumentException('Raw SQL 参数值必须是标量或 null');
+                throw new InvalidArgumentException('Raw SQL parameter values must be scalar or null');
             }
         }
 
@@ -152,7 +152,7 @@ final class RenderContext
                 $out .= '/*';
                 $i++;
             } elseif ($char === '?') {
-                throw new InvalidArgumentException('Raw SQL 必须使用命名占位符，不支持 ? 占位符');
+                throw new InvalidArgumentException('Raw SQL requires named placeholders; ? placeholders are not supported');
             } elseif ($char === ':' && $next === ':') {
                 $out .= '::';
                 $i++;
@@ -163,7 +163,7 @@ final class RenderContext
                 }
                 $name = substr($sql, $i + 1, $end - $i);
                 if (!array_key_exists($name, $rawParams)) {
-                    throw new InvalidArgumentException('Raw SQL 缺少参数: ' . $name);
+                    throw new InvalidArgumentException('Raw SQL is missing parameter: ' . $name);
                 }
                 $used[$name] = true;
                 $out .= $this->bind($rawParams[$name]);
@@ -175,7 +175,7 @@ final class RenderContext
 
         $missing = array_diff(array_keys($rawParams), array_keys($used));
         if ($missing !== []) {
-            throw new InvalidArgumentException('Raw SQL 存在未使用的参数: ' . implode(', ', $missing));
+            throw new InvalidArgumentException('Raw SQL has unused parameters: ' . implode(', ', $missing));
         }
 
         return $out;

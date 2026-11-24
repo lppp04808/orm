@@ -207,7 +207,7 @@ final class ModelGeneratorTest extends TestCase
             $generator->generate($this->directory, 'App Bad', tables: ['ordinary']);
             self::fail('非法 namespace 应被拒绝');
         } catch (InvalidArgumentException $error) {
-            self::assertStringContainsString('命名空间', $error->getMessage());
+            self::assertStringContainsString('Invalid PHP namespace', $error->getMessage());
         }
         self::assertDirectoryDoesNotExist($this->directory);
 
@@ -216,7 +216,7 @@ final class ModelGeneratorTest extends TestCase
                 $generator->generate($this->directory, 'App\\Model', tables: [$table]);
                 self::fail("非法表名 $table 应被拒绝");
             } catch (InvalidArgumentException $error) {
-                self::assertStringContainsString('表名', $error->getMessage());
+                self::assertStringContainsString('Invalid table name', $error->getMessage());
             }
         }
         self::assertDirectoryDoesNotExist($this->directory);
@@ -225,7 +225,7 @@ final class ModelGeneratorTest extends TestCase
         self::assertTrue(mkdir($this->directory, 0777, true));
         file_put_contents($file, 'keep');
         $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('不是目录');
+        $this->expectExceptionMessage('Output path is not a directory');
         $generator->generate($file, 'App\\Model', tables: ['ordinary']);
     }
 
@@ -283,14 +283,14 @@ final class ModelGeneratorTest extends TestCase
             PHP_BINARY, '-d', 'extension=pdo_sqlite', $bin, 'generate', '--dsn=sqlite::memory:', '--dir=' . $directory, '--namespace=Bad Namespace',
         ]);
         self::assertSame(1, $invalid['status']);
-        self::assertStringContainsString('非法 PHP 命名空间', $invalid['stderr']);
+        self::assertStringContainsString('Invalid PHP namespace', $invalid['stderr']);
 
         $missing = $this->runProcess([
             PHP_BINARY, $bin, 'generate', '--dsn', '--dir', $directory . '/models',
             '--namespace', 'Cli\\Generated',
         ]);
         self::assertSame(1, $missing['status']);
-        self::assertStringContainsString('--dsn 缺少值', $missing['stderr']);
+        self::assertStringContainsString('Option --dsn requires a value', $missing['stderr']);
     }
 
     public function testJsonAndObjectDefaultsNeverProduceInvalidPhpInitializers(): void
@@ -335,7 +335,7 @@ final class ModelGeneratorTest extends TestCase
             $generator->generate($this->directory, 'App\\Model', tables: ['audit_log']);
             self::fail('无主键表不应生成不可用的 Active Record');
         } catch (InvalidArgumentException $error) {
-            self::assertStringContainsString('没有主键', $error->getMessage());
+            self::assertStringContainsString('has no primary key', $error->getMessage());
         }
         self::assertDirectoryDoesNotExist($this->directory);
 
@@ -343,7 +343,7 @@ final class ModelGeneratorTest extends TestCase
             $generator->render($table, 'App\\Model');
             self::fail('直接 render 无主键表也必须失败');
         } catch (InvalidArgumentException $error) {
-            self::assertStringContainsString('audit_log 没有主键', $error->getMessage());
+            self::assertStringContainsString('Table audit_log has no primary key', $error->getMessage());
         }
 
         // 已有目录存在时也不能因为跳过文件而绕开模型可用性校验。

@@ -172,7 +172,7 @@ final class OrmSqlBehaviorTest extends TestCase
         $this->pdo->exec('DELETE FROM item');
 
         $this->expectException(IdentityException::class);
-        $this->expectExceptionMessage('删除没有命中恰好一行');
+        $this->expectExceptionMessage('delete must affect exactly one row');
         $item->delete();
     }
 
@@ -205,7 +205,7 @@ final class OrmSqlBehaviorTest extends TestCase
     public function testIdentityFromRejectsUnknownColumns(): void
     {
         $this->expectException(IdentityException::class);
-        $this->expectExceptionMessage('不属于主键');
+        $this->expectExceptionMessage('identity contains non-primary-key columns');
         Item::find(['id' => 1, 'user_id' => 2]);
     }
 
@@ -317,7 +317,7 @@ final class OrmSqlBehaviorTest extends TestCase
             $fiberB->start();
             $this->fail('共享单连接下并发事务应被拒绝');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('独立连接', $e->getMessage());
+            self::assertStringContainsString('independent connection', $e->getMessage());
         }
         $fiberA->resume();
         self::assertTrue($fiberA->isTerminated());

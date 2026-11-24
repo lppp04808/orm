@@ -16,7 +16,7 @@ final class Subquery
         ?callable $constraint = null,
     ) {
         if ($path === '' || in_array('', explode('.', $path), true)) {
-            throw new RelationException('关系路径不能包含空名称');
+            throw new RelationException('Relation paths cannot contain empty names');
         }
         $this->constraint = $constraint;
     }

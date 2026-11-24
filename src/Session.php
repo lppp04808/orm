@@ -160,13 +160,13 @@ final class Session
         }
 
         if (self::$strict && (\Fiber::getCurrent() !== null || self::runtimeCoroutine() !== null)) {
-            throw new LogicException('当前 Fiber/协程还没有 Pixiaoka\Orm\Session::use()；严格模式禁止回退根连接：' . $name);
+            throw new LogicException('No Pixiaoka\Orm\Session::use() registration exists in the current Fiber/coroutine; strict mode forbids root fallback: ' . $name);
         }
 
         return self::$mainSessions[$name]
             ?? throw new LogicException($name === 'default'
-                ? '还没有 Pixiaoka\Orm\Session::use()'
-                : "还没有 Pixiaoka\\Orm\\Session::use(..., '$name')");
+                ? 'No Pixiaoka\Orm\Session::use() registration exists'
+                : "No Pixiaoka\\Orm\\Session::use(..., '$name') registration exists");
     }
 
     /**
@@ -182,7 +182,7 @@ final class Session
         if ((self::$discardingContexts !== null && isset(self::$discardingContexts[$context]))
             || (self::$observingContexts !== null && isset(self::$observingContexts[$context]))) {
             if (self::sessions($context, $name) !== []) {
-                throw new LogicException('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期');
+                throw new LogicException('An observability listener must not reenter the same connection or change the Session/transaction lifecycle');
             }
         }
         $sessions = self::sessions($context, $name);
@@ -329,7 +329,7 @@ final class Session
     {
         $context = self::currentContext();
         if (self::$observingContexts !== null && isset(self::$observingContexts[$context])) {
-            throw new LogicException('观测监听器不得切换或清理当前上下文的 Session');
+            throw new LogicException('An observability listener must not switch or discard the current context Session');
         }
     }
 
@@ -358,7 +358,7 @@ final class Session
         $connection = $gateway->connection();
         $owner = self::$connectionContexts[$connection] ?? null;
         if ($owner !== null && $owner !== $context) {
-            throw new LogicException('同一连接已被另一个 Fiber/协程事务持有，请为并发事务提供独立连接');
+            throw new LogicException('This connection is owned by another Fiber/coroutine transaction; use an independent connection for concurrent transactions');
         }
         self::$connectionContexts[$connection] = $context;
     }
@@ -403,7 +403,7 @@ final class Session
     private static function assertSessionName(string $name): void
     {
         if ($name === '') {
-            throw new \InvalidArgumentException('Session 名称不能为空字符串');
+            throw new \InvalidArgumentException('Session name must not be empty');
         }
     }
 
@@ -411,7 +411,7 @@ final class Session
     {
         $owner = self::$gatewayContexts[$gateway] ?? null;
         if ($owner !== null && $owner !== $context) {
-            throw new LogicException('同一网关已被另一个活跃 Fiber/协程持有，请 discard 原上下文会话或使用独立连接');
+            throw new LogicException('This Gateway is owned by another active Fiber/coroutine; discard the original context session or use an independent connection');
         }
         self::$gatewayContexts ??= new WeakMap();
         self::$gatewayContexts[$gateway] = $context;

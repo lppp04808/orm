@@ -21,7 +21,7 @@ final class SchemaInspector
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
         if (!in_array($driver, ['sqlite', 'mysql', 'pgsql'], true)) {
-            throw new InvalidArgumentException("不支持的数据库驱动: {$driver}；仅支持 sqlite、mysql、pgsql");
+            throw new InvalidArgumentException("Unsupported database driver: $driver; only sqlite, mysql, and pgsql are supported");
         }
         $this->driver = $driver;
     }
@@ -36,7 +36,7 @@ final class SchemaInspector
         };
         $statement = $this->pdo->query($sql);
         if ($statement === false) {
-            throw new RuntimeException('无法读取数据库表列表');
+            throw new RuntimeException('Unable to read the database table list');
         }
 
         $tables = [];
@@ -58,7 +58,7 @@ final class SchemaInspector
             'pgsql' => $this->pgsqlColumns($table),
         };
         if ($columns === []) {
-            throw new RuntimeException("表不存在或没有字段: $table");
+            throw new RuntimeException("Table does not exist or has no fields: $table");
         }
 
         $indexes = match ($this->driver) {
@@ -80,7 +80,7 @@ final class SchemaInspector
             }
         }
         if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/D', $candidate) !== 1) {
-            throw new InvalidArgumentException('非法表名: ' . $identifier . '；只允许字母、数字、下划线且不能以数字开头');
+            throw new InvalidArgumentException('Invalid table name: ' . $identifier . '; only letters, digits, and underscores are allowed, and the name cannot start with a digit');
         }
     }
 
@@ -222,7 +222,7 @@ final class SchemaInspector
             $columns = [];
             foreach ($info->fetchAll(PDO::FETCH_ASSOC) as $column) {
                 if ($column['name'] === null) {
-                    throw new RuntimeException("索引 $name 包含表达式，无法与模型字段索引安全比较");
+                    throw new RuntimeException("Index $name contains an expression and cannot be safely compared with model field indexes");
                 }
                 $this->assertIdentifier((string) $column['name']);
                 $columns[(int) $column['seqno']] = (string) $column['name'];
@@ -251,10 +251,10 @@ final class SchemaInspector
             $name = (string) $row['INDEX_NAME'];
             $column = $row['COLUMN_NAME'];
             if ($column === null) {
-                throw new RuntimeException("索引 $name 包含函数表达式，无法与模型字段索引安全比较");
+                throw new RuntimeException("Index $name contains a functional expression and cannot be safely compared with model field indexes");
             }
             if ($row['SUB_PART'] !== null || strtoupper((string) $row['INDEX_TYPE']) === 'FULLTEXT') {
-                throw new RuntimeException("索引 $name 包含前缀长度或全文定义，无法与模型字段索引安全比较");
+                throw new RuntimeException("Index $name contains a prefix length or full-text definition and cannot be safely compared with model field indexes");
             }
             $this->assertIdentifier($name);
             $this->assertIdentifier((string) $column);
@@ -290,7 +290,7 @@ final class SchemaInspector
         foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
             $name = (string) $row['index_name'];
             if ($row['column_name'] === null) {
-                throw new RuntimeException("索引 $name 包含表达式或包含列，无法与模型字段索引安全比较");
+                throw new RuntimeException("Index $name contains an expression or included column and cannot be safely compared with model field indexes");
             }
             $column = (string) $row['column_name'];
             $this->assertIdentifier($name);

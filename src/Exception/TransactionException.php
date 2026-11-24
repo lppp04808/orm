@@ -12,9 +12,9 @@ final class TransactionException extends OrmException
         public readonly ?\Throwable $businessException,
         \Throwable $previous,
     ) {
-        $message = '数据库' . $operation . '结果未知，当前连接已禁止复用；请丢弃该连接、Gateway 和关联实体';
+        $message = 'Database transaction ' . $operation . ' outcome is unknown; the connection must not be reused. Discard the connection, Gateway, and associated entities';
         if ($businessException !== null) {
-            $message .= '；业务异常 ' . $businessException::class . ' 已由数据库异常取代';
+            $message .= '; business exception ' . $businessException::class . ' was superseded by the database exception';
         }
 
         parent::__construct($message, 0, $previous);

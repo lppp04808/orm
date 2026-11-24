@@ -469,7 +469,7 @@ final class OrmRelationTest extends TestCase
                 };
                 self::fail($method . ' 不得把过期实体隐式绑定到新 Gateway');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('原 Gateway 已销毁', $e->getMessage());
+                self::assertStringContainsString('has a destroyed Gateway', $e->getMessage());
             }
         }
         self::assertSame('ephemeral', $customer->name);

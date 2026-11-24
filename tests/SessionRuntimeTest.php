@@ -86,7 +86,7 @@ namespace Tests\Pixiaoka\Orm {
             SwooleCoroutine::setCurrentForTest(new \stdClass());
             Session::strict();
             $this->expectException(\LogicException::class);
-            $this->expectExceptionMessage('严格模式禁止回退根连接');
+            $this->expectExceptionMessage('strict mode forbids root fallback');
             try {
                 Session::get();
             } finally {
@@ -166,7 +166,7 @@ namespace Tests\Pixiaoka\Orm {
             Session::use($gateway);
             SwowCoroutine::setCurrent($second);
             $this->expectException(\LogicException::class);
-            $this->expectExceptionMessage('另一个活跃 Fiber/协程');
+            $this->expectExceptionMessage('another active Fiber/coroutine');
             try {
                 Session::use($gateway);
             } finally {
@@ -182,7 +182,7 @@ namespace Tests\Pixiaoka\Orm {
             $scope = Session::scope(self::gateway());
             SwowCoroutine::setCurrent(null);
             $this->expectException(\LogicException::class);
-            $this->expectExceptionMessage('创建它的 Fiber');
+            $this->expectExceptionMessage('where it was created');
             try {
                 $scope->close();
             } finally {

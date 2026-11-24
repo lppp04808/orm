@@ -32,7 +32,7 @@ final class RowCache
     public function __construct(int $maxSize = 1024)
     {
         if ($maxSize < 0) {
-            throw new InvalidArgumentException('RowCache 容量不能小于 0');
+            throw new InvalidArgumentException('RowCache capacity must not be negative');
         }
         $this->maxSize = $maxSize;
     }

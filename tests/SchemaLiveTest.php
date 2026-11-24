@@ -174,7 +174,7 @@ final class SchemaLiveTest extends TestCase
                 ? "CREATE INDEX $q$expression$q ON $q$table$q ((LOWER(label)))"
                 : "CREATE INDEX $q$expression$q ON $q$table$q (LOWER(label))");
             $this->expectException(\RuntimeException::class);
-            $this->expectExceptionMessage('表达式');
+            $this->expectExceptionMessage('expression');
             $inspector->table($table);
         } finally {
             $pdo->exec("DROP TABLE IF EXISTS $q$table$q");

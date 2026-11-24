@@ -135,7 +135,7 @@ final class OrmOptimisticLockTest extends TestCase
             $record->save();
             self::fail('不能手改版本');
         } catch (IdentityException $e) {
-            self::assertStringContainsString('不能直接修改', $e->getMessage());
+            self::assertStringContainsString('do not modify it directly', $e->getMessage());
         }
         $record->refresh();
         $record->save();
@@ -149,7 +149,7 @@ final class OrmOptimisticLockTest extends TestCase
                 $operation();
                 self::fail('批量写不能绕过乐观锁');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('无法保留逐实体版本语义', $e->getMessage());
+                self::assertStringContainsString('cannot preserve per-entity version semantics', $e->getMessage());
             }
         }
     }
@@ -396,13 +396,13 @@ final class OrmOptimisticLockTest extends TestCase
             $other->save();
             self::fail('回滚后的生成主键不得被重新插入');
         } catch (IdentityException $e) {
-            self::assertStringContainsString('生成列由数据库填写', $e->getMessage());
+            self::assertStringContainsString('generated column is assigned by the database', $e->getMessage());
         }
         self::assertSame([], $other->takeOriginal());
         self::assertSame(1, $other->revision);
         self::assertSame(0, (int) $this->pdo->query('SELECT COUNT(*) FROM version_record')->fetchColumn());
         $this->expectException(IdentityException::class);
-        $this->expectExceptionMessage('还没入库');
+        $this->expectExceptionMessage('is not persisted');
         $other->delete();
         self::assertNull(VersionRecord::query()->where('body', 'new in transaction')->first());
         $record->save();
@@ -687,12 +687,12 @@ final class OrmOptimisticLockTest extends TestCase
     public static function invalidModels(): array
     {
         return [
-            'missing column' => [VersionWithoutColumn::class, '必须同时声明'],
-            'duplicate' => [DuplicateVersionRecord::class, '只能声明一个'],
-            'primary' => [PrimaryVersionRecord::class, '不能兼任主键'],
-            'string' => [StringVersionRecord::class, '非空 int'],
-            'nullable' => [NullableVersionRecord::class, '非空 int'],
-            'timestamp' => [TimeVersionRecord::class, '不能兼任自动时间'],
+            'missing column' => [VersionWithoutColumn::class, 'version fields must also declare #[Column]'],
+            'duplicate' => [DuplicateVersionRecord::class, 'declares a second version field'],
+            'primary' => [PrimaryVersionRecord::class, 'version fields cannot also be primary keys'],
+            'string' => [StringVersionRecord::class, 'version fields must be non-nullable int'],
+            'nullable' => [NullableVersionRecord::class, 'version fields must be non-nullable int'],
+            'timestamp' => [TimeVersionRecord::class, 'version fields cannot also be automatic timestamp fields'],
         ];
     }
 

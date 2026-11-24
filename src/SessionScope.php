@@ -33,7 +33,7 @@ final class SessionScope
             return;
         }
         if (Session::currentContext() !== $this->owner) {
-            throw new LogicException('SessionScope 必须在创建它的 Fiber/协程上下文中关闭');
+            throw new LogicException('SessionScope must be closed in the Fiber/coroutine context where it was created');
         }
 
         $this->active = false;
@@ -44,7 +44,7 @@ final class SessionScope
     public function abandon(): void
     {
         if (Session::currentContext() !== $this->owner) {
-            throw new LogicException('SessionScope 必须在创建它的 Fiber/协程上下文中关闭');
+            throw new LogicException('SessionScope must be closed in the Fiber/coroutine context where it was created');
         }
         $this->active = false;
     }

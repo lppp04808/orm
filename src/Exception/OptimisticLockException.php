@@ -16,7 +16,7 @@ final class OptimisticLockException extends OrmException
         public readonly int $expectedVersion,
     ) {
         parent::__construct(sprintf(
-            '%s %s 乐观锁冲突：预期版本 %d 已失效，请 refresh 后重试',
+            'Optimistic lock conflict during %s %s: expected version %d is stale; refresh before retrying',
             $model,
             $operation,
             $expectedVersion,

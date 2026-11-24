@@ -34,7 +34,7 @@ final class SqlExecutor
             throw new \LogicException(self::$failedConnections[$this->connection]);
         }
         if (self::$observingConnections !== null && isset(self::$observingConnections[$this->connection])) {
-            throw new \LogicException('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期');
+            throw new \LogicException('An observability listener must not reenter the same connection or change the Session/transaction lifecycle');
         }
     }
 
@@ -42,7 +42,7 @@ final class SqlExecutor
     public function assertObservationBoundary(): void
     {
         if (self::$observingConnections !== null && isset(self::$observingConnections[$this->connection])) {
-            throw new \LogicException('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期');
+            throw new \LogicException('An observability listener must not reenter the same connection or change the Session/transaction lifecycle');
         }
     }
 
@@ -50,7 +50,7 @@ final class SqlExecutor
     public function invalidateConnection(): void
     {
         self::$failedConnections ??= new \WeakMap();
-        self::$failedConnections[$this->connection] = '数据库开始、提交或回滚结果未知，禁止复用当前连接；请丢弃该连接、Gateway 和关联实体';
+        self::$failedConnections[$this->connection] = 'The database begin, commit, or rollback outcome is unknown; do not reuse this connection. Discard the connection, Gateway, and associated entities';
     }
 
     /** 事件同步发送，但连接级隔离禁止监听器重入 ORM；监听器异常仍由 Dispatcher 隔离。 */
@@ -110,25 +110,25 @@ final class SqlExecutor
     {
         if ($sql instanceof Expression) {
             if ($params !== []) {
-                throw new \InvalidArgumentException('Expression 已携带参数，不要再传 $params');
+                throw new \InvalidArgumentException('Expression already has parameters; do not pass $params again');
             }
             $query = $sql->build();
             $this->assertNamedParams($query['sql'], $query['params']);
             foreach ($query['params'] as $value) {
                 if (!is_scalar($value) && $value !== null) {
-                    throw new \InvalidArgumentException('原生 SQL 参数值必须是标量或 null');
+                    throw new \InvalidArgumentException('Raw SQL parameter values must be scalar or null');
                 }
             }
 
             return $query;
         }
         if (trim($sql) === '') {
-            throw new \InvalidArgumentException('原生 SQL 不能为空');
+            throw new \InvalidArgumentException('Raw SQL must not be empty');
         }
         $this->assertNamedParams($sql, $params);
         foreach ($params as $value) {
             if (!is_scalar($value) && $value !== null) {
-                throw new \InvalidArgumentException('原生 SQL 参数值必须是标量或 null');
+                throw new \InvalidArgumentException('Raw SQL parameter values must be scalar or null');
             }
         }
 
@@ -139,7 +139,7 @@ final class SqlExecutor
     {
         foreach ($params as $key => $_) {
             if (!is_string($key) || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $key) !== 1) {
-                throw new \InvalidArgumentException('原生 SQL 参数必须使用命名占位符');
+                throw new \InvalidArgumentException('Raw SQL parameters must use named placeholders');
             }
         }
         // 用于识别命名占位符的状态机：忽略字符串、标识符、注释、PG dollar quote 和 :: 类型转换。
@@ -202,7 +202,7 @@ final class SqlExecutor
                 $used[] = substr($sql, $i + 1, $j - $i);
                 $i = $j;
             } elseif ($char === '?') {
-                throw new \InvalidArgumentException('原生 SQL 请使用命名占位符，避免与复杂查询参数合并时错位');
+                throw new \InvalidArgumentException('Raw SQL must use named placeholders to avoid parameter misalignment in complex queries');
             }
         }
         $used = array_values(array_unique($used));
@@ -211,7 +211,7 @@ final class SqlExecutor
         sort($provided);
         if ($used !== $provided) {
             throw new \InvalidArgumentException(sprintf(
-                '原生 SQL 参数不匹配，SQL 需要 [%s]，实际提供 [%s]',
+                'Raw SQL parameter mismatch: SQL requires [%s], but [%s] were provided',
                 implode(', ', $used),
                 implode(', ', $provided),
             ));
@@ -223,7 +223,7 @@ final class SqlExecutor
         if ($this->connection instanceof DriverAwareConnection
             && $this->connection->driver() === 'sqlite'
             && preg_match('/\bFOR\s+(UPDATE|SHARE)\b/i', $sql) === 1) {
-            throw new \LogicException('SQLite 不支持 FOR UPDATE / FOR SHARE，请使用事务');
+            throw new \LogicException('SQLite does not support FOR UPDATE / FOR SHARE; use a transaction');
         }
     }
 

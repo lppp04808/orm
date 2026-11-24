@@ -39,7 +39,7 @@ final readonly class ModelMeta
 
     public function field(string $property): FieldMeta
     {
-        return $this->fields[$property] ?? throw new \LogicException('未知字段: ' . $property);
+        return $this->fields[$property] ?? throw new \LogicException('Unknown field: ' . $property);
     }
 
     public function timestampField(string $role): ?FieldMeta

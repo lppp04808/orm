@@ -368,14 +368,14 @@ final class OrmComplexEdgeTest extends TestCase
         $a = ComplexOrder::query()->selectAs('sku', 'name')->selectAs('qty', 'name');
         $b = ComplexOrder::query()->selectAs('sku', 'name')->selectAs('qty', 'name');
         $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('重复');
+        $this->expectExceptionMessage('duplicate output column names or aliases');
         $a->unionAll($b);
     }
 
     public function testSelectDuplicateAliasRejectedOutsideUnion(): void
     {
         $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('别名重复');
+        $this->expectExceptionMessage('Duplicate SELECT output alias');
         ComplexOrder::query()->selectAs('sku', 'x')->aggregate('COUNT', '*', 'x')->build();
     }
 
@@ -461,7 +461,7 @@ final class OrmComplexEdgeTest extends TestCase
     public function testRawUnusedParamIsRejected(): void
     {
         $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('未使用的参数');
+        $this->expectExceptionMessage('unused parameters');
         ComplexOrder::query()->whereRaw('qty > :min', ['min' => 1, 'extra' => 2])->build();
     }
 
@@ -482,7 +482,7 @@ final class OrmComplexEdgeTest extends TestCase
             ComplexOrder::queryRaw('SELECT :a AS v', ['a' => 1, 'b' => 2]);
             self::fail('多余参数必须拒绝');
         } catch (InvalidArgumentException $e) {
-            self::assertStringContainsString('参数不匹配', $e->getMessage());
+            self::assertStringContainsString('parameter mismatch', $e->getMessage());
         }
 
         // 3. 占位符没有对应参数 → 拒绝
@@ -490,7 +490,7 @@ final class OrmComplexEdgeTest extends TestCase
             ComplexOrder::queryRaw('SELECT :a AS v', []);
             self::fail('缺失参数必须拒绝');
         } catch (InvalidArgumentException $e) {
-            self::assertStringContainsString('参数不匹配', $e->getMessage());
+            self::assertStringContainsString('parameter mismatch', $e->getMessage());
         }
 
         // 4. 非命名（数字索引）参数 → 拒绝
@@ -498,7 +498,7 @@ final class OrmComplexEdgeTest extends TestCase
             ComplexOrder::queryRaw('SELECT :a AS v', [1]);
             self::fail('数字索引参数必须拒绝');
         } catch (InvalidArgumentException $e) {
-            self::assertStringContainsString('命名占位符', $e->getMessage());
+            self::assertStringContainsString('named placeholders', $e->getMessage());
         }
 
         // 5. 非标量参数值 → 拒绝
@@ -506,7 +506,7 @@ final class OrmComplexEdgeTest extends TestCase
             ComplexOrder::queryRaw('SELECT :a AS v', ['a' => ['array']]);
             self::fail('非标量参数值必须拒绝');
         } catch (InvalidArgumentException $e) {
-            self::assertStringContainsString('标量', $e->getMessage());
+            self::assertStringContainsString('scalar', $e->getMessage());
         }
 
         // 6. 引号/注释/:: 与 Builder raw 一致地忽略

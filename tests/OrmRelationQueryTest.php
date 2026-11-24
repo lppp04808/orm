@@ -399,7 +399,7 @@ final class OrmRelationQueryTest extends TestCase
                         ->rows();
                     self::fail("顶层或祖先表别名不得冒充任意深度的内部关联别名: $method depth $depth");
                 } catch (RelationException $e) {
-                    self::assertStringContainsString('内部关联别名冲突', $e->getMessage());
+                    self::assertStringContainsString('Internal relation alias conflict', $e->getMessage());
                 }
             }
         }
@@ -409,7 +409,7 @@ final class OrmRelationQueryTest extends TestCase
             RelQueryReservedParent::query()->whereHas('orders')->get();
             self::fail('真实表名不得冒充内部关联别名');
         } catch (RelationException $e) {
-            self::assertStringContainsString('内部关联别名冲突', $e->getMessage());
+            self::assertStringContainsString('Internal relation alias conflict', $e->getMessage());
         }
         $this->pdo->exec('DROP TABLE "_orm_relation_1"');
         self::assertSame(0, $this->selects);

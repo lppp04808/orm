@@ -50,14 +50,14 @@ final readonly class RelationMeta
             : self::fields($source, $name, 'foreignKey', $targetMeta, $relation->foreignKey);
 
         if (count($sourceFields) !== count($targetFields)) {
-            throw new MetadataException("$source::$name 关系两侧键数量必须相同");
+            throw new MetadataException("$source::$name must have the same number of keys on both sides of the relation");
         }
         foreach ($sourceFields as $index => $field) {
             $target = $targetFields[$index];
             if ($field->typeName() !== $target->typeName()
                 || $field->temporal !== $target->temporal) {
                 throw new MetadataException(
-                    "$source::$name 键 {$field->property} 与 {$target->property} 的类型或时间存储形式不匹配",
+                    "$source::$name keys {$field->property} and {$target->property} have mismatched types or temporal storage",
                 );
             }
         }
@@ -74,12 +74,12 @@ final readonly class RelationMeta
         array $keys,
     ): array {
         if ($keys === [] || array_is_list($keys) === false) {
-            throw new MetadataException("$source::$name $argument 必须是非空有序字符串数组");
+            throw new MetadataException("$source::$name $argument must be a non-empty ordered list of field-name strings");
         }
         $fields = [];
         foreach ($keys as $key) {
             if (!is_string($key) || $key === '') {
-                throw new MetadataException("$source::$name $argument 只能包含非空字段名");
+                throw new MetadataException("$source::$name $argument may only contain non-empty field names");
             }
             $field = null;
             foreach ($meta->fields as $candidate) {
@@ -88,9 +88,9 @@ final readonly class RelationMeta
                     break;
                 }
             }
-            $field ??= throw new MetadataException("$source::$name $argument 包含未知字段 $key");
+            $field ??= throw new MetadataException("$source::$name $argument contains unknown field $key");
             if (isset($fields[$field->property])) {
-                throw new MetadataException("$source::$name 不能重复使用键 {$field->property}");
+                throw new MetadataException("$source::$name must not reuse key {$field->property}");
             }
             $fields[$field->property] = $field;
         }

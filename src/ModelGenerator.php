@@ -51,16 +51,16 @@ final readonly class ModelGenerator
         $schemas = [];
         foreach ($requested as $table) {
             if (!is_string($table)) {
-                throw new InvalidArgumentException('表名必须是字符串');
+                throw new InvalidArgumentException('Table names must be strings');
             }
             if (isset($seen[$table])) {
-                throw new InvalidArgumentException("表名重复: $table");
+                throw new InvalidArgumentException("Duplicate table name: $table");
             }
             $seen[$table] = true;
             $schemas[$table] = $this->schema->table($table);
             $class = $this->className($table, $prefix);
             if (isset($targets[$class])) {
-                throw new InvalidArgumentException("表 {$targets[$class]} 与 $table 会生成同一个类 {$class}；请调整 --prefix 或分别指定表");
+                throw new InvalidArgumentException("Tables {$targets[$class]} and $table generate the same class $class; adjust --prefix or specify the tables separately");
             }
             $targets[$class] = $table;
         }
@@ -81,10 +81,10 @@ final readonly class ModelGenerator
                 continue;
             }
             if (file_exists($file) && !is_file($file)) {
-                throw new RuntimeException("目标不是普通文件: $file");
+                throw new RuntimeException("Target is not a regular file: $file");
             }
             if (file_exists($file) && $force && !is_writable($file)) {
-                throw new RuntimeException("目标文件不可写: $file");
+                throw new RuntimeException("Target file is not writable: $file");
             }
 
             $this->write($file, $rendered[$table]);
@@ -98,11 +98,11 @@ final readonly class ModelGenerator
     {
         $namespace = $this->validateNamespace($namespace);
         if ($table->primaryKeys === []) {
-            throw new InvalidArgumentException("表 {$table->name} 没有主键，无法生成可用的 Active Record 模型");
+            throw new InvalidArgumentException("Table {$table->name} has no primary key; cannot generate a usable Active Record model");
         }
         $class ??= $this->className($table->name);
         if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/D', $class) !== 1 || $this->reserved($class)) {
-            throw new InvalidArgumentException("非法 PHP 类名: $class");
+            throw new InvalidArgumentException("Invalid PHP class name: $class");
         }
 
         $uses = [Column::class, Entity::class, PrimaryKey::class];
@@ -116,7 +116,7 @@ final readonly class ModelGenerator
         foreach ($table->columns as $column) {
             $property = $column->name;
             if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/D', $property) !== 1 || $property === 'this') {
-                throw new InvalidArgumentException("表 {$table->name} 的字段 $property 不能作为 PHP 属性名");
+                throw new InvalidArgumentException("Field $property in table {$table->name} cannot be used as a PHP property name");
             }
             $body .= "    #[Column]\n";
             if ($column->primary()) {
@@ -152,13 +152,13 @@ final readonly class ModelGenerator
     {
         $directory = rtrim(trim($directory));
         if ($directory === '' || $directory === '.' || $directory === '..' || str_contains($directory, "\0")) {
-            throw new InvalidArgumentException('--dir 必须是明确的模型输出目录，不能是当前目录或父目录');
+            throw new InvalidArgumentException('--dir must be an explicit model output directory, not the current or parent directory');
         }
         if (preg_match('/^(?:[A-Za-z]:[\\\\\/]?|[\\\\\/]+)$/D', $directory) === 1) {
-            throw new InvalidArgumentException('--dir 不能指向文件系统根目录: ' . $directory);
+            throw new InvalidArgumentException('--dir must not point to a filesystem root: ' . $directory);
         }
         if (file_exists($directory) && !is_dir($directory)) {
-            throw new InvalidArgumentException('输出路径不是目录: ' . $directory);
+            throw new InvalidArgumentException('Output path is not a directory: ' . $directory);
         }
 
         return $directory;
@@ -167,11 +167,11 @@ final readonly class ModelGenerator
     private function prepareDirectory(string $directory): string
     {
         if (!is_dir($directory) && !mkdir($directory, 0777, true) && !is_dir($directory)) {
-            throw new RuntimeException('无法创建输出目录: ' . $directory);
+            throw new RuntimeException('Unable to create output directory: ' . $directory);
         }
         $real = realpath($directory);
         if ($real === false || !is_writable($real)) {
-            throw new RuntimeException('输出目录不可写: ' . $directory);
+            throw new RuntimeException('Output directory is not writable: ' . $directory);
         }
 
         return $real;
@@ -181,11 +181,11 @@ final readonly class ModelGenerator
     {
         $namespace = trim($namespace, " \\t\n\r\0\x0B\\");
         if ($namespace === '' || preg_match('/^[A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)*$/D', $namespace) !== 1) {
-            throw new InvalidArgumentException('非法 PHP 命名空间: ' . $namespace);
+            throw new InvalidArgumentException('Invalid PHP namespace: ' . $namespace);
         }
         foreach (explode('\\', $namespace) as $part) {
             if ($this->reserved($part)) {
-                throw new InvalidArgumentException('PHP 命名空间包含保留字: ' . $part);
+                throw new InvalidArgumentException('PHP namespace contains a reserved word: ' . $part);
             }
         }
 
@@ -195,7 +195,7 @@ final readonly class ModelGenerator
     private function validatePrefix(string $prefix): void
     {
         if ($prefix !== '' && preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/D', $prefix) !== 1) {
-            throw new InvalidArgumentException('非法表名前缀: ' . $prefix);
+            throw new InvalidArgumentException('Invalid table prefix: ' . $prefix);
         }
     }
 
@@ -203,7 +203,7 @@ final readonly class ModelGenerator
     {
         $base = $prefix !== '' && str_starts_with($table, $prefix) ? substr($table, strlen($prefix)) : $table;
         if ($base === '') {
-            throw new InvalidArgumentException("表 $table 去掉前缀后为空，无法生成类名");
+            throw new InvalidArgumentException("Table $table is empty after removing the prefix; cannot generate a class name");
         }
         $class = str_replace(' ', '', ucwords(str_replace('_', ' ', $base)));
         if ($this->reserved($class) && $class !== 'Final') {
@@ -237,11 +237,11 @@ final readonly class ModelGenerator
             // force 已由 generate() 判断，这里加锁原子替换，避免留下半截 PHP 文件。
             $temporary = tempnam(dirname($file), '.pixiaoka-orm-');
             if ($temporary === false) {
-                throw new RuntimeException('无法创建模型临时文件: ' . dirname($file));
+                throw new RuntimeException('Unable to create a temporary model file in: ' . dirname($file));
             }
             try {
                 if (file_put_contents($temporary, $code, LOCK_EX) !== strlen($code) || !rename($temporary, $file)) {
-                    throw new RuntimeException('无法覆盖模型文件: ' . $file);
+                    throw new RuntimeException('Unable to overwrite model file: ' . $file);
                 }
             } finally {
                 if (is_file($temporary)) {
@@ -257,7 +257,7 @@ final readonly class ModelGenerator
             while ($length < strlen($code)) {
                 $written = fwrite($handle, substr($code, $length));
                 if ($written === false || $written === 0) {
-                    throw new RuntimeException('无法写入模型文件: ' . $file);
+                    throw new RuntimeException('Unable to write model file: ' . $file);
                 }
                 $length += $written;
             }

@@ -46,7 +46,7 @@ final class Loader
     public function load(array $entities, string|array $relations): void
     {
         if ($this->loading !== []) {
-            throw new RelationException('预加载约束不得重入 with/load；请使用点分嵌套路径声明关系');
+            throw new RelationException('Eager-loading constraints must not reenter with/load; use dot-separated paths for nested relations');
         }
         if ($entities === []) {
             return;
@@ -54,7 +54,7 @@ final class Loader
         $class = $entities[0]::class;
         foreach ($entities as $entity) {
             if ($entity::class !== $class) {
-                throw new RelationException('一次 with/load 只能加载同一个模型的关系');
+                throw new RelationException('Each with/load call can only load relations for one model');
             }
         }
         $this->identities = [];
@@ -161,7 +161,7 @@ final class Loader
         }
         foreach ($current['loadedRelations'] as $name => $_) {
             $relation = $this->gateway->relationDefinitions($target::class)[$name]
-                ?? throw new RelationException($target::class . "::$name 的关系声明已失效");
+                ?? throw new RelationException($target::class . "::$name has an invalid relation declaration");
             foreach ($relation->sourceKey as $field) {
                 if (($changed[$field->property] ?? false) && !isset($pendingRelations[$name])) {
                     $target->forgetLoadedRelation($name);
@@ -187,7 +187,7 @@ final class Loader
             $relation = $this->gateway->relation($class, $name);
             $key = $class . '::' . $name;
             if (isset($this->loading[$key])) {
-                throw new RelationException("关系加载存在循环: $key");
+                throw new RelationException("Circular relation loading: $key");
             }
             // 在执行约束之前置位：约束闭包重入同一关系也必须被拒绝。
             $this->loading[$key] = true;
@@ -245,7 +245,7 @@ final class Loader
                     $values = $this->keyValues($target, $relation, false);
                     // 每个元组条件已经排除 NULL，理论不可达；显式保护避免错误键串行。
                     if ($values === null) {
-                        throw new RelationException($relation->target . ' 的关联键不能为 NULL');
+                        throw new RelationException('Relation keys for ' . $relation->target . ' cannot be NULL');
                     }
                     $identityValues = $this->identityValues($target);
                     $identity = RowCache::key(
@@ -290,16 +290,16 @@ final class Loader
     {
         $result = $constraint($query);
         if ($result !== null && $result !== $query) {
-            throw new RelationException($relation->name . ' 预加载约束必须修改传入的 Builder，或返回同一 Builder');
+            throw new RelationException('Eager-loading constraint ' . $relation->name . ' must modify the provided Builder or return the same Builder');
         }
         $shape = $query->relationShape();
         if ($shape['limit'] !== null || $shape['offset'] > 0) {
-            throw new RelationException($relation->name . ' 预加载不支持全局 limit/offset；请先关联查询，后续使用独立游标分页');
+            throw new RelationException('Eager loading ' . $relation->name . ' does not support global limit/offset; run a relation query first and paginate separately with a cursor');
         }
         if ($shape['projection'] || $shape['joins'] || $shape['groupBy'] || $shape['having']
             || $shape['unions'] || $shape['derivedFrom'] || $shape['distinct'] || $shape['alias']
             || $shape['lock'] || $shape['relations'] !== []) {
-            throw new RelationException($relation->name . ' 预加载只允许 WHERE/OR/排序及确定性 targetKey 覆盖；不支持复杂查询、行锁或嵌套 with');
+            throw new RelationException('Eager loading ' . $relation->name . ' only allows WHERE/OR, ordering, and deterministic targetKey overrides; complex queries, row locks, and nested with are not supported');
         }
         // 用户排序在前；关联键用于父行分组，目标主键用于同组候选的稳定决胜。
         $ordered = $shape['order'];
@@ -320,7 +320,7 @@ final class Loader
         $fields = $source ? $relation->sourceKey : $relation->targetKey;
         foreach ($fields as $field) {
             if (!$entity->propSet($field->property)) {
-                throw new RelationException($entity::class . '::' . $relation->name . ' 缺少关联键 ' . $field->property);
+                throw new RelationException($entity::class . '::' . $relation->name . ' is missing relation key ' . $field->property);
             }
             $value = $entity->{$field->property};
             if ($value === null) {
@@ -338,7 +338,7 @@ final class Loader
         $values = [];
         foreach ($this->gateway->meta($entity::class)->primaryKey as $field) {
             if (!$entity->propSet($field->property)) {
-                throw new RelationException($entity::class . ' 缺少主键 ' . $field->property);
+                throw new RelationException($entity::class . ' is missing primary key ' . $field->property);
             }
             $values[] = $this->gateway->castQueryValue($entity::class, $field->column, $entity->{$field->property});
         }
@@ -366,7 +366,7 @@ final class Loader
     {
         $name = array_shift($parts);
         if ($name === '') {
-            throw new RelationException('关系路径不能包含空名称');
+            throw new RelationException('Relation paths cannot contain empty names');
         }
         if (!isset($tree[$name])) {
             $tree[$name] = new RelationSpec($name);
@@ -380,7 +380,7 @@ final class Loader
             return;
         }
         if ($constraint !== null && $tree[$name]->constraint !== null) {
-            throw new RelationException('同一关系路径不能声明多个约束: ' . $path);
+            throw new RelationException('A relation path cannot declare multiple constraints: ' . $path);
         }
         $tree[$name]->constraint = $constraint;
     }
@@ -401,7 +401,7 @@ final class Loader
                     continue;
                 }
                 if (!is_string($value)) {
-                    throw new RelationException('位置关系项必须是路径字符串或关系配置数组');
+                    throw new RelationException('Positional relation items must be path strings or relation configuration arrays');
                 }
                 $items[] = [$value, null];
             } elseif (is_string($value)) {
@@ -413,7 +413,7 @@ final class Loader
             } elseif (is_callable($value)) {
                 $items[] = [$key, $value];
             } else {
-                throw new RelationException('关系约束必须是可调用对象或嵌套路径数组');
+                throw new RelationException('Relation constraints must be callable or nested path arrays');
             }
         }
 

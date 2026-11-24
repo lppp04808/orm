@@ -36,13 +36,13 @@ final class SqlExecutorTest extends TestCase
                 self::fail('同一物理连接熔断后，其他 Gateway 必须拒绝执行 SQL');
             } catch (\LogicException $e) {
                 self::assertSame(
-                    '数据库开始、提交或回滚结果未知，禁止复用当前连接；请丢弃该连接、Gateway 和关联实体',
+                    'The database begin, commit, or rollback outcome is unknown; do not reuse this connection. Discard the connection, Gateway, and associated entities',
                     $e->getMessage(),
                 );
             }
         }
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessage('禁止复用当前连接');
+        $this->expectExceptionMessage('do not reuse this connection');
         $this->executor($connection)->selectRaw('SELECT 1');
     }
 
@@ -61,13 +61,13 @@ final class SqlExecutorTest extends TestCase
                 $other->selectRaw('SELECT 1');
                 self::fail('观测监听器不得通过其他 Gateway 重入同一连接');
             } catch (\LogicException $e) {
-                self::assertSame('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期', $e->getMessage());
+                self::assertSame('An observability listener must not reenter the same connection or change the Session/transaction lifecycle', $e->getMessage());
             }
             try {
                 $other->assertObservationBoundary();
                 self::fail('观测监听器不得重入观测边界');
             } catch (\LogicException $e) {
-                self::assertSame('观测监听器不得重入同一连接执行 ORM 操作或改变 Session/事务生命周期', $e->getMessage());
+                self::assertSame('An observability listener must not reenter the same connection or change the Session/transaction lifecycle', $e->getMessage());
             }
         });
 
@@ -98,7 +98,7 @@ SQL;
     public function testNamedParamLexerRejectsPositionalPlaceholder(): void
     {
         $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('原生 SQL 请使用命名占位符，避免与复杂查询参数合并时错位');
+        $this->expectExceptionMessage('Raw SQL must use named placeholders to avoid parameter misalignment in complex queries');
         $this->executor(new SqlExecutorConnection())->selectRaw('SELECT :value + ?', ['value' => 1]);
     }
 

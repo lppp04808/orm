@@ -15,7 +15,7 @@ final readonly class BcDecimal implements Decimal
     {
         $text = (string) $value;
         if (preg_match('/^-?\d+(\.\d+)?$/', $text) !== 1) {
-            throw new \InvalidArgumentException('非法十进数: ' . $text);
+            throw new \InvalidArgumentException('Invalid decimal number: ' . $text);
         }
         $this->value = $text;
     }

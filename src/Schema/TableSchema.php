@@ -25,7 +25,7 @@ final readonly class TableSchema
         public array $indexes = [],
     ) {
         if ($columns === []) {
-            throw new InvalidArgumentException("表 $name 没有可生成的字段");
+            throw new InvalidArgumentException("Table $name has no fields to generate");
         }
 
         $this->columns = $columns;

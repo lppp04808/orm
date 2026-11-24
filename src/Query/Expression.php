@@ -22,7 +22,7 @@ final readonly class Expression
         public array $params = [],
     ) {
         if (trim($this->sql) === '') {
-            throw new InvalidArgumentException('Raw SQL 不能为空');
+            throw new InvalidArgumentException('Raw SQL cannot be empty');
         }
     }
 

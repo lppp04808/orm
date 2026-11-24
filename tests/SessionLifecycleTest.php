@@ -58,7 +58,7 @@ final class SessionLifecycleTest extends TestCase
                 Session::use($this->rootGateway);
                 self::fail('外层网关在作用域期间及恢复后均须保持独占');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('另一个活跃 Fiber/协程', $e->getMessage());
+                self::assertStringContainsString('another active Fiber/coroutine', $e->getMessage());
             }
         });
         Session::scope($inner, function () use ($inner, $probe): void {
@@ -72,7 +72,7 @@ final class SessionLifecycleTest extends TestCase
                 Session::use($this->rootGateway);
                 self::fail('恢复后的外层网关必须重新保持引用');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('另一个活跃 Fiber/协程', $e->getMessage());
+                self::assertStringContainsString('another active Fiber/coroutine', $e->getMessage());
             }
         });
         $probe->start();
@@ -97,7 +97,7 @@ final class SessionLifecycleTest extends TestCase
                 Session::use($this->rootGateway);
                 self::fail('同网关嵌套作用域退出后，外层会话仍须保持独占');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('另一个活跃 Fiber/协程', $e->getMessage());
+                self::assertStringContainsString('another active Fiber/coroutine', $e->getMessage());
             }
         });
         $probe->start();
@@ -136,7 +136,7 @@ final class SessionLifecycleTest extends TestCase
         Session::strict();
         $fiber = new \Fiber(static fn (): string => Session::get()->gateway::class);
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessage('严格模式禁止回退根连接');
+        $this->expectExceptionMessage('strict mode forbids root fallback');
         $fiber->start();
     }
 
@@ -216,7 +216,7 @@ final class SessionLifecycleTest extends TestCase
         $scope = Session::scope($this->rootGateway);
         $fiber = new \Fiber(static fn () => $scope->close());
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessage('创建它的 Fiber');
+        $this->expectExceptionMessage('where it was created');
         $fiber->start();
     }
 
@@ -237,7 +237,7 @@ final class SessionLifecycleTest extends TestCase
             });
             self::fail('清理事务 Session 后必须拒绝提交');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('不能继续提交', $e->getMessage());
+            self::assertStringContainsString('cannot be committed', $e->getMessage());
         }
         self::assertSame(1, $connection->rollbacks);
         self::assertSame([], self::databaseRows($path));
@@ -284,7 +284,7 @@ final class SessionLifecycleTest extends TestCase
             });
             self::fail('作用域清理事务后必须拒绝提交');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('不能继续提交', $e->getMessage());
+            self::assertStringContainsString('cannot be committed', $e->getMessage());
         }
         self::assertSame($this->rootGateway, Session::get()->gateway);
         self::assertSame(1, $connection->rollbacks);
@@ -307,7 +307,7 @@ final class SessionLifecycleTest extends TestCase
             });
             self::fail('必须优先报告事务回滚结果未知');
         } catch (TransactionException $e) {
-            self::assertSame('回滚', $e->operation);
+            self::assertSame('rollback', $e->operation);
             self::assertNull($e->businessException);
             self::assertSame('rollback failure', $e->getPrevious()?->getMessage());
         }
@@ -330,7 +330,7 @@ final class SessionLifecycleTest extends TestCase
                     Session::use($replacement);
                     self::fail('隐式换绑不得代替调用方回滚未结束事务');
                 } catch (\LogicException $e) {
-                    self::assertStringContainsString('禁止换绑', $e->getMessage());
+                    self::assertStringContainsString('before rebinding', $e->getMessage());
                 }
                 self::assertSame(0, $connection->rollbacks);
                 self::assertSame($recordingGateway, Session::get()->gateway);
@@ -357,7 +357,7 @@ final class SessionLifecycleTest extends TestCase
             });
             self::fail('换绑拒绝应在事务内保留业务异常语义');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('禁止换绑', $e->getMessage());
+            self::assertStringContainsString('before rebinding', $e->getMessage());
         }
         self::assertSame($this->rootGateway, Session::get()->gateway);
     }
@@ -376,7 +376,7 @@ final class SessionLifecycleTest extends TestCase
                 });
                 self::fail('同 Gateway 的作用域或重新绑定也不能回滚当前事务');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('禁止换绑', $e->getMessage());
+                self::assertStringContainsString('before rebinding', $e->getMessage());
             }
             self::assertSame($this->rootGateway, Session::get()->gateway);
         }
@@ -397,7 +397,7 @@ final class SessionLifecycleTest extends TestCase
                     Session::use(self::gateway($path));
                     self::fail('换绑不得吞掉回滚失败或伪装业务异常');
                 } catch (\LogicException $e) {
-                    self::assertStringContainsString('禁止换绑', $e->getMessage());
+                    self::assertStringContainsString('before rebinding', $e->getMessage());
                     self::assertNotInstanceOf(TransactionException::class, $e);
                 }
                 self::assertSame(0, $connection->rollbacks);
@@ -406,7 +406,7 @@ final class SessionLifecycleTest extends TestCase
             });
             self::fail('外层回滚失败必须报告事务结果未知');
         } catch (TransactionException $e) {
-            self::assertSame('回滚', $e->operation);
+            self::assertSame('rollback', $e->operation);
             self::assertSame('business rollback', $e->businessException?->getMessage());
             self::assertSame('rollback failure', $e->getPrevious()?->getMessage());
         }
@@ -544,7 +544,7 @@ final class SessionLifecycleTest extends TestCase
                 Session::use($this->rootGateway);
                 self::fail('非事务读写也不能在两个活跃 Fiber 间共享同一网关');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('另一个活跃 Fiber/协程', $e->getMessage());
+                self::assertStringContainsString('another active Fiber/coroutine', $e->getMessage());
             }
         });
         $second->start();
@@ -621,7 +621,7 @@ final class SessionLifecycleTest extends TestCase
             });
             self::fail('所有命名会话回滚后不得提交');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('操作已回滚', $e->getMessage());
+            self::assertStringContainsString('the work was rolled back', $e->getMessage());
         }
         self::assertSame(1, $firstConnection->rollbacks);
         self::assertSame(1, $secondConnection->rollbacks);
@@ -656,7 +656,7 @@ final class SessionLifecycleTest extends TestCase
                 Session::use($this->rootGateway);
                 self::fail('删除另一个命名会话后，恢复的外层会话仍须保持独占');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('另一个活跃 Fiber/协程', $e->getMessage());
+                self::assertStringContainsString('another active Fiber/coroutine', $e->getMessage());
             }
         });
         $probe->start();

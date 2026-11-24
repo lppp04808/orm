@@ -14,22 +14,24 @@ use Pixiaoka\Orm\Metadata\ModelMeta;
 use Pixiaoka\Orm\Query\Builder;
 
 /** @internal 批量及条件写入；仅调用期间使用网关，不保存网关强引用。 */
-final class BulkWriter
+final readonly class BulkWriter
 {
     public function __construct(
-        private readonly Connection $connection,
-        private readonly MetadataReader $metadata,
-        private readonly Caster $caster,
-        private readonly RowCache $cache,
-        private readonly SqlExecutor $executor,
-        private readonly TransactionManager $transactions,
+        private Connection         $connection,
+        private MetadataReader     $metadata,
+        private Caster             $caster,
+        private RowCache           $cache,
+        private SqlExecutor        $executor,
+        private TransactionManager $transactions,
     ) {
     }
 
     /**
+     * @param EntityGateway $gateway
      * @param class-string<Entity> $class
      * @param list<Entity|array<string, mixed>> $rows
      * @param callable(Entity, bool=, string=): void $cacheSet
+     * @throws \Throwable
      */
     public function batchInsert(EntityGateway $gateway, string $class, array $rows, callable $cacheSet): void
     {
@@ -61,15 +63,15 @@ final class BulkWriter
                 continue;
             }
             if (!$row instanceof $class) {
-                throw new \InvalidArgumentException('批量插入实体必须是 ' . $class . '，收到 ' . $row::class);
+                throw new \InvalidArgumentException('Batch insert entities must be ' . $class . ', got ' . $row::class);
             }
             if (!$row->isNew()) {
-                throw new IdentityException($row::class . ' 已经在库里，不能再批量 insert');
+                throw new IdentityException($row::class . ' is already persisted and cannot be batch-inserted');
             }
             if ($row->hasGatewayBinding()) {
                 $bound = $row->boundGateway()
-                    ?? throw new \LogicException($row::class . ' 原 Gateway 已销毁，请在新 Gateway 上显式重查');
-                $gateway->assertSame($bound, '批量插入');
+                    ?? throw new \LogicException($row::class . ' has a destroyed Gateway; query it explicitly through a new Gateway');
+                $gateway->assertSame($bound, 'batch insert');
             }
             $entities[$index] = $row;
         }
@@ -77,7 +79,7 @@ final class BulkWriter
         // P0-3：多行含实体 + 生成列时，RETURNING 是唯一可靠的批量回填途径。
         if ($generated !== null && $entities !== [] && count($rows) > 1 && !$this->connection->supportsReturning()) {
             throw new IdentityException(
-                $meta->class . ' 该连接不支持 RETURNING，无法批量回填生成列，请逐行 insert',
+                $meta->class . ' cannot batch-populate generated columns because the connection does not support RETURNING; insert entities individually',
                 true,
             );
         }
@@ -128,11 +130,11 @@ final class BulkWriter
                     ? $row->{$field->property}
                     : (array_key_exists($field->column, $row) ? $row[$field->column] : $row[$field->property]);
             } else {
-                throw new IdentityException($meta->class . '::' . $field->property . ' 批量插入缺少列');
+                throw new IdentityException($meta->class . '::' . $field->property . ' is missing a value for batch insert');
             }
             $values[] = $this->caster->toDbNormalized($meta->class, $field, $value);
             if ($isVersion) {
-                $version = $meta->versionField() ?? throw new \LogicException('版本元数据不一致');
+                $version = $meta->versionField() ?? throw new \LogicException('Version metadata is inconsistent');
                 $this->versionValue($meta, $version, $this->caster->toPhp($meta->class, $version, $value));
             }
         }
@@ -151,7 +153,7 @@ final class BulkWriter
     ): void {
         if ($generated !== null && !$row->propSet($generated->property)) {
             if ($id === null || $id === '' || $id === '0') {
-                throw new IdentityException($meta->class . ' 行可能已写入，但生成列没有回填', true);
+                throw new IdentityException($meta->class . ' row may have been written, but its generated column was not populated', true);
             }
             $row->{$generated->property} = $this->caster->toPhp($meta->class, $generated, $id);
         }
@@ -165,9 +167,12 @@ final class BulkWriter
     /**
      * 执行已完整预检的分块；这里不再运行钩子或修改实体。
      *
+     * @param ModelMeta $meta
+     * @param FieldMeta|null $generated
      * @param list<FieldMeta> $fieldList
      * @param list<list<int|float|string|null>> $chunk
      * @return list<string|null>
+     * @throws \Throwable
      */
     private function executeBatchChunk(
         ModelMeta $meta,
@@ -223,7 +228,7 @@ final class BulkWriter
 
     public function executeUpdate(Builder $builder, array $values): int
     {
-        $this->assertVersionWrite($this->metadata->read($builder->modelClass()), '批量条件 UPDATE');
+        $this->assertVersionWrite($this->metadata->read($builder->modelClass()), 'conditional UPDATE');
         $query = $builder->buildUpdate($values);
         $affected = $this->executor->execute($query['sql'], $query['params'], $builder->modelClass());
         $this->cache->clearClass($this->metadata->read($builder->modelClass())->class);
@@ -231,13 +236,19 @@ final class BulkWriter
         return $affected;
     }
 
-    /** @param callable(Entity, bool=, string=): void $cacheSet 批量恢复只同步实际命中的已交付实体。 */
+    /**
+     * @param EntityGateway $gateway
+     * @param Builder $builder
+     * @param callable(Entity, bool=, string=): void $cacheSet 批量恢复只同步实际命中的已交付实体。
+     * @return int
+     * @throws \Throwable
+     */
     public function executeRestore(EntityGateway $gateway, Builder $builder, callable $cacheSet): int
     {
         $meta = $this->metadata->read($builder->modelClass());
         $field = $meta->softDeleteField()
-            ?? throw new \InvalidArgumentException($meta->class . ' 未声明软删除字段');
-        $this->assertVersionWrite($meta, '批量条件 UPDATE');
+            ?? throw new \InvalidArgumentException($meta->class . ' does not declare a soft-delete field');
+        $this->assertVersionWrite($meta, 'conditional UPDATE');
         $known = $this->knownMatchingEntities($meta, $builder);
         $query = $builder->buildUpdate([$field->property => null]);
         $affected = $this->executor->execute($query['sql'], $query['params'], $meta->class);
@@ -253,10 +264,17 @@ final class BulkWriter
         return $affected;
     }
 
+    /**
+     * @param EntityGateway $gateway
+     * @param Builder $builder
+     * @param bool $force
+     * @return int
+     * @throws \Throwable
+     */
     public function executeDelete(EntityGateway $gateway, Builder $builder, bool $force = false): int
     {
         $meta = $this->metadata->read($builder->modelClass());
-        $this->assertVersionWrite($meta, '批量条件 DELETE');
+        $this->assertVersionWrite($meta, 'conditional DELETE');
         $class = $meta->class;
         $softDelete = $force ? null : $meta->softDeleteField();
         if ($softDelete !== null) {
@@ -334,7 +352,12 @@ final class BulkWriter
             ->build();
     }
 
-    /** @return list<Entity> */
+    /**
+     * @param ModelMeta $meta
+     * @param Builder $builder
+     * @return list<Entity>
+     * @throws \Throwable
+     */
     private function knownMatchingEntities(ModelMeta $meta, Builder $builder): array
     {
         $candidates = $this->deletedIdentityQuery($meta, $builder);
@@ -365,7 +388,7 @@ final class BulkWriter
             $identity = [];
             foreach ($meta->primaryKey as $field) {
                 if (!array_key_exists($field->column, $row)) {
-                    throw new IdentityException($meta->class . ' DELETE RETURNING 缺少主键列 ' . $field->column);
+                    throw new IdentityException($meta->class . ' DELETE RETURNING is missing primary key column ' . $field->column);
                 }
                 $identity[$field->column] = $this->caster->toDbNormalized($meta->class, $field, $row[$field->column]);
             }
@@ -383,13 +406,15 @@ final class BulkWriter
      * @param array<string, mixed> $values 属性名或真实列名 => 值
      * @param list<string>|null $updateColumns
      * @param list<string>|null $conflictColumns
+     * @return int
+     * @throws \Throwable
      */
     public function upsert(string $class, array $values, ?array $updateColumns = null, ?array $conflictColumns = null): int
     {
         $meta = $this->metadata->read($class);
         $this->assertVersionWrite($meta, 'UPSERT');
         if ($values === []) {
-            throw new \InvalidArgumentException('UPSERT 至少需要一个字段');
+            throw new \InvalidArgumentException('UPSERT requires at least one field');
         }
         $fields = [];
         foreach ($meta->fields as $field) {
@@ -397,11 +422,11 @@ final class BulkWriter
             $fields[$field->column] = $field;
         }
         $resolve = static function (string $name) use ($fields, $class): FieldMeta {
-            return $fields[$name] ?? throw new \InvalidArgumentException($class . ' 未知字段: ' . $name);
+            return $fields[$name] ?? throw new \InvalidArgumentException($class . ' has unknown field: ' . $name);
         };
         $conflictColumns ??= $meta->primaryColumns();
         if ($conflictColumns === []) {
-            throw new \InvalidArgumentException('UPSERT 必须指定冲突键');
+            throw new \InvalidArgumentException('UPSERT requires a conflict key');
         }
         $conflicts = [];
         foreach ($conflictColumns as $column) {
@@ -411,20 +436,20 @@ final class BulkWriter
         $insert = [];
         foreach ($values as $column => $value) {
             if (!is_string($column)) {
-                throw new \InvalidArgumentException('UPSERT 字段名必须是字符串');
+                throw new \InvalidArgumentException('UPSERT field names must be strings');
             }
             $field = $resolve($column);
             if (isset($insert[$field->column])) {
-                throw new \InvalidArgumentException('UPSERT 字段重复: ' . $field->column);
+                throw new \InvalidArgumentException('Duplicate UPSERT field: ' . $field->column);
             }
             if ($field->generated && !isset($conflicts[$field->column])) {
-                throw new IdentityException($class . ' 代理键只有作为显式 UPSERT 冲突键时才可写入');
+                throw new IdentityException($class . ' generated key may be written only as an explicit UPSERT conflict key');
             }
             $insert[$field->column] = $this->caster->toDbNormalized($meta->class, $field, $value);
         }
         foreach ($conflicts as $column => $_) {
             if (!array_key_exists($column, $insert)) {
-                throw new IdentityException($class . ' UPSERT 缺少冲突键 ' . $column);
+                throw new IdentityException($class . ' UPSERT is missing conflict key ' . $column);
             }
         }
         $updates = [];
@@ -438,7 +463,7 @@ final class BulkWriter
         }
         foreach ($meta->fields as $field) {
             if (!array_key_exists($field->column, $insert) && !$field->generated && !$field->nullable()) {
-                throw new IdentityException($class . ' UPSERT 缺少非空字段 ' . $field->column);
+                throw new IdentityException($class . ' UPSERT is missing non-nullable field ' . $field->column);
             }
         }
         if ($updateColumns !== []) {
@@ -464,16 +489,16 @@ final class BulkWriter
             foreach ($updateColumns as $column) {
                 $field = $resolve($column);
                 if (isset($conflicts[$field->column]) || $field->generated) {
-                    throw new \InvalidArgumentException('UPSERT 不允许更新冲突键或生成列: ' . $field->column);
+                    throw new \InvalidArgumentException('UPSERT cannot update conflict keys or generated columns: ' . $field->column);
                 }
                 if (!array_key_exists($field->column, $insert)) {
-                    throw new \InvalidArgumentException('UPSERT 更新字段没有输入值: ' . $field->column);
+                    throw new \InvalidArgumentException('UPSERT update field has no input value: ' . $field->column);
                 }
                 $updates[$field->column] = $field;
             }
         }
         if ($updateColumns === null && $updates === []) {
-            throw new \InvalidArgumentException('UPSERT 没有可更新字段；如需冲突时忽略请传 $updateColumns=[]');
+            throw new \InvalidArgumentException('UPSERT has no fields to update; pass $updateColumns=[] to ignore conflicts');
         }
         $columns = array_keys($insert);
         $sql = sprintf(
@@ -527,7 +552,7 @@ final class BulkWriter
     private function versionValue(ModelMeta $meta, FieldMeta $field, mixed $value): int
     {
         if (!is_int($value) || $value < 0 || $value === PHP_INT_MAX) {
-            throw new IdentityException($meta->class . '::' . $field->property . ' 版本必须是大于等于 0 且可递增的 int');
+            throw new IdentityException($meta->class . '::' . $field->property . ' version must be a non-negative int that can be incremented');
         }
 
         return $value;
@@ -536,7 +561,7 @@ final class BulkWriter
     private function assertVersionWrite(ModelMeta $meta, string $operation): void
     {
         if ($meta->version !== null) {
-            throw new \LogicException($meta->class . " 使用乐观锁，$operation 无法保留逐实体版本语义；请逐实体 save/delete");
+            throw new \LogicException($meta->class . " uses optimistic locking; $operation cannot preserve per-entity version semantics; use save/delete per entity");
         }
     }
 
@@ -552,7 +577,7 @@ final class BulkWriter
     private function driver(): string
     {
         if (!$this->connection instanceof DriverAwareConnection) {
-            throw new \LogicException('该操作需要连接实现 DriverAwareConnection，以选择正确的 SQL 方言');
+            throw new \LogicException('This operation requires DriverAwareConnection to select the SQL dialect');
         }
 
         return $this->connection->driver();

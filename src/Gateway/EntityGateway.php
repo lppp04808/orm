@@ -126,7 +126,7 @@ final class EntityGateway
     public function assertSame(EntityGateway $gateway, string $operation): void
     {
         if ($this !== $gateway) {
-            throw new \InvalidArgumentException($operation . '必须使用同一个 EntityGateway');
+            throw new \InvalidArgumentException($operation . ' must use the same EntityGateway');
         }
     }
 
@@ -154,11 +154,11 @@ final class EntityGateway
         $identity = [];
         $primary = $this->meta($class)->primaryKey;
         if (count($primary) !== count($values)) {
-            throw new \LogicException($class . ' 的关系目标主键不完整');
+            throw new \LogicException($class . ' has an incomplete relation target primary key');
         }
         foreach ($primary as $index => $field) {
             if (!array_key_exists($index, $values) || (!is_scalar($values[$index]) && $values[$index] !== null)) {
-                throw new \LogicException($class . ' 的关系目标主键必须是完整标量元组');
+                throw new \LogicException($class . ' relation target primary key must be a complete scalar tuple');
             }
             $identity[$field->column] = $values[$index];
         }
@@ -204,8 +204,8 @@ final class EntityGateway
             $entity->bindGateway($this);
         } else {
             $bound = $entity->boundGateway()
-                ?? throw new \LogicException($entity::class . ' 原 Gateway 已销毁，请在新 Gateway 上显式重查');
-            $this->assertSame($bound, '实体操作');
+                ?? throw new \LogicException($entity::class . ' has a destroyed Gateway; query it explicitly through a new Gateway');
+            $this->assertSame($bound, 'entity operation');
         }
 
         return $this;
@@ -221,7 +221,7 @@ final class EntityGateway
     public function constrainRelation(array $fields, array $values): Expression
     {
         if (count($fields) !== count($values)) {
-            throw new \LogicException('关系键和值数量不一致');
+            throw new \LogicException('Relation key and value counts differ');
         }
         $parts = [];
         $params = [];
@@ -257,7 +257,7 @@ final class EntityGateway
     public function driver(): string
     {
         if (!$this->connection instanceof DriverAwareConnection) {
-            throw new \LogicException('该操作需要连接实现 DriverAwareConnection，以选择正确的 SQL 方言');
+            throw new \LogicException('This operation requires DriverAwareConnection to select the SQL dialect');
         }
 
         return $this->connection->driver();
@@ -281,12 +281,12 @@ final class EntityGateway
         foreach ($meta->fields as $field) {
             if ($field->generated) {
                 if ($entity->propSet($field->property)) {
-                    throw new IdentityException($meta->class . ' 生成列由数据库填写，调用方不能提供');
+                    throw new IdentityException($meta->class . ' generated column is assigned by the database and cannot be provided');
                 }
                 continue;
             }
             if (!$entity->propSet($field->property)) {
-                throw new IdentityException($meta->class . '::' . $field->property . ' 插入前必须有值');
+                throw new IdentityException($meta->class . '::' . $field->property . ' must have a value before insertion');
             }
             $params[$field->column] = $this->caster->toDb($meta->class, $field, $entity->{$field->property});
         }
@@ -332,7 +332,7 @@ final class EntityGateway
         }
 
         if ($id === '' || $id === '0') {
-            throw new IdentityException($meta->class . ' 行可能已写入，但生成列没有回填', true);
+            throw new IdentityException($meta->class . ' row may have been written, but its generated column was not populated', true);
         }
 
         $entity->{$generated->property} = $this->caster->toPhp($meta->class, $generated, $id);
@@ -443,7 +443,7 @@ final class EntityGateway
         }
 
         if ($expectedVersion !== null) {
-            $version = $meta->versionField() ?? throw new \LogicException('版本元数据不一致');
+            $version = $meta->versionField() ?? throw new \LogicException('Version metadata is inconsistent');
             $sets[] = $this->quote($version->column) . ' = ' . $this->quote($version->column) . ' + 1';
         }
         $sql = sprintf(
@@ -485,7 +485,7 @@ final class EntityGateway
         $softDelete = !$force ? $meta->softDeleteField() : null;
         if ($softDelete !== null) {
             if ($entity->propSet($softDelete->property) && $entity->{$softDelete->property} !== null) {
-                throw new IdentityException($meta->class . ' 已软删除，请使用 restore() 或 forceDelete()');
+                throw new IdentityException($meta->class . ' is soft-deleted; use restore() or forceDelete()');
             }
             $deletedAt = $this->caster->currentTimestamp($softDelete);
             $sql = sprintf(
@@ -504,7 +504,7 @@ final class EntityGateway
             );
         }
         if ($expectedVersion !== null) {
-            $version = $meta->versionField() ?? throw new \LogicException('版本元数据不一致');
+            $version = $meta->versionField() ?? throw new \LogicException('Version metadata is inconsistent');
             $sql .= ' AND ' . $this->quote($version->column) . ' = :orm_version';
             $params['orm_version'] = $expectedVersion;
         }
@@ -513,7 +513,7 @@ final class EntityGateway
             throw new OptimisticLockException($meta->class, 'DELETE', $expectedVersion);
         }
         if ($expectedVersion === null && $affected !== 1) {
-            throw new IdentityException($meta->class . ' 删除没有命中恰好一行');
+            throw new IdentityException($meta->class . ' delete must affect exactly one row');
         }
         $this->transactions->recordDeletedIdentity($entity, $identity->parts);
         if ($softDelete !== null) {
@@ -531,7 +531,7 @@ final class EntityGateway
         $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
         $field = $meta->softDeleteField()
-            ?? throw new \LogicException($meta->class . ' 未声明软删除字段');
+            ?? throw new \LogicException($meta->class . ' does not declare a soft-delete field');
         $identity = $this->identityOf($entity, $meta);
         $this->transactions->rememberEntity($entity);
         $params = [];
@@ -544,7 +544,7 @@ final class EntityGateway
         );
         $affected = $this->runExecute($sql, $params, $meta->class);
         if ($affected !== 1) {
-            throw new IdentityException($meta->class . ' 恢复没有命中恰好一条软删除记录');
+            throw new IdentityException($meta->class . ' restore must affect exactly one soft-deleted row');
         }
         $entity->{$field->property} = null;
         $entity->markPersisted($this);
@@ -639,12 +639,12 @@ final class EntityGateway
         );
         $row = $this->runQueryOne($sql, $params, $meta->class);
         if ($row === null) {
-            throw new IdentityException($meta->class . ' 行不存在，无法刷新');
+            throw new IdentityException($meta->class . ' row does not exist and cannot be refreshed');
         }
 
         foreach ($meta->fields as $field) {
             if (!array_key_exists($field->column, $row)) {
-                throw new IdentityException($meta->class . '::' . $field->property . ' 读出的行缺少列');
+                throw new IdentityException($meta->class . '::' . $field->property . ' result row is missing column');
             }
             $entity->{$field->property} = $this->caster->toPhp($meta->class, $field, $row[$field->column]);
         }
@@ -677,7 +677,7 @@ final class EntityGateway
             $field = $this->queryField($class, $column);
             if ($field === null) {
                 if (!is_scalar($value) && $value !== null) {
-                    throw new \InvalidArgumentException('查询值必须是标量或 null');
+                    throw new \InvalidArgumentException('Query values must be scalar or null');
                 }
 
                 return $value;
@@ -687,7 +687,7 @@ final class EntityGateway
         }
 
         $field = $this->queryField($class, $column)
-            ?? throw new \InvalidArgumentException('对象查询值必须对应一个基表模型字段: ' . $column);
+            ?? throw new \InvalidArgumentException('Object query values must correspond to a base-model field: ' . $column);
 
         return $this->caster->toDbNormalized($class, $field, $value);
     }
@@ -729,7 +729,7 @@ final class EntityGateway
         }
         if ($column !== null) {
             if (!array_key_exists($column, $row)) {
-                throw new \UnexpectedValueException('查询结果没有列: ' . $column);
+                throw new \UnexpectedValueException('Query result has no column: ' . $column);
             }
 
             return $row[$column];
@@ -952,6 +952,9 @@ final class EntityGateway
 
     private function hydrate(ModelMeta $meta, array $row): Entity
     {
+        /**
+         * @var Entity $entity
+         */
         $entity = $this->reflectionClass($meta->class)->newInstanceWithoutConstructor();
 
         foreach ($meta->fields as $field) {
@@ -960,7 +963,7 @@ final class EntityGateway
                     $entity->{$field->property} = null;
                     continue;
                 }
-                throw new IdentityException($meta->class . '::' . $field->property . ' 读出的行缺少非空列');
+                throw new IdentityException($meta->class . '::' . $field->property . ' result row is missing non-nullable column');
             }
             $entity->{$field->property} = $this->caster->toPhp($meta->class, $field, $row[$field->column]);
         }
@@ -975,11 +978,11 @@ final class EntityGateway
         $parts = [];
         foreach ($meta->primaryKey as $field) {
             if (!$entity->propSet($field->property)) {
-                throw new IdentityException($meta->class . ' 缺少主键列 ' . $field->column);
+                throw new IdentityException($meta->class . ' is missing primary key column ' . $field->column);
             }
             $value = $entity->{$field->property};
             if ($value === null) {
-                throw new IdentityException($meta->class . ' 主键列 ' . $field->column . ' 不可空');
+                throw new IdentityException($meta->class . ' primary key column ' . $field->column . ' must not be null');
             }
             $parts[$field->column] = $this->caster->toDb($meta->class, $field, $value);
         }
@@ -992,17 +995,17 @@ final class EntityGateway
         $parts = [];
         foreach ($meta->primaryKey as $field) {
             if (!array_key_exists($field->column, $key)) {
-                throw new IdentityException($meta->class . ' 按身份查找缺少主键列 ' . $field->column);
+                throw new IdentityException($meta->class . ' identity lookup is missing primary key column ' . $field->column);
             }
             if ($key[$field->column] === null) {
-                throw new IdentityException($meta->class . ' 主键列 ' . $field->column . ' 不可空');
+                throw new IdentityException($meta->class . ' primary key column ' . $field->column . ' must not be null');
             }
             $php = $this->caster->toPhp($meta->class, $field, $key[$field->column]);
             $parts[$field->column] = $this->caster->toDb($meta->class, $field, $php);
         }
         $unknown = array_diff(array_keys($key), $meta->primaryColumns());
         if ($unknown !== []) {
-            throw new IdentityException($meta->class . ' 身份里有不属于主键的列: ' . implode(', ', $unknown));
+            throw new IdentityException($meta->class . ' identity contains non-primary-key columns: ' . implode(', ', $unknown));
         }
 
         return new Identity($parts);
@@ -1011,7 +1014,7 @@ final class EntityGateway
     private function where(ModelMeta $meta, array &$params, Identity $identity): string
     {
         if (!$identity->complete(count($meta->primaryKey))) {
-            throw new IdentityException($meta->class . ' 主键列不齐全，拒绝执行');
+            throw new IdentityException($meta->class . ' has an incomplete primary key; operation rejected');
         }
 
         $clauses = [];
@@ -1036,7 +1039,7 @@ final class EntityGateway
     private function versionValue(ModelMeta $meta, FieldMeta $field, mixed $value): int
     {
         if (!is_int($value) || $value < 0 || $value === PHP_INT_MAX) {
-            throw new IdentityException($meta->class . '::' . $field->property . ' 版本必须是大于等于 0 且可递增的 int');
+            throw new IdentityException($meta->class . '::' . $field->property . ' version must be a non-negative int that can be incremented');
         }
 
         return $value;
@@ -1053,10 +1056,10 @@ final class EntityGateway
         if ($entity->propSet($field->property)
             && array_key_exists($field->property, $original)
             && $entity->{$field->property} !== $value) {
-            throw new IdentityException($meta->class . '::' . $field->property . ' 是 ORM 托管的版本字段，不能直接修改；请使用 refresh');
+            throw new IdentityException($meta->class . '::' . $field->property . ' is an ORM-managed version field; do not modify it directly, use refresh');
         }
         if (!is_int($value) || $value < 0 || $value === PHP_INT_MAX) {
-            throw new IdentityException($meta->class . '::' . $field->property . ' 缺少有效持久化版本，请 refresh 后重试');
+            throw new IdentityException($meta->class . '::' . $field->property . ' has no valid persisted version; refresh before retrying');
         }
 
         return $value;

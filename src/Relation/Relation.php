@@ -24,9 +24,9 @@ abstract class Relation
     public function query(Builder $query): static
     {
         if ($query->modelClass() !== $this->meta->target) {
-            throw new RelationException('关系条件 Builder 的模型必须是 ' . $this->meta->target);
+            throw new RelationException('Relation constraint Builder must use model ' . $this->meta->target);
         }
-        $this->gateway->assertSame($query->gateway(), '关系查询');
+        $this->gateway->assertSame($query->gateway(), 'relation query');
         $clone = clone $this;
         $clone->query = clone $query;
 
@@ -98,7 +98,7 @@ abstract class Relation
         foreach ($this->meta->sourceKey as $field) {
             if (!$this->source->propSet($field->property)) {
                 throw new RelationException(
-                    $this->meta->source . '::' . $this->meta->name . ' 缺少关联键 ' . $field->property,
+                    $this->meta->source . '::' . $this->meta->name . ' is missing relation key ' . $field->property,
                 );
             }
             $value = $this->source->{$field->property};

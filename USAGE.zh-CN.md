@@ -474,7 +474,7 @@ $u = new User();
 $u->name = '李四';
 $u->insert(); // 只在 isNew=true 时可用
 
-$u->insert(); // ❌ IdentityException:"已经在库里，不能再 insert"
+$u->insert(); // ❌ IdentityException:"User is already persisted and cannot be inserted again"
 ```
 
 ### delete() —— 删除
@@ -483,7 +483,7 @@ $u->insert(); // ❌ IdentityException:"已经在库里，不能再 insert"
 $u = User::find(['id' => 5]);
 $u->delete(); // 返回 void；受影响行 !== 1 时抛异常
 
-$u->delete(); // ❌ IdentityException:"还没入库，不能 delete"
+$u->delete(); // ❌ IdentityException:"User is not persisted and cannot be deleted"
 ```
 
 ### find() —— 按主键查找
@@ -805,7 +805,7 @@ User::transaction(function () {
 
 新插入行的重复查询副本在回滚后也会失效，不能利用已读取的生成主键绕过插入保护。删除旧行后重插：若数据库复用旧主键，重插对象和查询副本恢复旧行基线；若分配新主键，则按事务新增行失效。非 `#[Column]` 业务属性和钩子的外部副作用不在恢复范围。
 
-只有数据库确认回滚成功，才恢复内存并透传业务异常。begin 返回 `false` 或抛异常、commit 失败、rollback 失败都按结果未知处理，抛 `TransactionException`；不能假定物理事务没有开始或提交。异常公开 `operation`（`开始` / `提交` / `回滚`）、`businessException` 和 `previous`。commit 失败不会被后续 rollback 失败覆盖；commit 已尝试后即使 rollback 成功也不恢复内存。
+只有数据库确认回滚成功，才恢复内存并透传业务异常。begin 返回 `false` 或抛异常、commit 失败、rollback 失败都按结果未知处理，抛 `TransactionException`；不能假定物理事务没有开始或提交。异常公开 `operation`（`begin` / `commit` / `rollback`）、`businessException` 和 `previous`。commit 失败不会被后续 rollback 失败覆盖；commit 已尝试后即使 rollback 成功也不恢复内存。
 
 事务结果未知后，禁止在原 `Connection` 上继续查询、写入、事务或通过另一个 Gateway/`Session::use()` 复用。必须丢弃连接、Gateway 和关联实体；`Session::discard()` 仍允许解除失败 Session。驱动 begin 之前的连接所有权冲突是确定的 `LogicException`，不会毒化连接。
 

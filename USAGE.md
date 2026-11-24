@@ -474,7 +474,7 @@ $u = new User();
 $u->name = 'Bob';
 $u->insert(); // Available only while isNew=true
 
-$u->insert(); // IdentityException: the row is already persisted and cannot be inserted again
+$u->insert(); // IdentityException: "User is already persisted and cannot be inserted again"
 ```
 
 ### delete() — deletion
@@ -483,7 +483,7 @@ $u->insert(); // IdentityException: the row is already persisted and cannot be i
 $u = User::find(['id' => 5]);
 $u->delete(); // Returns void; throws if affected rows !== 1
 
-$u->delete(); // IdentityException: the row is not persisted and cannot be deleted
+$u->delete(); // IdentityException: "User is not persisted and cannot be deleted"
 ```
 
 ### find() — lookup by primary key
@@ -805,7 +805,7 @@ Outermost rollback restores persistent fields, uninitialized state, `isNew()`, o
 
 Duplicate query copies of a newly inserted row also become unpersisted after rollback, so an already-read generated key cannot bypass insertion protection. When an old row is deleted and reinserted: if the database reuses its old key, both the reinserted object and query copies return to the old-row baseline; if a new key is allocated, they become unpersisted as transaction-new rows. Non-`#[Column]` business properties and external hook side effects are not restored.
 
-Memory is restored and the business exception propagated only after the database confirms successful rollback. A `false` return or exception from begin, failed commit, or failed rollback means an unknown outcome and throws `TransactionException`; never assume the physical transaction did not begin or commit. The exception exposes `operation` (`begin` / `commit` / `rollback` in the underlying exception), `businessException`, and `previous`. A commit failure is not replaced by a later rollback failure. Once commit has been attempted, memory is not restored even if rollback succeeds.
+Memory is restored and the business exception propagated only after the database confirms successful rollback. A `false` return or exception from begin, failed commit, or failed rollback means an unknown outcome and throws `TransactionException`; never assume the physical transaction did not begin or commit. The exception exposes `operation` (`begin` / `commit` / `rollback`), `businessException`, and `previous`. A commit failure is not replaced by a later rollback failure. Once commit has been attempted, memory is not restored even if rollback succeeds.
 
 After an unknown transaction outcome, do not query, write, transact, or reuse the original `Connection` through another Gateway or `Session::use()`. Discard the connection, Gateway, and associated entities. `Session::discard()` remains available to unbind the failed Session. A connection-ownership conflict before driver begin is a deterministic `LogicException` and does not poison the connection.
 

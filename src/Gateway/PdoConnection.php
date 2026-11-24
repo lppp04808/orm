@@ -200,7 +200,7 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
         $quoted = [];
         foreach ($segments as $segment) {
             if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $segment) !== 1) {
-                throw new \InvalidArgumentException('非法标识符: ' . $identifier);
+                throw new \InvalidArgumentException('Invalid identifier: ' . $identifier);
             }
             $quoted[] = match ($this->driver) {
                 'mysql' => '`' . $segment . '`',
@@ -248,7 +248,7 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
         if ($this->transactionDepth === 0) {
             // 未受管的 PDO 事务不能悄悄冒充本适配器的最外层事务。
             if ($this->pdo->inTransaction()) {
-                throw new \LogicException('PDO 已存在未由 PdoConnection 开启的事务，禁止混用事务边界');
+                throw new \LogicException('PDO has a transaction not started by PdoConnection; mixing transaction boundaries is forbidden');
             }
             $begun = $this->pdo->beginTransaction();
             if ($begun) {
@@ -269,7 +269,7 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
     {
         $depth = $this->transactionDepth;
         if ($depth === 0) {
-            throw new \LogicException('当前连接没有可提交的事务');
+            throw new \LogicException('The connection has no transaction to commit');
         }
         if ($depth > 1) {
             $this->execute('RELEASE SAVEPOINT sp_' . $depth, []);

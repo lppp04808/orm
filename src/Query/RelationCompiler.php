@@ -26,7 +26,7 @@ final readonly class RelationCompiler
     ): Builder {
         $parts = explode('.', $spec->path);
         if ($parts === [] || in_array('', $parts, true)) {
-            throw new RelationException('关系路径不能包含空名称');
+            throw new RelationException('Relation paths cannot contain empty names');
         }
         $name = array_shift($parts);
         $relation = $this->gateway->relation($class, $name);
@@ -39,7 +39,7 @@ final readonly class RelationCompiler
             // 自关联允许重复登记真实表名，但不得遮蔽任意已分配的内部别名。
             $ctx->reserveRelationQualifier($this->gateway->meta($relation->target)->table);
         } catch (InvalidArgumentException $e) {
-            throw new RelationException('内部关联别名冲突: ' . $e->getMessage(), 0, $e);
+            throw new RelationException('Internal relation alias conflict: ' . $e->getMessage(), 0, $e);
         }
         $query = new Builder($relation->target, $this->gateway);
         $target = $query->state;
@@ -57,7 +57,7 @@ final readonly class RelationCompiler
         } elseif ($constraint !== null) {
             $result = $constraint($query);
             if ($result !== null && $result !== $query) {
-                throw new RelationException($spec->path . ' 关系约束必须修改传入的 Builder，或返回同一 Builder');
+                throw new RelationException('Relation constraint ' . $spec->path . ' must modify the provided Builder or return the same Builder');
             }
         }
         $target->correlatedRelation = true;
@@ -92,7 +92,7 @@ final readonly class RelationCompiler
             || $state->groupBy !== [] || $state->having !== [] || $state->unions !== []
             || $state->derivedFrom !== null || $state->distinct || $state->tableAlias !== null
             || $state->lockMode !== null || $state->eagerRelations !== []) {
-            throw new RelationException($path . ' 关系约束只允许结构化 WHERE/OR 和嵌套关系条件，不支持投影、计数、JOIN、GROUP、UNION、派生表、DISTINCT、alias、排序、分页、行锁或 with');
+            throw new RelationException('Relation constraint ' . $path . ' only allows structured WHERE/OR and nested relation conditions; projections, counts, JOIN, GROUP, UNION, derived tables, DISTINCT, alias, ordering, pagination, row locks, and with are not supported');
         }
         $this->assertNoRawRelationConditions($state->where, $path);
         foreach ($state->orGroups as $group) {
@@ -158,7 +158,7 @@ final readonly class RelationCompiler
                     continue;
                 }
                 if (!is_string($value)) {
-                    throw new RelationException('withCount() 位置项必须是路径字符串或嵌套配置数组');
+                    throw new RelationException('withCount() positional items must be path strings or nested configuration arrays');
                 }
                 $items[] = [$prefix . $value, null];
             } elseif (is_callable($value)) {
@@ -169,7 +169,7 @@ final readonly class RelationCompiler
                     : $this->relationCountItems($value, $prefix . $key . '.');
                 $items = [...$items, ...$children];
             } else {
-                throw new RelationException('withCount() 约束必须是可调用对象或嵌套路径数组');
+                throw new RelationException('withCount() constraints must be callable or nested path arrays');
             }
         }
 
@@ -180,18 +180,18 @@ final readonly class RelationCompiler
     {
         foreach ($conditions as $condition) {
             if ($condition['operator'] === 'RAW') {
-                throw new RelationException($path . ' 关系约束不支持 whereRaw；请使用结构化条件或嵌套 whereHas()');
+                throw new RelationException('Relation constraint ' . $path . ' does not support whereRaw; use structured conditions or nested whereHas()');
             }
             if ($condition['operator'] === 'CORRELATION') {
                 continue;
             }
             if (str_contains($condition['column'], '.')) {
-                throw new RelationException($path . ' 关系约束的列由当前关系自动限定，不接受显式表前缀');
+                throw new RelationException('Columns in relation constraint ' . $path . ' are automatically qualified by the current relation; explicit table prefixes are not accepted');
             }
             if ($condition['value'] instanceof Builder) {
                 $nested = $condition['value'];
                 if (!$nested->state->correlatedRelation) {
-                    throw new RelationException($path . ' 关系约束不接受任意子查询 Builder；请使用嵌套 whereHas()');
+                    throw new RelationException('Relation constraint ' . $path . ' does not accept arbitrary subquery Builders; use nested whereHas()');
                 }
                 $this->assertRelationConstraint($nested->state, $path, true);
             }
@@ -213,7 +213,7 @@ final readonly class RelationCompiler
         }
         if ($state->derivedFrom !== null || $state->joins !== [] || $state->groupBy !== []
             || $state->having !== [] || $state->unions !== [] || $state->distinct) {
-            throw new RelationException('关联过滤/计数当前仅支持无 JOIN/GROUP/HAVING/UNION/派生表/DISTINCT 的父查询；可保留父查询表别名');
+            throw new RelationException('Relation filtering/counting requires a parent query without JOIN/GROUP/HAVING/UNION/derived tables/DISTINCT; a parent table alias is allowed');
         }
     }
 
@@ -255,7 +255,7 @@ final readonly class RelationCompiler
     public function assertNoRelationCounts(QueryState $state, string $operation): void
     {
         if ($state->relationCounts !== []) {
-            throw new RelationException($operation . ' 不能与 withCount() 组合，请拆分查询');
+            throw new RelationException($operation . ' cannot be combined with withCount(); split the operations into separate queries');
         }
     }
 
@@ -266,7 +266,7 @@ final readonly class RelationCompiler
         }
         if ($group !== null) {
             if ($this->groupHasRelationFeatures($group)) {
-                throw new RelationException($operation . ' 不能与 whereHas()/whereDoesntHave()/whereRelation() 组合，请拆分查询');
+                throw new RelationException($operation . ' cannot be combined with whereHas()/whereDoesntHave()/whereRelation(); split the operations into separate queries');
             }
 
             return;
@@ -279,7 +279,7 @@ final readonly class RelationCompiler
     {
         foreach ($state->orGroups as $group) {
             if ($this->groupHasRelationFeatures($group)) {
-                throw new RelationException($operation . ' 不能与 whereHas()/whereDoesntHave()/whereRelation() 组合，请拆分查询');
+                throw new RelationException($operation . ' cannot be combined with whereHas()/whereDoesntHave()/whereRelation(); split the operations into separate queries');
             }
         }
     }
@@ -288,7 +288,7 @@ final readonly class RelationCompiler
     {
         foreach ($state->where as $condition) {
             if ($condition['value'] instanceof Subquery) {
-                throw new RelationException($operation . ' 不能与 whereHas()/whereDoesntHave()/whereRelation() 组合，请拆分查询');
+                throw new RelationException($operation . ' cannot be combined with whereHas()/whereDoesntHave()/whereRelation(); split the operations into separate queries');
             }
         }
     }

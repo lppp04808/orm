@@ -57,15 +57,15 @@ final class MetadataReader
     public function import(array $cache): void
     {
         if (($cache['version'] ?? null) !== self::CACHE_VERSION) {
-            throw new MetadataException('元数据缓存版本不兼容，请重新生成');
+            throw new MetadataException('Incompatible metadata cache version; regenerate the cache');
         }
         if (!isset($cache['models']) || !is_array($cache['models'])) {
-            throw new MetadataException('元数据缓存缺少 models');
+            throw new MetadataException('Metadata cache is missing models');
         }
         $compiled = [];
         foreach ($cache['models'] as $class => $model) {
             if (!is_string($class) || !is_subclass_of($class, Entity::class) || !is_array($model)) {
-                throw new MetadataException('元数据缓存包含无效模型');
+                throw new MetadataException('Metadata cache contains an invalid model');
             }
             $compiled[$class] = $model;
         }
@@ -93,7 +93,7 @@ final class MetadataReader
         }
 
         if (!is_subclass_of($class, Entity::class)) {
-            throw new MetadataException($class . ' 必须继承 Pixiaoka\Orm\\Entity');
+            throw new MetadataException($class . ' must extend Pixiaoka\Orm\\Entity');
         }
         if (isset($this->compiled[$class])) {
             return $this->cache[$class] = $this->hydrate($class, $this->compiled[$class]);
@@ -116,12 +116,12 @@ final class MetadataReader
         }
 
         if ($fields === []) {
-            throw new MetadataException($class . ' 没有持久化字段');
+            throw new MetadataException($class . ' has no persistent fields');
         }
 
         $primary = array_values(array_filter($fields, static fn (FieldMeta $field): bool => $field->primary));
         if ($primary === []) {
-            throw new MetadataException($class . ' 没有主键');
+            throw new MetadataException($class . ' has no primary key');
         }
 
         usort($primary, static function (FieldMeta $a, FieldMeta $b): int {
@@ -130,14 +130,14 @@ final class MetadataReader
 
         $generated = array_values(array_filter($primary, static fn (FieldMeta $field): bool => $field->generated));
         if (count($generated) > 1) {
-            throw new MetadataException($class . ' 只能有一个生成列');
+            throw new MetadataException($class . ' may declare only one generated column');
         }
         if ($generated !== [] && count($primary) !== 1) {
-            throw new MetadataException($class . ' 生成列不能和自然键组成复合主键');
+            throw new MetadataException($class . ' cannot combine a generated column with natural keys in a composite primary key');
         }
         foreach ($primary as $field) {
             if ($field->nullable()) {
-                throw new MetadataException($class . '::' . $field->property . ' 主键列不可空');
+                throw new MetadataException($class . '::' . $field->property . ' primary key columns must not be nullable');
             }
         }
 
@@ -209,7 +209,7 @@ final class MetadataReader
                 }
                 $declaredKinds[] = $kind;
                 if (count($attributes) > 1) {
-                    throw new MetadataException("$class::$name 不能重复声明关系 $kind");
+                    throw new MetadataException("$class::$name must not declare relation $kind more than once");
                 }
                 $found[] = [$annotation, $kind, $attributes[0]];
             }
@@ -218,12 +218,12 @@ final class MetadataReader
             }
             if (count($found) > 1) {
                 throw new MetadataException(
-                    "$class::$name 不能同时声明多种关系 " . implode('、', $declaredKinds),
+                    "$class::$name must not declare multiple relation types: " . implode(', ', $declaredKinds),
                 );
             }
             if ($method->isStatic() || $method->getNumberOfRequiredParameters() > 0
                 || $method->getNumberOfParameters() > 0) {
-                throw new MetadataException("$class::$name 关系方法必须是无参数 public 实例方法");
+                throw new MetadataException("$class::$name relation methods must be public instance methods without parameters");
             }
             $type = $method->getReturnType();
             $expected = $kinds[$found[0][0]];
@@ -233,12 +233,12 @@ final class MetadataReader
                 'belongsTo' => \Pixiaoka\Orm\Relation\BelongsTo::class,
             };
             if (!$type instanceof ReflectionNamedType || $type->getName() !== $relationClass) {
-                throw new MetadataException("$class::$name 返回类型必须声明为 $relationClass");
+                throw new MetadataException("$class::$name must declare return type $relationClass");
             }
             /** @var RelationAnnotation $annotation */
             $annotation = $found[0][2]->newInstance();
             if (!is_subclass_of($annotation->target, Entity::class)) {
-                throw new MetadataException("$class::$name target 必须继承 " . Entity::class);
+                throw new MetadataException("$class::$name target must extend " . Entity::class);
             }
             $relations[$name] = RelationMeta::from(
                 $name,
@@ -268,7 +268,7 @@ final class MetadataReader
         $this->assertRelational($class);
 
         return $this->relationCache[$class][$name]
-            ?? throw new MetadataException($class . ' 未声明关系 ' . $name);
+            ?? throw new MetadataException($class . ' does not declare relation ' . $name);
     }
 
     /**
@@ -287,7 +287,7 @@ final class MetadataReader
             if (!isset($fields[$name])) {
                 if ($property->getAttributes(CreatedAt::class) !== []
                     || $property->getAttributes(UpdatedAt::class) !== []) {
-                    throw new MetadataException("$class::$name 时间角色必须同时声明 #[Column]");
+                    throw new MetadataException("$class::$name timestamp roles must also declare #[Column]");
                 }
                 continue;
             }
@@ -300,17 +300,17 @@ final class MetadataReader
                 $roles[] = 'updated_at';
             }
             if (count($roles) > 1) {
-                throw new MetadataException("$class::$name 创建时间和更新时间角色不能共用同一字段");
+                throw new MetadataException("$class::$name cannot serve as both the creation and update timestamp");
             }
             foreach ($roles as $role) {
                 if (isset($ts[$role])) {
-                    throw new MetadataException("$class::$name 时间角色 $role 重复声明");
+                    throw new MetadataException("$class::$name duplicates timestamp role $role");
                 }
                 if ($field->primary) {
-                    throw new MetadataException("$class::$name 主键不能作为自动时间角色");
+                    throw new MetadataException("$class::$name primary keys cannot be automatic timestamp fields");
                 }
                 if (!in_array($field->typeName(), ['int', \DateTimeImmutable::class], true)) {
-                    throw new MetadataException("$class::$name 自动时间角色只支持 int 或 DateTimeImmutable");
+                    throw new MetadataException("$class::$name automatic timestamp fields only support int or DateTimeImmutable");
                 }
                 $ts[$role] = $name;
             }
@@ -338,18 +338,18 @@ final class MetadataReader
                 continue;
             }
             $name = $property->getName();
-            $field = $fields[$name] ?? throw new MetadataException("$class::$name 版本字段必须同时声明 #[Column]");
+            $field = $fields[$name] ?? throw new MetadataException("$class::$name version fields must also declare #[Column]");
             if ($version !== null) {
-                throw new MetadataException("$class::$name 一个模型只能声明一个版本字段，$version 已声明");
+                throw new MetadataException("$class::$name declares a second version field; $version is already declared");
             }
             if ($field->primary || $field->generated) {
-                throw new MetadataException("$class::$name 版本字段不能兼任主键或生成列");
+                throw new MetadataException("$class::$name version fields cannot also be primary keys or generated columns");
             }
             if (in_array($name, $timestamps, true)) {
-                throw new MetadataException("$class::$name 版本字段不能兼任自动时间字段");
+                throw new MetadataException("$class::$name version fields cannot also be automatic timestamp fields");
             }
             if ($field->typeName() !== 'int' || $field->nullable()) {
-                throw new MetadataException("$class::$name 版本字段必须是非空 int");
+                throw new MetadataException("$class::$name version fields must be non-nullable int");
             }
             $version = $name;
         }
@@ -376,15 +376,15 @@ final class MetadataReader
                 continue;
             }
             $name = $property->getName();
-            $field = $fields[$name] ?? throw new MetadataException("$class::$name 软删除字段必须同时声明 #[Column]");
+            $field = $fields[$name] ?? throw new MetadataException("$class::$name soft-delete fields must also declare #[Column]");
             if ($softDelete !== null) {
-                throw new MetadataException("$class::$name 一个模型只能声明一个软删除字段");
+                throw new MetadataException("$class::$name may declare only one soft-delete field per model");
             }
             if ($field->primary || $field->generated || $name === $version || in_array($name, $timestamps, true)) {
-                throw new MetadataException("$class::$name 软删除字段不能兼任主键、生成列、版本或自动时间字段");
+                throw new MetadataException("$class::$name soft-delete fields cannot also be primary keys, generated columns, version fields, or automatic timestamp fields");
             }
             if ($field->typeName() !== \DateTimeImmutable::class || !$field->nullable()) {
-                throw new MetadataException("$class::$name 软删除字段必须是可空 DateTimeImmutable");
+                throw new MetadataException("$class::$name soft-delete fields must be nullable DateTimeImmutable");
             }
             $softDelete = $name;
         }
@@ -404,7 +404,7 @@ final class MetadataReader
         foreach ($reflection->getAttributes(Index::class) as $attribute) {
             $index = $attribute->newInstance();
             if (isset($indexes[$index->name])) {
-                throw new MetadataException($class . ' 索引名称重复: ' . $index->name);
+                throw new MetadataException($class . ' has duplicate index name: ' . $index->name);
             }
             $columns = [];
             foreach ($index->columns as $property) {
@@ -418,7 +418,7 @@ final class MetadataReader
                     }
                 }
                 if ($field === null) {
-                    throw new MetadataException($class . ' 索引 ' . $index->name . ' 包含未知字段 ' . $property);
+                    throw new MetadataException($class . ' index ' . $index->name . ' contains unknown field ' . $property);
                 }
                 $columns[] = $field->column;
             }
@@ -432,10 +432,10 @@ final class MetadataReader
     {
         $type = $property->getType();
         if (!$type instanceof ReflectionNamedType) {
-            throw new MetadataException($class . '::' . $property->getName() . ' 必须是具名类型');
+            throw new MetadataException($class . '::' . $property->getName() . ' must have a named type');
         }
         if (!$type->isBuiltin() && !class_exists($type->getName()) && !enum_exists($type->getName())) {
-            throw new MetadataException($class . '::' . $property->getName() . ' 类/枚举不存在');
+            throw new MetadataException($class . '::' . $property->getName() . ' refers to a class or enum that does not exist');
         }
 
         $primaryAttr = $property->getAttributes(PrimaryKey::class);
@@ -446,7 +446,7 @@ final class MetadataReader
         if ($temporalAttr !== []) {
             $temporal = $temporalAttr[0]->newInstance()->storage;
             if (!in_array($temporal, [Temporal::TEXT, Temporal::UNIX], true)) {
-                throw new MetadataException($class . '::' . $property->getName() . ' 时间存储形式不合法');
+                throw new MetadataException($class . '::' . $property->getName() . ' has invalid temporal storage');
             }
         }
 
@@ -458,10 +458,10 @@ final class MetadataReader
                 || is_a($name, Decimal::class, true)
                 || is_a($name, Castable::class, true);
         if (!$supported) {
-            throw new MetadataException($class . '::' . $property->getName() . ' 不支持类型 ' . $name);
+            throw new MetadataException($class . '::' . $property->getName() . ' has unsupported type ' . $name);
         }
         if ($temporalAttr !== [] && $name !== \DateTimeImmutable::class) {
-            throw new MetadataException($class . '::' . $property->getName() . ' 只有 DateTimeImmutable 可以声明时间存储');
+            throw new MetadataException($class . '::' . $property->getName() . ' only DateTimeImmutable may declare temporal storage');
         }
 
         return new FieldMeta(
@@ -495,34 +495,34 @@ final class MetadataReader
                 || !is_array($primaryNames) || !in_array($identityKind, ['natural', 'surrogate'], true)
                 || !is_array($timestamps) || (!is_string($version) && $version !== null)
                 || (!is_string($softDelete) && $softDelete !== null)) {
-                throw new MetadataException($class . ' 元数据缓存结构无效或已过期');
+                throw new MetadataException($class . ' has invalid or expired metadata cache structure');
             }
             $reflection = new ReflectionClass($class);
             $fields = [];
             foreach ($definitions as $property => $definition) {
                 if (!is_string($property) || !is_array($definition)) {
-                    throw new MetadataException($class . ' 元数据缓存字段无效');
+                    throw new MetadataException($class . ' has invalid metadata cache fields');
                 }
                 $type = $definition['type'] ?? null;
                 $column = $definition['column'] ?? null;
                 $nullable = $definition['nullable'] ?? null;
                 $temporal = $definition['temporal'] ?? null;
                 if (!is_string($type) || !is_string($column) || !is_bool($nullable) || !is_string($temporal)) {
-                    throw new MetadataException("$class::$property 元数据缓存字段类型无效");
+                    throw new MetadataException("$class::$property has invalid metadata cache field types");
                 }
                 $propertyReflection = $reflection->getProperty($property);
                 $actualType = $propertyReflection->getType();
                 if (!$actualType instanceof ReflectionNamedType || $actualType->getName() !== $type
                     || $actualType->allowsNull() !== $nullable) {
-                    throw new MetadataException("$class::$property 元数据缓存与属性类型不一致，请重新生成");
+                    throw new MetadataException("$class::$property metadata cache does not match the property type; regenerate the cache");
                 }
                 foreach (['primary', 'generated'] as $flag) {
                     if (!is_bool($definition[$flag] ?? null)) {
-                        throw new MetadataException("$class::$property 元数据缓存标记无效");
+                        throw new MetadataException("$class::$property has invalid metadata cache flags");
                     }
                 }
                 if (!is_int($definition['order'] ?? null)) {
-                    throw new MetadataException("$class::$property 元数据缓存顺序无效");
+                    throw new MetadataException("$class::$property has invalid metadata cache ordering");
                 }
                 $fields[$property] = new FieldMeta(
                     $property,
@@ -537,41 +537,41 @@ final class MetadataReader
             $primary = [];
             foreach ($primaryNames as $property) {
                 if (!is_string($property) || !isset($fields[$property]) || !$fields[$property]->primary) {
-                    throw new MetadataException($class . ' 元数据缓存主键无效');
+                    throw new MetadataException($class . ' has invalid metadata cache primary keys');
                 }
                 $primary[] = $fields[$property];
             }
             if ($primary === [] || $fields === []) {
-                throw new MetadataException($class . ' 元数据缓存缺少字段或主键');
+                throw new MetadataException($class . ' metadata cache is missing fields or primary keys');
             }
             /** @var array{created_at?: string, updated_at?: string} $timestamps */
             foreach ($timestamps as $role => $property) {
                 if (!in_array($role, ['created_at', 'updated_at'], true)
                     || !is_string($property) || !isset($fields[$property])) {
-                    throw new MetadataException($class . ' 元数据缓存时间字段无效');
+                    throw new MetadataException($class . ' has invalid metadata cache timestamp fields');
                 }
             }
             if ($version !== null && (!isset($fields[$version]) || $fields[$version]->primary)) {
-                throw new MetadataException($class . ' 元数据缓存版本字段无效');
+                throw new MetadataException($class . ' has an invalid metadata cache version field');
             }
 
             if ($softDelete !== null && !isset($fields[$softDelete])) {
-                throw new MetadataException($class . ' 元数据缓存软删除字段无效');
+                throw new MetadataException($class . ' has an invalid metadata cache soft-delete field');
             }
             $indexes = [];
             $definitions = $model['indexes'] ?? [];
             if (!is_array($definitions)) {
-                throw new MetadataException($class . ' 元数据缓存索引无效');
+                throw new MetadataException($class . ' has invalid metadata cache indexes');
             }
             $columns = array_map(static fn (FieldMeta $field): string => $field->column, $fields);
             foreach ($definitions as $definition) {
                 if (!is_array($definition) || !is_string($definition['name'] ?? null)
                     || !is_array($definition['columns'] ?? null) || !is_bool($definition['unique'] ?? null)) {
-                    throw new MetadataException($class . ' 元数据缓存索引结构无效');
+                    throw new MetadataException($class . ' has invalid metadata cache index structure');
                 }
                 foreach ($definition['columns'] as $column) {
                     if (!is_string($column) || !in_array($column, $columns, true)) {
-                        throw new MetadataException($class . ' 元数据缓存索引字段无效');
+                        throw new MetadataException($class . ' has invalid metadata cache index fields');
                     }
                 }
                 $indexes[] = new IndexSchema($definition['name'], $definition['columns'], $definition['unique']);
@@ -581,7 +581,7 @@ final class MetadataReader
         } catch (MetadataException $e) {
             throw $e;
         } catch (\Throwable $e) {
-            throw new MetadataException($class . ' 元数据缓存无效: ' . $e->getMessage(), 0, $e);
+            throw new MetadataException($class . ' has invalid metadata cache: ' . $e->getMessage(), 0, $e);
         }
     }
 }

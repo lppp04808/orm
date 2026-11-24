@@ -115,7 +115,7 @@ final class MetadataCacheCastableTest extends TestCase
         $cache['models'][CachedCastEntity::class]['fields']['status']['type'] = 'string';
         $imported = new MetadataReader($cache);
         $this->expectException(MetadataException::class);
-        $this->expectExceptionMessage('不一致');
+        $this->expectExceptionMessage('does not match the property type');
         $imported->read(CachedCastEntity::class);
     }
 

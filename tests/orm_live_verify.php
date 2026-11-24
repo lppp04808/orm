@@ -861,7 +861,7 @@ function runScenarios(string $driver, PDO $pdo, RecordingConnection $rec, Check 
             $check->no('i4. 携带旧生成列复活应被内核拒绝', '内核没有拒绝，id 被复用或旧 id 插入');
         } catch (IdentityException $e) {
             $check->assert(
-                str_contains($e->getMessage(), '生成列由数据库填写'),
+                str_contains($e->getMessage(), 'generated column is assigned by the database'),
                 'i4. 携带旧生成列复活被内核拒绝（预期行为）',
                 $e->getMessage(),
             );

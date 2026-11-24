@@ -14,6 +14,7 @@ use Pixiaoka\Orm\Relation\BelongsTo;
 use Pixiaoka\Orm\Relation\HasMany;
 use Pixiaoka\Orm\Relation\HasOne;
 use Pixiaoka\Orm\Relation\Relation;
+use WeakReference;
 
 /**
  * Active Record。字段是带 #[Column] 的类型化属性，表名由子类给出。
@@ -26,8 +27,8 @@ abstract class Entity
     /** @var array<class-string, array<string, \ReflectionProperty>> 反射元数据按实际实体类与属性名复用，不进入持久化元数据。 */
     private static array $reflectionProperties = [];
 
-    /** 弱归属不延长 Gateway/连接生命周期；禁止跨连接隐式切换。 */
-    private ?\WeakReference $ormGateway = null;
+    /** @var ?WeakReference<EntityGateway> 弱归属不延长 Gateway/连接生命周期；禁止跨连接隐式切换。 */
+    private ?WeakReference $ormGateway = null;
 
     /** @var array<string, mixed> 持久化时的原值，用于脏跟踪 */
     private array $ormOriginal = [];
@@ -97,7 +98,7 @@ abstract class Entity
     public function loadedRelation(string $name): Entity|array|null
     {
         if (!$this->relationLoaded($name)) {
-            throw new \LogicException(static::class . "::$name 尚未加载；请先 with/load，或调用 $name()->get()");
+            throw new \LogicException(static::class . "::$name is not loaded; call with/load or $name()->get()");
         }
 
         return $this->ormRelations[$name];
@@ -125,7 +126,7 @@ abstract class Entity
             'hasOne' => new HasOne($this, $meta, $gateway),
             'hasMany' => new HasMany($this, $meta, $gateway),
             'belongsTo' => new BelongsTo($this, $meta, $gateway),
-            default => throw new \LogicException('未知关系类型 ' . $meta->kind),
+            default => throw new \LogicException('Unknown relation type: ' . $meta->kind),
         };
     }
 
@@ -139,9 +140,9 @@ abstract class Entity
     public function bindGateway(EntityGateway $gateway): void
     {
         if ($this->ormGateway !== null) {
-            throw new \LogicException(static::class . ' 已有 Gateway 归属，不能重新绑定');
+            throw new \LogicException(static::class . ' already has a Gateway binding and cannot be rebound');
         }
-        $this->ormGateway = \WeakReference::create($gateway);
+        $this->ormGateway = WeakReference::create($gateway);
     }
 
     /** @internal */
@@ -213,7 +214,7 @@ abstract class Entity
         $gateway = $this->boundGateway();
         if ($gateway === null) {
             if ($this->hasGatewayBinding()) {
-                throw new \LogicException(static::class . ' 原 Gateway 已销毁，请在新 Gateway 上显式重查');
+                throw new \LogicException(static::class . ' has a destroyed Gateway; query it explicitly through a new Gateway');
             }
             $gateway = Session::get()->gateway;
         }
@@ -241,7 +242,7 @@ abstract class Entity
     public function insert(): void
     {
         if (!$this->ormNew) {
-            throw new IdentityException(static::class . ' 已经在库里，不能再 insert');
+            throw new IdentityException(static::class . ' is already persisted and cannot be inserted again');
         }
 
         $this->gateway()->insert($this);
@@ -250,7 +251,7 @@ abstract class Entity
     public function delete(): void
     {
         if ($this->ormNew) {
-            throw new IdentityException(static::class . ' 还没入库，不能 delete');
+            throw new IdentityException(static::class . ' is not persisted and cannot be deleted');
         }
 
         $this->gateway()->delete($this);
@@ -259,7 +260,7 @@ abstract class Entity
     public function restore(): void
     {
         if ($this->ormNew) {
-            throw new IdentityException(static::class . ' 还没入库，不能 restore');
+            throw new IdentityException(static::class . ' is not persisted and cannot be restored');
         }
         $this->gateway()->restore($this);
     }
@@ -267,7 +268,7 @@ abstract class Entity
     public function forceDelete(): void
     {
         if ($this->ormNew) {
-            throw new IdentityException(static::class . ' 还没入库，不能 forceDelete');
+            throw new IdentityException(static::class . ' is not persisted and cannot be force-deleted');
         }
         $this->gateway()->forceDelete($this);
     }
@@ -294,7 +295,7 @@ abstract class Entity
             return $gateway->toArray($this);
         }
         if ($this->hasGatewayBinding()) {
-            throw new \LogicException(static::class . ' 原 Gateway 已销毁，请在新 Gateway 上显式重查');
+            throw new \LogicException(static::class . ' has a destroyed Gateway; query it explicitly through a new Gateway');
         }
 
         return Session::get()->gateway->toArray($this);
@@ -368,7 +369,7 @@ abstract class Entity
     {
         $meta = $this->gateway()->relation(static::class, $name);
         if ($arguments !== []) {
-            throw new \InvalidArgumentException(static::class . "::$name 关系方法不接受参数");
+            throw new \InvalidArgumentException(static::class . "::$name relation method does not accept arguments");
         }
 
         return $this->makeRelation($meta);

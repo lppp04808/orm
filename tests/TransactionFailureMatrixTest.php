@@ -56,14 +56,14 @@ final class TransactionFailureMatrixTest extends TestCase
             });
             self::fail('begin 失败必须报告事务结果未知');
         } catch (TransactionException $e) {
-            self::assertSame('开始', $e->operation);
+            self::assertSame('begin', $e->operation);
             self::assertNull($e->businessException);
             if ($throws) {
                 self::assertSame($driverFailure, $e->getPrevious());
                 self::assertTrue($connection->pdo->inTransaction(), '适配器可能已开始物理事务再抛异常');
                 $connection->pdo->rollBack();
             } else {
-                self::assertSame('数据库事务开始失败', $e->getPrevious()?->getMessage());
+                self::assertSame('Failed to begin database transaction', $e->getPrevious()?->getMessage());
             }
         }
 
@@ -129,13 +129,13 @@ final class TransactionFailureMatrixTest extends TestCase
             });
             self::fail('回滚失败必须取代业务异常');
         } catch (TransactionException $e) {
-            self::assertSame('回滚', $e->operation);
+            self::assertSame('rollback', $e->operation);
             self::assertSame($business, $e->businessException);
             if ($throws) {
                 self::assertSame($rollbackFailure, $e->getPrevious());
             } else {
                 self::assertInstanceOf(\RuntimeException::class, $e->getPrevious());
-                self::assertSame('数据库事务回滚失败', $e->getPrevious()?->getMessage());
+                self::assertSame('Failed to roll back database transaction', $e->getPrevious()?->getMessage());
             }
         }
 
@@ -187,13 +187,13 @@ final class TransactionFailureMatrixTest extends TestCase
             });
             self::fail('commit 返回 false 必须报告提交结果未知');
         } catch (TransactionException $e) {
-            self::assertSame('提交', $e->operation);
+            self::assertSame('commit', $e->operation);
             self::assertNull($e->businessException);
             if ($commitThrows) {
                 self::assertSame($commitFailure, $e->getPrevious());
             } else {
                 self::assertInstanceOf(\RuntimeException::class, $e->getPrevious());
-                self::assertSame('数据库事务提交失败', $e->getPrevious()?->getMessage());
+                self::assertSame('Failed to commit database transaction', $e->getPrevious()?->getMessage());
             }
             self::assertNotSame($rollbackFailure, $e->getPrevious());
         }
@@ -228,13 +228,13 @@ final class TransactionFailureMatrixTest extends TestCase
             });
             self::fail('commit 失败必须报告未知结果');
         } catch (TransactionException $e) {
-            self::assertSame('提交', $e->operation);
+            self::assertSame('commit', $e->operation);
             self::assertNull($e->businessException);
             if ($throws) {
                 self::assertSame($commitFailure, $e->getPrevious());
             } else {
                 self::assertInstanceOf(\RuntimeException::class, $e->getPrevious());
-                self::assertSame('数据库事务提交失败', $e->getPrevious()?->getMessage());
+                self::assertSame('Failed to commit database transaction', $e->getPrevious()?->getMessage());
             }
         }
 
@@ -324,7 +324,7 @@ final class TransactionFailureMatrixTest extends TestCase
                     $gateway->transaction(static fn (): null => null);
                     self::fail('内层保存点开启必须失败');
                 } catch (TransactionException $e) {
-                    self::assertSame('开始', $e->operation);
+                    self::assertSame('begin', $e->operation);
                 }
                 $owners = (new \ReflectionProperty(Session::class, 'connectionContexts'))->getValue();
                 self::assertSame(Session::context(), $owners[$gateway->connection()] ?? null);
@@ -479,7 +479,7 @@ final class TransactionFailureMatrixTest extends TestCase
             });
             self::fail('整条链已被 discard 回滚后，外层不得提交');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('操作已回滚，不能继续提交', $e->getMessage());
+            self::assertStringContainsString('the work was rolled back and cannot be committed', $e->getMessage());
         }
 
         self::assertSame(['begin', 'begin', 'forceRollback'], $connection->transactionCalls);
@@ -559,7 +559,7 @@ final class TransactionFailureMatrixTest extends TestCase
                 $operation();
                 self::fail($name . ' 必须拒绝复用结果未知的连接');
             } catch (\LogicException $e) {
-                self::assertStringContainsString('禁止复用', $e->getMessage(), $name);
+                self::assertStringContainsString('do not reuse this connection', $e->getMessage(), $name);
             }
         }
         self::assertSame([], array_filter(
@@ -680,8 +680,8 @@ final class MatrixConnection implements ManagedConnection
                     "INSERT INTO matrix_record (body, revision) VALUES ('observer side effect', 1)",
                 );
             } catch (\LogicException $e) {
-                if (!str_contains($e->getMessage(), '观测监听器')
-                    && !str_contains($e->getMessage(), '禁止复用')) {
+                if (!str_contains($e->getMessage(), 'observability listener')
+                    && !str_contains($e->getMessage(), 'do not reuse this connection')) {
                     throw $e;
                 }
             }

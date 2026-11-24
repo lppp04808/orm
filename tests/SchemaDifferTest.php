@@ -128,7 +128,7 @@ final class SchemaDifferTest extends TestCase
 
         self::assertTrue($sqlite['hasUnsupported']);
         $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('重建表');
+        $this->expectExceptionMessage('rebuild the table manually');
         $differ->previewSql($meta, $table, 'sqlite');
     }
 

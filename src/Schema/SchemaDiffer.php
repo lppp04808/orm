@@ -58,12 +58,12 @@ final class SchemaDiffer
     {
         foreach ($databaseTypes as $class => $types) {
             if (!is_string($class) || !class_exists($class)) {
-                throw new InvalidArgumentException('自定义 Schema 类型的 PHP 类不存在: ' . $class);
+                throw new InvalidArgumentException('Custom Schema PHP class does not exist: ' . $class);
             }
             foreach (['mysql', 'pgsql', 'sqlite'] as $driver) {
                 if (!isset($types[$driver]) || !is_string($types[$driver])
                     || preg_match('/^[A-Za-z][A-Za-z0-9_]*(?:\s+[A-Za-z][A-Za-z0-9_]*)*(?:\(\d+(?:,\d+)?\))?(?:\s+UNSIGNED)?$/i', $types[$driver]) !== 1) {
-                    throw new InvalidArgumentException("$class 的 $driver 数据库类型无效");
+                    throw new InvalidArgumentException("Invalid $driver database type for $class");
                 }
             }
         }
@@ -74,11 +74,11 @@ final class SchemaDiffer
     {
         $driver = strtolower($driver);
         if (!in_array($driver, ['mysql', 'pgsql', 'sqlite'], true)) {
-            throw new InvalidArgumentException('SchemaDiffer 仅支持 mysql、pgsql、sqlite');
+            throw new InvalidArgumentException('SchemaDiffer only supports mysql, pgsql, and sqlite');
         }
-        $this->assertIdentifier($model->table, '表');
+        $this->assertIdentifier($model->table, 'Table');
         if ($table->name !== $model->table) {
-            throw new InvalidArgumentException('SchemaDiffer 的模型表名与实时结构不一致: ' . $model->table . ' / ' . $table->name);
+            throw new InvalidArgumentException('SchemaDiffer model table name does not match the actual schema: ' . $model->table . ' / ' . $table->name);
         }
         $actual = [];
         foreach ($table->columns as $column) {
@@ -102,7 +102,7 @@ final class SchemaDiffer
                         'MODIFY COLUMN ' . $definition, true),
                     'pgsql' => $this->change('change_type', $field->column, $type, $column->databaseType,
                         'ALTER COLUMN ' . $this->quote($field->column, $driver) . ' TYPE ' . $type, true,
-                        '隐式转换失败时需人工补充 USING 子句'),
+                        'Add a USING clause manually if implicit conversion fails'),
                     default => $this->unsupported($field, 'change_type', $type, $column->databaseType),
                 };
             }
@@ -122,7 +122,7 @@ final class SchemaDiffer
                 $changes[] = match ($driver) {
                     'sqlite' => $this->change('drop_column', $name, null, $column->databaseType,
                         'DROP COLUMN ' . $this->quote($name, $driver), true,
-                        '需要 SQLite 3.35+；字段被索引或约束引用时执行会失败，需人工重建表'),
+                        'Requires SQLite 3.35+; execution fails if the column is referenced by an index or constraint, requiring a manual table rebuild'),
                     default => $this->change('drop_column', $name, null, $column->databaseType,
                         'DROP COLUMN ' . $this->quote($name, $driver), true),
                 };
@@ -167,7 +167,7 @@ final class SchemaDiffer
     {
         $report = $this->compare($model, $table, $driver);
         if ($report['hasUnsupported']) {
-            throw new InvalidArgumentException($model->table . ' 存在不能安全自动执行的 SQLite 变更，请按报告人工重建表');
+            throw new InvalidArgumentException($model->table . ' has SQLite changes that cannot be executed safely; rebuild the table manually according to the report');
         }
 
         return array_map(static fn (array $change): string => $change['sql'], $report['changes']);
@@ -193,7 +193,7 @@ final class SchemaDiffer
             }
             if ($current !== null) {
                 $changes[] = $this->change('drop_index', $name, null, $this->indexValue($current),
-                    $this->dropIndex($name, $model->table, $driver), true, '索引定义变化，先删除旧索引');
+                    $this->dropIndex($name, $model->table, $driver), true, 'Index definition changed; drop the old index first');
             }
             $changes[] = $this->change($kind, $name, $this->indexValue($index),
                 $current === null ? null : $this->indexValue($current),
@@ -241,8 +241,8 @@ final class SchemaDiffer
     private function unsupported(FieldMeta $field, string $kind, mixed $expected, mixed $actual): array
     {
         return $this->change($kind, $field->column, $expected, $actual,
-            '/* 需要重建表：' . $this->columnDefinition($field, $this->databaseType($field, 'sqlite'), 'sqlite', false) . ' */',
-            false, 'SQLite 不支持直接修改列类型或可空性，请创建新表、复制数据并原子替换');
+            '/* Table rebuild required: ' . $this->columnDefinition($field, $this->databaseType($field, 'sqlite'), 'sqlite', false) . ' */',
+            false, 'SQLite cannot directly change column types or nullability; create a new table, copy the data, and atomically replace the original table');
     }
 
     /** @return Change */
@@ -307,9 +307,9 @@ final class SchemaDiffer
             return $this->databaseTypes[$name][$driver];
         }
         if (is_a($name, Castable::class, true)) {
-            throw new InvalidArgumentException("$name 是 Castable，请在 SchemaDiffer 构造器中显式提供三种数据库类型");
+            throw new InvalidArgumentException("$name is Castable; explicitly provide all three database types in the SchemaDiffer constructor");
         }
-        throw new InvalidArgumentException("没有 $name 在 $driver 下的 Schema 类型映射");
+        throw new InvalidArgumentException("No Schema type mapping for $name on $driver");
     }
 
     private function semanticType(string $type, string $driver): string
@@ -350,7 +350,7 @@ final class SchemaDiffer
 
     private function quote(string $identifier, string $driver): string
     {
-        $this->assertIdentifier($identifier, '标识符');
+        $this->assertIdentifier($identifier, 'Identifier');
         $quote = $driver === 'mysql' ? '`' : '"';
 
         return $quote . str_replace($quote, $quote . $quote, $identifier) . $quote;
@@ -359,7 +359,7 @@ final class SchemaDiffer
     private function assertIdentifier(string $identifier, string $what): void
     {
         if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/D', $identifier) !== 1) {
-            throw new InvalidArgumentException($what . '名称不是受控标识符: ' . $identifier);
+            throw new InvalidArgumentException($what . ' is not an allowed identifier: ' . $identifier);
         }
     }
 }

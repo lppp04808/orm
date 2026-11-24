@@ -45,7 +45,7 @@ final class Operator
     {
         $op = self::normalize($operator);
         if (!self::isAllowed($op)) {
-            throw new InvalidArgumentException('非法运算符: ' . $operator);
+            throw new InvalidArgumentException('Invalid operator: ' . $operator);
         }
 
         return $op;
@@ -56,7 +56,7 @@ final class Operator
     {
         $op = self::normalize($operator);
         if (!self::isComparison($op)) {
-            throw new InvalidArgumentException('ON 子句只允许比较运算符，收到: ' . $operator);
+            throw new InvalidArgumentException('ON clauses only accept comparison operators; received: ' . $operator);
         }
 
         return $op;

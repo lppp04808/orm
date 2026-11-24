@@ -67,10 +67,10 @@ final readonly class SqlCompiler
         $this->relations->assertRelationParentSupported($class, $state);
         $this->assertWritable($state);
         if ($set === []) {
-            throw new InvalidArgumentException('UPDATE SET 不能为空');
+            throw new InvalidArgumentException('UPDATE SET cannot be empty');
         }
         if ($state->where === [] && $state->orGroups === []) {
-            throw new InvalidArgumentException('UPDATE 必须有 WHERE 条件，拒绝全表更新');
+            throw new InvalidArgumentException('UPDATE requires a WHERE condition; full-table updates are rejected');
         }
 
         $meta = $this->gateway->meta($class);
@@ -79,17 +79,17 @@ final readonly class SqlCompiler
         foreach ($set as $column => $value) {
             $field = $this->resolveField($class, $column);
             if ($field === null) {
-                throw new InvalidArgumentException('UPDATE 未知列: ' . $column);
+                throw new InvalidArgumentException('Unknown UPDATE column: ' . $column);
             }
             if ($field->primary) {
-                throw new InvalidArgumentException('禁止通过 UPDATE 修改主键列: ' . $field->column);
+                throw new InvalidArgumentException('UPDATE cannot modify primary key column: ' . $field->column);
             }
             $casted = $this->castValue($class, $field->column, $value);
             $sets[] = $this->quote($field->column) . ' = ' . $ctx->bind($casted);
         }
         $where = $this->renderWhereClause($class, $state, $ctx);
         if ($where === '') {
-            throw new InvalidArgumentException('UPDATE 的 WHERE 不能为空，拒绝全表更新');
+            throw new InvalidArgumentException('UPDATE WHERE cannot be empty; full-table updates are rejected');
         }
         $sql = 'UPDATE ' . $this->quote($meta->table) . ' SET ' . implode(', ', $sets) . $where;
 
@@ -104,13 +104,13 @@ final readonly class SqlCompiler
         $this->assertWritable($state);
         if ($state->where === [] && $state->orGroups === []
             && $this->gateway->meta($class)->softDeleteField() === null) {
-            throw new InvalidArgumentException('DELETE 必须有 WHERE 条件，拒绝全表删除');
+            throw new InvalidArgumentException('DELETE requires a WHERE condition; full-table deletes are rejected');
         }
         $meta = $this->gateway->meta($class);
         $ctx = new RenderContext();
         $where = $this->renderWhereClause($class, $state, $ctx);
         if ($where === '') {
-            throw new InvalidArgumentException('DELETE 的 WHERE 不能为空，拒绝全表删除');
+            throw new InvalidArgumentException('DELETE WHERE cannot be empty; full-table deletes are rejected');
         }
         $sql = 'DELETE FROM ' . $this->quote($meta->table) . $where;
 
@@ -121,7 +121,7 @@ final readonly class SqlCompiler
     {
         if ($state->unions !== []) {
             if ($state->lockMode !== null) {
-                throw new InvalidArgumentException('UNION 查询不支持行锁');
+                throw new InvalidArgumentException('UNION queries do not support row locks');
             }
             $union = $this->renderUnionSql($class, $state, $ctx);
             // MySQL 的派生表不能可靠保留末尾复合查询 ORDER BY 的作用域。
@@ -191,7 +191,7 @@ final readonly class SqlCompiler
     public function renderUnionSql(string $class, QueryState $state, RenderContext $ctx): string
     {
         if ($state->lockMode !== null) {
-            throw new InvalidArgumentException('UNION 查询不支持行锁');
+            throw new InvalidArgumentException('UNION queries do not support row locks');
         }
         $sql = $this->renderUnionBranch(
             $class,
@@ -203,7 +203,7 @@ final readonly class SqlCompiler
         );
         foreach ($state->unions as $union) {
             $other = $union['builder'];
-            $this->assertNoLock($other, 'UNION 子查询');
+            $this->assertNoLock($other, 'UNION subquery');
             $this->assertUnionCompatibility($class, $state, $other);
             $sql .= ($union['all'] ? ' UNION ALL ' : ' UNION ')
                 . $this->renderUnion($other->modelClass(), $other->state, $ctx);
@@ -324,7 +324,7 @@ final readonly class SqlCompiler
             /** @var JoinClause $clause */
             $clause = $join['on'];
             if ($clause->isEmpty()) {
-                throw new InvalidArgumentException($join['type'] . ' JOIN 必须有 ON 条件；无 ON 请显式使用 joinRaw()');
+                throw new InvalidArgumentException($join['type'] . ' JOIN requires an ON condition; explicitly use joinRaw() when no ON condition is needed');
             }
             $parts = [];
             foreach ($clause->conditions() as $cond) {
@@ -411,9 +411,9 @@ final readonly class SqlCompiler
                     ? $this->relations->relationQuery($class, $state, $value, $ctx, false)
                     : $value;
                 if (!$sub instanceof Builder) {
-                    throw new \LogicException('EXISTS 条件必须是 Builder 或关系子查询');
+                    throw new \LogicException('EXISTS conditions require a Builder or relation subquery');
                 }
-                $this->assertNoLock($sub, 'EXISTS 子查询');
+                $this->assertNoLock($sub, 'EXISTS subquery');
                 $inner = $this->renderSelect($sub->modelClass(), $sub->state, $ctx);
 
                 return $operator . ' (' . $inner . ')';
@@ -437,9 +437,9 @@ final readonly class SqlCompiler
 
         // 标量子查询。
         if ($value instanceof Builder) {
-            $this->assertSameGateway($value, '标量子查询');
-            $this->assertSingleColumn($value, '标量子查询');
-            $this->assertNoLock($value, '标量子查询');
+            $this->assertSameGateway($value, 'scalar subquery');
+            $this->assertSingleColumn($value, 'scalar subquery');
+            $this->assertNoLock($value, 'scalar subquery');
             $inner = $this->renderSelect($value->modelClass(), $value->state, $ctx);
 
             return $this->quote($this->relations->relationColumn($class, $state, $column)) . ' ' . $operator . ' (' . $inner . ')';
@@ -462,9 +462,9 @@ final readonly class SqlCompiler
             return $operator === 'IN' ? '1 = 0' : '1 = 1';
         }
         if ($value instanceof Builder) {
-            $this->assertSameGateway($value, 'IN 子查询');
-            $this->assertSingleColumn($value, 'IN 子查询');
-            $this->assertNoLock($value, 'IN 子查询');
+            $this->assertSameGateway($value, 'IN subquery');
+            $this->assertSingleColumn($value, 'IN subquery');
+            $this->assertNoLock($value, 'IN subquery');
             $inner = $this->renderSelect($value->modelClass(), $value->state, $ctx);
 
             return $this->quote($this->relations->relationColumn($class, $state, $column)) . ' ' . $operator . ' (' . $inner . ')';
@@ -526,7 +526,7 @@ final readonly class SqlCompiler
                 'sqlite' => ' LIMIT -1 OFFSET ' . $offset,
                 'mysql' => ' LIMIT 18446744073709551615 OFFSET ' . $offset,
                 'pgsql' => ' OFFSET ' . $offset,
-                default => throw new \LogicException('不支持的数据库方言'),
+                default => throw new \LogicException('Unsupported database dialect'),
             };
         }
         $sql = ' LIMIT ' . $limit;
@@ -546,7 +546,7 @@ final readonly class SqlCompiler
         if (preg_match('/^(COUNT|SUM|AVG|MIN|MAX)\(\s*(DISTINCT\s+)?(\*|[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\)$/i', $trimmed) === 1) {
             return;
         }
-        throw new InvalidArgumentException('HAVING 表达式只允许标识符或受控聚合表达式: ' . $expression);
+        throw new InvalidArgumentException('HAVING expressions only allow identifiers or controlled aggregate expressions: ' . $expression);
     }
 
     public function renderHavingExpression(string $expression): string
@@ -577,7 +577,7 @@ final readonly class SqlCompiler
         foreach ($state->projection as $projection) {
             if ($projection['kind'] === 'raw' || ($projection['kind'] === 'aggregate' && $projection['alias'] === null)) {
                 throw new InvalidArgumentException(
-                    'UNION 分支请使用 select()/selectAs() 或带别名的 aggregate()；复杂 raw UNION 请使用 queryRaw()',
+                    'UNION branches must use select()/selectAs() or aliased aggregate(); use queryRaw() for complex raw UNION queries',
                 );
             }
             $name = match ($projection['kind']) {
@@ -590,7 +590,7 @@ final readonly class SqlCompiler
             $shape[] = strtolower($count['alias']);
         }
         if (count($shape) !== count(array_unique($shape))) {
-            throw new InvalidArgumentException('UNION 分支不能包含重复的输出列名/别名');
+            throw new InvalidArgumentException('UNION branches cannot contain duplicate output column names or aliases');
         }
 
         return $shape;
@@ -606,7 +606,7 @@ final readonly class SqlCompiler
                 }
                 $name = strtolower($projection['alias']);
                 if (isset($names[$name])) {
-                    throw new InvalidArgumentException('SELECT 输出别名重复: ' . $projection['alias']);
+                    throw new InvalidArgumentException('Duplicate SELECT output alias: ' . $projection['alias']);
                 }
                 $names[$name] = true;
             }
@@ -620,21 +620,21 @@ final readonly class SqlCompiler
         }
         foreach ($state->projection as $projection) {
             if ($projection['kind'] === 'raw' || ($projection['kind'] === 'aggregate' && $projection['alias'] === null)) {
-                throw new RelationException('withCount() 不能与无明确输出别名的 selectRaw()/aggregate() 组合');
+                throw new RelationException('withCount() cannot be combined with selectRaw()/aggregate() without explicit output aliases');
             }
             $name = match ($projection['kind']) {
                 'as', 'aggregate' => strtolower($projection['alias']),
                 default => strtolower(($parts = explode('.', $projection['column']))[count($parts) - 1]),
             };
             if (isset($names[$name])) {
-                throw new InvalidArgumentException('SELECT 输出别名重复: ' . $name);
+                throw new InvalidArgumentException('Duplicate SELECT output alias: ' . $name);
             }
             $names[$name] = true;
         }
         foreach ($state->relationCounts as $count) {
             $name = strtolower($count['alias']);
             if (isset($names[$name])) {
-                throw new InvalidArgumentException('SELECT 输出别名重复: ' . $count['alias']);
+                throw new InvalidArgumentException('Duplicate SELECT output alias: ' . $count['alias']);
             }
             $names[$name] = true;
         }
@@ -642,11 +642,11 @@ final readonly class SqlCompiler
 
     public function assertUnionCompatibility(string $class, QueryState $state, Builder $other): void
     {
-        $this->assertSameGateway($other, 'UNION 分支');
+        $this->assertSameGateway($other, 'UNION branch');
         $left = $this->firstSelect($class, $state);
         $right = $this->firstSelect($other->modelClass(), $other->state);
         if ($this->projectionShape($left[0], $left[1]) !== $this->projectionShape($right[0], $right[1])) {
-            throw new InvalidArgumentException('UNION 每个分支必须返回相同数量的列，且输出列名/别名必须一致');
+            throw new InvalidArgumentException('Every UNION branch must return the same number of columns with identical output names and aliases');
         }
     }
 
@@ -654,7 +654,7 @@ final readonly class SqlCompiler
     {
         $state = $builder->state;
         if ($state->lockMode !== null) {
-            throw new InvalidArgumentException($context . '不允许携带行锁');
+            throw new InvalidArgumentException($context . ' must not include a row lock');
         }
         if ($state->derivedFrom !== null) {
             $this->assertNoLock($state->derivedFrom['builder'], $context);
@@ -688,17 +688,17 @@ final readonly class SqlCompiler
     {
         $state = $builder->state;
         if ($state->projection === []) {
-            throw new InvalidArgumentException($context . '必须显式 select() 选择一个列');
+            throw new InvalidArgumentException($context . ' must explicitly select() one column');
         }
         $columns = 0;
         foreach ($state->projection as $projection) {
             if ($projection['kind'] === 'raw') {
-                throw new InvalidArgumentException($context . '使用 selectRaw() 时请确保只返回一列，或显式 select() 单列');
+                throw new InvalidArgumentException($context . ' using selectRaw() must return one column, or explicitly select() a single column');
             }
             $columns++;
         }
         if ($columns !== 1) {
-            throw new InvalidArgumentException($context . '必须恰好返回一列');
+            throw new InvalidArgumentException($context . ' must return exactly one column');
         }
     }
 
@@ -706,7 +706,7 @@ final readonly class SqlCompiler
     {
         if (!$this->isSimpleBaseQuery($state)) {
             throw new InvalidArgumentException(
-                '该查询包含投影/JOIN/GROUP/UNION/派生表，无法 hydrate 为实体，请使用 rows()/row()/value()'
+                'This query contains projections/JOIN/GROUP/UNION/derived tables and cannot hydrate entities; use rows()/row()/value()'
             );
         }
     }
@@ -720,7 +720,7 @@ final readonly class SqlCompiler
             || $state->distinct || $state->orderBy !== []
             || $state->limit !== null || $state->offset > 0 || $state->lockMode !== null) {
             throw new InvalidArgumentException(
-                'UPDATE/DELETE 仅支持基表 WHERE 条件，不支持投影/JOIN/GROUP/HAVING/UNION/alias/派生表/排序/分页/行锁',
+                'UPDATE/DELETE only supports base-table WHERE conditions; projections/JOIN/GROUP/HAVING/UNION/alias/derived tables/ordering/pagination/row locks are not supported',
             );
         }
     }
@@ -742,28 +742,28 @@ final readonly class SqlCompiler
     public function assertNoEagerRelations(QueryState $state, string $operation): void
     {
         if ($state->eagerRelations !== []) {
-            throw new InvalidArgumentException($operation . ' 不支持 with() 预加载；请使用实体 get()/first()');
+            throw new InvalidArgumentException($operation . ' does not support with() eager loading; use entity get()/first()');
         }
     }
 
     public function assertDeferredRelationExecution(QueryState $state): void
     {
         if ($state->buildingRelationConstraint) {
-            throw new RelationException('关系约束闭包只能声明查询条件，不得执行 get/rows/build/update/delete 等终结操作');
+            throw new RelationException('Relation constraint closures may only declare query conditions; terminal operations such as get/rows/build/update/delete are forbidden');
         }
     }
 
     public function assertRelationConstraintBuilderAllowed(QueryState $state): void
     {
         if ($state->buildingRelationConstraint) {
-            throw new RelationException('关系约束不能通过 JOIN、UNION 或派生表改写子查询结构');
+            throw new RelationException('Relation constraints cannot rewrite the subquery structure with JOIN, UNION, or derived tables');
         }
     }
 
     public function assertSameGateway(Builder $other, string $context): void
     {
         if ($this->gateway !== $other->gateway()) {
-            throw new InvalidArgumentException($context . '必须使用与父查询相同的 EntityGateway 连接');
+            throw new InvalidArgumentException($context . ' must use the same EntityGateway connection as the parent query');
         }
     }
 
@@ -795,10 +795,10 @@ final readonly class SqlCompiler
     private function castQueryValue(string $class, string $column, mixed $value): int|float|string|bool|null
     {
         if ($value instanceof Builder) {
-            throw new InvalidArgumentException('标量值位置不允许子查询');
+            throw new InvalidArgumentException('Subqueries are not allowed in scalar value positions');
         }
         if (is_array($value) || is_resource($value)) {
-            throw new InvalidArgumentException('条件值必须是标量，不允许 array/resource');
+            throw new InvalidArgumentException('Condition values must be scalar; array/resource are not allowed');
         }
         // 基表字段（不带表前缀且是模型列）走 castQueryValue。
         if (!str_contains($column, '.') && method_exists($this->gateway, 'castQueryValue')) {
@@ -850,6 +850,6 @@ final readonly class SqlCompiler
                 return (string) $value;
             }
         }
-        throw new InvalidArgumentException('不支持的绑定值类型: ' . get_debug_type($value));
+        throw new InvalidArgumentException('Unsupported bound value type: ' . get_debug_type($value));
     }
 }

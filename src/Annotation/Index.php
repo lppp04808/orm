@@ -20,17 +20,17 @@ final readonly class Index
     public function __construct(array $columns, ?string $name = null, public bool $unique = false)
     {
         if ($columns === [] || !array_is_list($columns)) {
-            throw new InvalidArgumentException('索引字段必须是非空有序数组');
+            throw new InvalidArgumentException('Index columns must be a non-empty ordered array');
         }
         foreach ($columns as $column) {
             if (!is_string($column) || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/D', $column) !== 1) {
-                throw new InvalidArgumentException('索引字段必须是合法标识符');
+                throw new InvalidArgumentException('Index columns must be valid identifiers');
             }
         }
         $this->columns = $columns;
         $this->name = $name ?? ($unique ? 'uniq_' : 'idx_') . implode('_', $columns);
         if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/D', $this->name) !== 1) {
-            throw new InvalidArgumentException('索引名称不是合法标识符');
+            throw new InvalidArgumentException('Index name must be a valid identifier');
         }
     }
 }

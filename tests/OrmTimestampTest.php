@@ -118,11 +118,11 @@ final class OrmTimestampTest extends TestCase
     public static function invalidTimestampModels(): array
     {
         return [
-            DuplicateCreatedAtRecord::class => [DuplicateCreatedAtRecord::class, '重复声明'],
-            DualRoleTimestampRecord::class => [DualRoleTimestampRecord::class, '不能共用同一字段'],
-            StringTimestampRecord::class => [StringTimestampRecord::class, '只支持 int 或 DateTimeImmutable'],
-            MissingColumnTimestampRecord::class => [MissingColumnTimestampRecord::class, '必须同时声明'],
-            PrimaryTimestampRecord::class => [PrimaryTimestampRecord::class, '主键不能作为自动时间角色'],
+            DuplicateCreatedAtRecord::class => [DuplicateCreatedAtRecord::class, 'duplicates timestamp role'],
+            DualRoleTimestampRecord::class => [DualRoleTimestampRecord::class, 'cannot serve as both the creation and update timestamp'],
+            StringTimestampRecord::class => [StringTimestampRecord::class, 'only support int or DateTimeImmutable'],
+            MissingColumnTimestampRecord::class => [MissingColumnTimestampRecord::class, 'timestamp roles must also declare #[Column]'],
+            PrimaryTimestampRecord::class => [PrimaryTimestampRecord::class, 'primary keys cannot be automatic timestamp fields'],
         ];
     }
 
