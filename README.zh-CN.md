@@ -16,7 +16,7 @@
 - **高效安全写入：** 语义脏跟踪、乐观锁、软删除、UPSERT 和批量插入。
 - **可靠事务：** 嵌套 SAVEPOINT，回滚恢复字段、原始快照与缓存对象身份。
 - **可预测查询：** 只读关系、显式预加载、关联过滤、复杂 SQL 和原始数组结果。
-- **适配常驻运行时：** Fiber/协程感知的命名会话、O(1) LRU 行缓存、元数据缓存与可观测性。
+- **适配常驻运行时：** Fiber/协程感知的命名会话、O(1) LRU 行缓存与语句缓存、元数据缓存及可观测性。
 
 核心库不依赖框架、不隐式创建 PDO，也不强制使用连接池。
 内置结构读取、模型生成与 Schema 差异预览，覆盖日常开发工作流。
@@ -91,6 +91,7 @@ Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
 | 主题 | 手册章节 |
 |---|---|
 | 安装初始化、会话、Fiber 与连接池 | [初始化](./USAGE.zh-CN.md#1-初始化) |
+| PDOStatement 缓存配置与生命周期 | [语句缓存](./USAGE.zh-CN.md#语句缓存) |
 | 模型、类型转换、时间、版本与软删除 | [定义模型](./USAGE.zh-CN.md#2-定义模型) |
 | 关系、预加载、关联过滤与计数 | [只读关系与预加载](./USAGE.zh-CN.md#3-只读关系与预加载) |
 | 创建、读取、更新、删除与刷新 | [Active Record](./USAGE.zh-CN.md#4-active-record) |
@@ -102,9 +103,39 @@ Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
 | 索引声明与绝不自动执行的 Schema 差异 | [Schema 差异对比](./USAGE.zh-CN.md#16-索引声明与-schema-差异对比) |
 | SQL、事务与会话事件 | [可观测性](./USAGE.zh-CN.md#17-可观测性) |
 | 本地与真实数据库验收 | [测试与验收](./USAGE.zh-CN.md#18-测试与真实数据库验收) |
-| 长时稳定性与资源边界演练 | [SOAK.md](./SOAK.md) |
 
 英文阅读请访问 [英文首页](./README.md) 或 [英文完整手册](./USAGE.md)。
+
+## PDO、ORM 与语句缓存基准
+
+本机 Docker 顺序测量快照：PHP 8.3.13、原生预处理、500 行数据、1 轮预热和 5 轮测量。SQLite 使用内存库；MySQL 8.4.13 和 PostgreSQL 16.16 使用独立本地容器。数值为毫秒中位数，不代表生产环境容量保证。
+
+原生 PDO 与启用 64 条语句缓存的完整 ORM 路径：
+
+| 场景 | SQLite 3.45.3 PDO / ORM | MySQL PDO / ORM | PostgreSQL PDO / ORM |
+|---|---:|---:|---:|
+| 500 行数组读取 | 0.136 / 0.180 | 0.367 / 0.504 | 0.515 / 0.565 |
+| 500 个实体读取 | — / 2.439 | — / 2.620 | — / 2.684 |
+| 500 次主键读取 | 1.880 / 6.334 | 75.368 / 47.457 | 101.454 / 51.947 |
+| 200 次原子自增 | 0.591 / 1.866 | 37.193 / 22.720 | 46.725 / 20.439 |
+
+PDO 主键路径读取数组；`Entity::find()` 绕过行缓存并水合实体。ORM 自增使用 `Builder::increment()`，PDO 对照执行等价的参数化 SQL。不同后端的绝对耗时不能直接解释为 ORM 本身的算法开销。
+
+同一低层 SQL 的连接层对照，每轮使用新的连接封装：
+
+| 场景 | 后端 | 原生 PDO | 缓存 0 | 缓存 64 |
+|---|---|---:|---:|---:|
+| 500 次主键数组读取 | SQLite | 1.880 ms | 1.893 ms | 0.574 ms |
+| 200 次更新 | SQLite | 0.591 ms | 0.646 ms | 0.255 ms |
+| 500 行数组读取 | SQLite | 0.136 ms | 0.129 ms | 0.130 ms |
+| 500 次主键数组读取 | MySQL | 75.368 ms | 66.075 ms | 31.825 ms |
+| 200 次更新 | MySQL | 37.193 ms | 37.159 ms | 21.118 ms |
+| 500 行数组读取 | MySQL | 0.367 ms | 0.397 ms | 0.351 ms |
+| 500 次主键数组读取 | PostgreSQL | 101.454 ms | 101.853 ms | 36.194 ms |
+| 200 次更新 | PostgreSQL | 46.725 ms | 43.159 ms | 16.884 ms |
+| 500 行数组读取 | PostgreSQL | 0.515 ms | 0.454 ms | 0.419 ms |
+
+可运行 `php bench/statement_cache.php sqlite|mysql|pgsql` 复测；外部数据库通过 `BENCH_DSN`、`BENCH_USER`、`BENCH_PASSWORD` 配置。PostgreSQL 在重复执行期间保留了一个服务端预备语句。实测 pdo_mysql 的 mysqlnd 驱动即使复用同一语句对象，在游标清理后仍会发起服务端 PREPARE；这些耗时不能证明消除了 MySQL 服务端 PREPARE 往返。配置与生命周期见[语句缓存手册](./USAGE.zh-CN.md#语句缓存)。
 
 ## 本地测试
 

@@ -42,6 +42,26 @@ try {
 
 同一个 `EntityGateway` 从绑定成功到 `discard()` / 作用域释放为止，整个活跃读写生命周期都只能属于一个 Context，不限于事务期间。另一个 Fiber/协程尝试绑定会提前抛出 `LogicException`，避免覆盖 `lastInsertId()` 或交错异步驱动协议包。同一 Context 的重复绑定采用引用计数，嵌套作用域会恢复外层归属。
 
+### 语句缓存
+
+`PdoConnection` 使用原始 SQL 文本作为键，在 O(1) LRU 缓存中保留最多 64 个可复用的 `PDOStatement` 对象。命中时跳过 `PDO::prepare()` 和 PostgreSQL dollar-quote 规范化；每次执行仍会按当前值的实际标量类型重新绑定参数。
+
+```php
+$pdo = new \PDO($dsn, $user, $password, [
+    \PDO::ATTR_EMULATE_PREPARES => false,
+]);
+
+$connection = new PdoConnection($pdo);                         // 默认容量：64
+$bounded = new PdoConnection($pdo, statementCacheSize: 128);   // 自定义 LRU 容量
+$uncached = new PdoConnection($pdo, statementCacheSize: 0);    // 禁用语句缓存
+
+$connection->clearStatementCache(); // 显式释放缓存的语句句柄
+```
+
+容量为负数时抛出 `InvalidArgumentException`。长度超过 4096 字节的 SQL 和 SAVEPOINT 控制语句不进入缓存，避免一次性批量语句挤掉可复用查询。查询和写入路径都会在 `finally` 中关闭游标，包括只读取部分结果的情况；绑定或执行失败会剔除对应语句，`forceRollback()` 也会清空缓存。DDL 可能使服务端执行计划失效，因此应保留原始异常，并仅在业务语义允许时重试操作。
+
+缓存属于单个 `PdoConnection`，不是 PDO 全局缓存，也不会在独立 Gateway 之间共享。它减少各支持驱动的客户端 prepare 开销，并在 pdo_pgsql 上保留服务端预备语句。实测 pdo_mysql 的 mysqlnd 驱动在关闭游标后，即使复用同一个语句对象再次执行，仍可能重新发起服务端 PREPARE；语句复用不保证消除 MySQL 服务端 PREPARE 往返。应针对目标驱动和工作负载实测，不能把缓存当作通用的性能保证。
+
 ### 命名会话与多数据源
 
 ```php

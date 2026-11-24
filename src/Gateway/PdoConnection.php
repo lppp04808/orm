@@ -14,6 +14,11 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
     /** 当前 PDO 物理连接上的事务深度；SAVEPOINT 名称只由这个受控整数生成。 */
     private int $transactionDepth = 0;
 
+    /** @var array<string, PDOStatement> 原始 SQL 到服务端预备语句的 LRU 映射。 */
+    private array $statementCache = [];
+
+    private readonly int $statementCacheSize;
+
     /**
      * @param PDO $pdo
      * @param \Closure|null $insertId 代替 lastInsertId，测试用
@@ -21,34 +26,53 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
     public function __construct(
         private readonly PDO       $pdo,
         private readonly ?\Closure $insertId = null,
+        int $statementCacheSize = 64,
     ) {
+        if ($statementCacheSize < 0) {
+            throw new \InvalidArgumentException('Statement cache size must not be negative');
+        }
+        $this->statementCacheSize = $statementCacheSize;
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $this->driver = $this->pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
     }
 
-    public function execute(string $sql, array $params): int
+    public function execute(string $sql, array $params, bool $cacheable = true): int
     {
-        $statement = $this->prepare($sql, $params);
-        $count = $statement->rowCount();
-        $statement->closeCursor();
-
-        return $count;
+        $statement = $this->prepare($sql, $params, $cacheable);
+        try {
+            return $statement->rowCount();
+        } finally {
+            $statement->closeCursor();
+        }
     }
 
     public function queryOne(string $sql, array $params): ?array
     {
         $statement = $this->prepare($sql, $params);
-        $row = $statement->fetch(PDO::FETCH_ASSOC);
+        try {
+            $row = $statement->fetch(PDO::FETCH_ASSOC);
 
-        return $row === false ? null : $row;
+            return $row === false ? null : $row;
+        } finally {
+            $statement->closeCursor();
+        }
     }
 
     public function queryAll(string $sql, array $params): array
     {
         $statement = $this->prepare($sql, $params);
-        $rows = $statement->fetchAll(PDO::FETCH_ASSOC);
+        try {
+            $rows = $statement->fetchAll(PDO::FETCH_ASSOC);
 
-        return $rows === false ? [] : $rows;
+            return $rows === false ? [] : $rows;
+        } finally {
+            $statement->closeCursor();
+        }
+    }
+
+    public function clearStatementCache(): void
+    {
+        $this->statementCache = [];
     }
 
     /**
@@ -58,24 +82,46 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
      *
      * @param array<int|string, int|float|string|bool|null> $params
      */
-    private function prepare(string $sql, array $params): PDOStatement
+    private function prepare(string $sql, array $params, bool $cacheable = true): PDOStatement
     {
-        if ($this->driver === 'pgsql') {
-            $sql = $this->normalizePgDollarQuotes($sql);
+        $cacheable = $cacheable && $this->statementCacheSize > 0 && strlen($sql) <= 4096;
+        $statement = $cacheable ? ($this->statementCache[$sql] ?? null) : null;
+        if ($statement !== null) {
+            unset($this->statementCache[$sql]);
+            $this->statementCache[$sql] = $statement;
+        } else {
+            $preparedSql = $this->driver === 'pgsql' ? $this->normalizePgDollarQuotes($sql) : $sql;
+            $statement = $this->pdo->prepare($preparedSql);
         }
-        $statement = $this->pdo->prepare($sql);
-        foreach ($params as $name => $value) {
-            $parameter = is_int($name) ? $name + 1 : ':' . ltrim($name, ':');
-            $type = match (true) {
-                is_int($value) => PDO::PARAM_INT,
-                is_bool($value) => PDO::PARAM_BOOL,
-                $value === null => PDO::PARAM_NULL,
-                // PDO 没有通用的浮点绑定类型；字符串绑定保留十进制文本。
-                default => PDO::PARAM_STR,
-            };
-            $statement->bindValue($parameter, $value, $type);
+        try {
+            foreach ($params as $name => $value) {
+                $parameter = is_int($name) ? $name + 1 : ':' . ltrim($name, ':');
+                $type = match (true) {
+                    is_int($value) => PDO::PARAM_INT,
+                    is_bool($value) => PDO::PARAM_BOOL,
+                    $value === null => PDO::PARAM_NULL,
+                    // PDO 没有通用的浮点绑定类型；字符串绑定保留十进制文本。
+                    default => PDO::PARAM_STR,
+                };
+                $statement->bindValue($parameter, $value, $type);
+            }
+            $statement->execute();
+        } catch (\Throwable $exception) {
+            if ($cacheable) {
+                unset($this->statementCache[$sql]);
+            }
+            throw $exception;
         }
-        $statement->execute();
+        if ($cacheable && !isset($this->statementCache[$sql])) {
+            $this->statementCache[$sql] = $statement;
+            while (count($this->statementCache) > $this->statementCacheSize) {
+                $oldest = array_key_first($this->statementCache);
+                if ($oldest === null) {
+                    break;
+                }
+                unset($this->statementCache[$oldest]);
+            }
+        }
 
         return $statement;
     }
@@ -259,7 +305,7 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
         }
 
         $depth = $this->transactionDepth + 1;
-        $this->execute('SAVEPOINT sp_' . $depth, []);
+        $this->execute('SAVEPOINT sp_' . $depth, [], cacheable: false);
         $this->transactionDepth = $depth;
 
         return true;
@@ -272,7 +318,7 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
             throw new \LogicException('The connection has no transaction to commit');
         }
         if ($depth > 1) {
-            $this->execute('RELEASE SAVEPOINT sp_' . $depth, []);
+            $this->execute('RELEASE SAVEPOINT sp_' . $depth, [], cacheable: false);
             $this->transactionDepth--;
 
             return true;
@@ -295,8 +341,8 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
         if ($depth > 1) {
             // MySQL、PostgreSQL、SQLite 均支持：回滚保存点后释放同名保存点。
             // 两条语句都成功才减少深度；失败交由 Gateway 禁止复用该连接。
-            $this->execute('ROLLBACK TO SAVEPOINT sp_' . $depth, []);
-            $this->execute('RELEASE SAVEPOINT sp_' . $depth, []);
+            $this->execute('ROLLBACK TO SAVEPOINT sp_' . $depth, [], cacheable: false);
+            $this->execute('RELEASE SAVEPOINT sp_' . $depth, [], cacheable: false);
             $this->transactionDepth--;
 
             return true;
@@ -318,6 +364,8 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
 
     public function forceRollback(): bool
     {
+        $this->clearStatementCache();
+
         if ($this->transactionDepth === 0) {
             return true;
         }

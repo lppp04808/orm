@@ -42,6 +42,26 @@ A scope does not close PDO. The application creates, reconnects, health-checks, 
 
 An `EntityGateway` belongs to one Context throughout its active read/write lifetime, from successful binding until `discard()` or scope release, not just during transactions. Another Fiber/coroutine attempting to bind it receives an early `LogicException`, preventing `lastInsertId()` interference or interleaved asynchronous driver packets. Repeated binding in the same Context is reference-counted, and nested scopes restore outer ownership.
 
+### Statement cache
+
+`PdoConnection` keeps up to 64 reusable `PDOStatement` objects in an O(1) LRU cache keyed by the original SQL text. A cache hit skips `PDO::prepare()` and PostgreSQL dollar-quote normalization; each execution still binds the current values using their actual scalar types.
+
+```php
+$pdo = new \PDO($dsn, $user, $password, [
+    \PDO::ATTR_EMULATE_PREPARES => false,
+]);
+
+$connection = new PdoConnection($pdo);                         // Default capacity: 64
+$bounded = new PdoConnection($pdo, statementCacheSize: 128);   // Custom LRU capacity
+$uncached = new PdoConnection($pdo, statementCacheSize: 0);    // Disable statement caching
+
+$connection->clearStatementCache(); // Release cached statement handles explicitly
+```
+
+A negative capacity throws `InvalidArgumentException`. SQL longer than 4096 bytes and SAVEPOINT control statements bypass the cache, preventing one-off bulk statements from evicting reusable queries. Query and write paths close cursors in `finally`, including partially read results. Binding or execution failures evict the affected statement; `forceRollback()` also clears the cache. DDL changes can invalidate server-side plans, so propagate the original exception and retry the operation only when its business semantics permit it.
+
+The cache belongs to one `PdoConnection`, not to PDO globally or across independent Gateway instances. It reduces client-side preparation on all supported drivers and preserves server-side prepared statements on pdo_pgsql. With the tested pdo_mysql mysqlnd driver, closing a cursor may still cause another server PREPARE when the same statement object executes again; statement reuse does not guarantee elimination of MySQL server PREPARE round trips. Measure the target driver and workload rather than treating the cache as a universal performance guarantee.
+
 ### Named sessions and multiple data sources
 
 ```php
