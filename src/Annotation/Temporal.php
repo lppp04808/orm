@@ -13,10 +13,15 @@ use Attribute;
 final readonly class Temporal
 {
     public const string TEXT = 'text';
+    public const string DATE = 'date';
+    public const string TEXT_US = 'text_us';
     public const string UNIX = 'unix';
+    public const string UNIX_MS = 'unix_ms';
 
     public function __construct(
         public string $storage = self::TEXT,
+        public ?string $displayFormat = null,
+        public ?string $displayTimezone = null,
     ) {
     }
 }

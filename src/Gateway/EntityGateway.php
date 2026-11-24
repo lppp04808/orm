@@ -614,7 +614,7 @@ final class EntityGateway
             $value = $entity->{$field->property};
             $arr[$field->column] = $value === null
                 ? null
-                : $this->caster->toDb($meta->class, $field, $value);
+                : $this->caster->formatDisplay($meta->class, $field, $value);
         }
 
         return $arr;

@@ -241,21 +241,58 @@ Decimal 与 `Castable` 一样在网关边界转换；字段按规范化数据库
 
 实体更新与关系刷新对对象字段按规范化数据库表示进行语义比较：等值的新 `Money`、`DateTimeImmutable`、Decimal 对象不会被误判为脏字段，也不会因此产生多余 UPDATE 或递增 `#[Version]`。不同时区但同一时刻的时间按其实际存储格式比较。绑定给 Builder 的 Castable 也经同一 Caster 规范化。
 
-### DateTimeImmutable 的存储格式
+### DateTimeImmutable 的存储与展示格式
+
+存储格式与展示格式彼此独立。以下属性都位于 Entity 模型类内部：
 
 ```php
 use Pixiaoka\Orm\Annotation\Temporal;
 
-// 默认：存成 UTC 文本 "2026-11-13 21:17:45"
+// 默认：存成 UTC 秒级文本 "2026-11-13 21:17:45"
 #[Column]
 #[Temporal]
 public DateTimeImmutable $happened_at;
 
-// Unix 时间戳
+// UTC 日期文本 / 原生 DATE；读取时是该日 UTC 零点
+#[Column]
+#[Temporal(Temporal::DATE)]
+public DateTimeImmutable $happened_on;
+
+// UTC 微秒文本；写入固定六位小数，读取兼容 PostgreSQL 返回的 0～6 位小数
+#[Column]
+#[Temporal(Temporal::TEXT_US)]
+public DateTimeImmutable $precise_at;
+
+// Unix 整数秒 / Unix 整数毫秒，均不经过浮点数转换
 #[Column]
 #[Temporal(Temporal::UNIX)]
 public DateTimeImmutable $created_at;
+
+#[Column]
+#[Temporal(Temporal::UNIX_MS)]
+public DateTimeImmutable $created_ms;
+
+// 只影响 toArray()：UTC 存储与属性值不变，输出指定时区的展示字符串
+#[Column]
+#[Temporal(Temporal::TEXT_US, displayFormat: 'Y-m-d H:i:s.u P', displayTimezone: 'Asia/Shanghai')]
+public DateTimeImmutable $published_at;
 ```
+
+| 存储常量 | 写库值 | 读取结果 |
+|---|---|---|
+| `Temporal::TEXT` | `Y-m-d H:i:s` UTC | UTC 的 `DateTimeImmutable` |
+| `Temporal::DATE` | `Y-m-d` UTC | 该日 UTC 零点 |
+| `Temporal::TEXT_US` | `Y-m-d H:i:s.u` UTC | 保留微秒的 UTC 时间 |
+| `Temporal::UNIX` | Unix 整数秒 | UTC 的 `DateTimeImmutable` |
+| `Temporal::UNIX_MS` | Unix 整数毫秒 | 保留毫秒的 UTC 时间 |
+
+`TEXT_US` 的数据库字段应保留六位小数，MySQL 用 `DATETIME(6)`，PostgreSQL 用 `TIMESTAMP(6)`，SQLite 用 `TEXT`。`DATE` 在 MySQL/PostgreSQL 用 `DATE`、SQLite 用 `TEXT`；两种 Unix 存储在 MySQL/PostgreSQL 用 `BIGINT`、SQLite 用 `INTEGER`。SchemaDiffer 会区分 `DATE` 与日期时间，以及 MySQL/PostgreSQL 的小数秒精度。迁移已有秒级字段到 `TEXT_US` 或 `UNIX_MS` 时须先转换数据库值，不能只改注解。
+
+所有时间落库前统一转为 UTC。`DATE` 截取的是 **UTC 日期**，不是原时区的墙上日期；按当地日历日存储时，请先在业务层转为该日 UTC 零点，或使用普通字符串字段。毫秒转换使用整数运算，支持负时间戳。非法日期、超过六位的小数、带时区的存储文本及非整数 Unix 值会抛 `CastException`，不会静默修正。
+
+`displayFormat` 使用 PHP 日期格式，`displayTimezone` 默认 UTC，单独设置时区而不设置格式会被拒绝。展示配置不影响 INSERT/UPDATE/UPSERT、WHERE 绑定、关系键、脏跟踪、主键缓存或 `refresh()`；它只改变 `toArray()` 的对应值。未设置展示格式时，`toArray()` 仍返回存储表示。
+
+自动 `#[CreatedAt]` / `#[UpdatedAt]` 同样支持这些存储。单实体和实体批量写入的自动值按声明提供微秒/毫秒；为保持同一批数组使用同一时刻，数组批量写入的缺省自动时间沿用整数秒。已有秒级模型不添加新常量即保持原行为。元数据缓存新增可选展示字段，旧格式缓存仍可导入。
 
 ### 可配置时间字段自动填充
 

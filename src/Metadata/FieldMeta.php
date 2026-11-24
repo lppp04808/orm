@@ -19,6 +19,8 @@ final readonly class FieldMeta
         public bool $generated,
         public int $order,
         public string $temporal,
+        public ?string $temporalDisplayFormat = null,
+        public ?string $temporalDisplayTimezone = null,
     ) {
     }
 

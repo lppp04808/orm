@@ -241,21 +241,58 @@ Like `Castable`, Decimal values are converted at the gateway boundary. Fields ar
 
 Entity updates and relation refreshes compare object fields by normalized database representation. New but equal `Money`, `DateTimeImmutable`, or Decimal objects are not marked dirty, and therefore do not cause an extra UPDATE or increment `#[Version]`. Times with different time zones but the same instant are compared using their actual storage format. Castable values bound to a Builder are normalized by the same Caster.
 
-### DateTimeImmutable storage formats
+### DateTimeImmutable storage and display formats
+
+Storage and display formats are independent. These properties belong inside an Entity model:
 
 ```php
 use Pixiaoka\Orm\Annotation\Temporal;
 
-// Default: UTC text such as "2026-11-13 21:17:45"
+// Default: second-precision UTC text such as "2026-11-13 21:17:45"
 #[Column]
 #[Temporal]
 public DateTimeImmutable $happened_at;
 
-// Unix timestamp
+// UTC date text / native DATE; reads as midnight UTC on that date
+#[Column]
+#[Temporal(Temporal::DATE)]
+public DateTimeImmutable $happened_on;
+
+// UTC microsecond text; writes six digits and accepts PostgreSQL's 0–6 digits
+#[Column]
+#[Temporal(Temporal::TEXT_US)]
+public DateTimeImmutable $precise_at;
+
+// Unix integer seconds / milliseconds without floating-point conversion
 #[Column]
 #[Temporal(Temporal::UNIX)]
 public DateTimeImmutable $created_at;
+
+#[Column]
+#[Temporal(Temporal::UNIX_MS)]
+public DateTimeImmutable $created_ms;
+
+// Only affects toArray(): UTC storage and the property remain unchanged
+#[Column]
+#[Temporal(Temporal::TEXT_US, displayFormat: 'Y-m-d H:i:s.u P', displayTimezone: 'Asia/Shanghai')]
+public DateTimeImmutable $published_at;
 ```
+
+| Storage constant | Database value | Read result |
+|---|---|---|
+| `Temporal::TEXT` | `Y-m-d H:i:s` UTC | UTC `DateTimeImmutable` |
+| `Temporal::DATE` | `Y-m-d` UTC | Midnight UTC on that date |
+| `Temporal::TEXT_US` | `Y-m-d H:i:s.u` UTC | UTC time with microseconds |
+| `Temporal::UNIX` | Unix integer seconds | UTC `DateTimeImmutable` |
+| `Temporal::UNIX_MS` | Unix integer milliseconds | UTC time with milliseconds |
+
+Use six-digit-capable columns for `TEXT_US`: `DATETIME(6)` on MySQL, `TIMESTAMP(6)` on PostgreSQL, and `TEXT` on SQLite. Use `DATE` on MySQL/PostgreSQL and `TEXT` on SQLite for `DATE`; both Unix modes use `BIGINT` on MySQL/PostgreSQL and `INTEGER` on SQLite. SchemaDiffer distinguishes dates from date-times and checks fractional-second precision on MySQL/PostgreSQL. Before changing an existing second-precision field to `TEXT_US` or `UNIX_MS`, migrate the stored values rather than changing only the attribute.
+
+All times are normalized to UTC before writing. `DATE` truncates to the **UTC calendar date**, not the original timezone's local date. Convert a business-local date to midnight UTC in application code first, or use a plain string field when the instant-based rule is not appropriate. Milliseconds use integer arithmetic, including negative timestamps. Invalid dates, more than six fractional digits, storage text containing a timezone, and non-integer Unix values throw `CastException` instead of being silently corrected.
+
+`displayFormat` uses PHP date formatting. `displayTimezone` defaults to UTC and cannot be specified without a format. Display configuration does not affect INSERT/UPDATE/UPSERT, WHERE bindings, relation keys, dirty tracking, primary-key caching, or `refresh()`; it changes only the corresponding `toArray()` value. Without a display format, `toArray()` retains the stored representation.
+
+Automatic `#[CreatedAt]` / `#[UpdatedAt]` fields support the same storage modes. Single-entity and entity-batch automatic values use the declared microsecond/millisecond precision. Array batches intentionally retain integer-second defaults so every row shares one batch timestamp. Existing second-precision models retain their behavior unless a new mode is explicitly selected. The optional display fields in metadata caches are backward-compatible with old exported caches.
 
 ### Configurable automatic timestamps
 

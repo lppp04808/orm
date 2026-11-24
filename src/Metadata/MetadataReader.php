@@ -162,6 +162,8 @@ final class MetadataReader
                 'generated' => $field->generated,
                 'order' => $field->order,
                 'temporal' => $field->temporal,
+                'temporalDisplayFormat' => $field->temporalDisplayFormat,
+                'temporalDisplayTimezone' => $field->temporalDisplayTimezone,
             ], $byProperty),
             'primaryKey' => array_map(static fn (FieldMeta $field): string => $field->property, $primary),
             'identityKind' => $identityKind,
@@ -442,11 +444,40 @@ final class MetadataReader
         $primary = $primaryAttr === [] ? null : $primaryAttr[0]->newInstance();
 
         $temporal = Temporal::TEXT;
+        $displayFormat = null;
+        $displayTimezone = null;
         $temporalAttr = $property->getAttributes(Temporal::class);
         if ($temporalAttr !== []) {
-            $temporal = $temporalAttr[0]->newInstance()->storage;
-            if (!in_array($temporal, [Temporal::TEXT, Temporal::UNIX], true)) {
-                throw new MetadataException($class . '::' . $property->getName() . ' has invalid temporal storage');
+            $attribute = $temporalAttr[0]->newInstance();
+            $temporal = $attribute->storage;
+            $displayFormat = $attribute->displayFormat;
+            $displayTimezone = $attribute->displayTimezone;
+            $fieldName = $class . '::' . $property->getName();
+            if (!in_array($temporal, [
+                Temporal::TEXT,
+                Temporal::DATE,
+                Temporal::TEXT_US,
+                Temporal::UNIX,
+                Temporal::UNIX_MS,
+            ], true)) {
+                throw new MetadataException($fieldName . ' has invalid temporal storage');
+            }
+            if ($displayFormat !== null && trim($displayFormat) === '') {
+                throw new MetadataException($fieldName . ' temporal display format must not be empty');
+            }
+            if ($displayTimezone !== null) {
+                if ($displayFormat === null) {
+                    throw new MetadataException($fieldName . ' temporal display timezone requires a display format');
+                }
+                try {
+                    new \DateTimeZone($displayTimezone);
+                } catch (\Throwable $exception) {
+                    throw new MetadataException(
+                        $fieldName . ' has invalid temporal display timezone',
+                        0,
+                        $exception,
+                    );
+                }
             }
         }
 
@@ -472,6 +503,8 @@ final class MetadataReader
             $primary?->generated ?? false,
             $primary?->order ?? $declaration,
             $temporal,
+            $displayFormat,
+            $displayTimezone,
         );
     }
 
@@ -507,7 +540,11 @@ final class MetadataReader
                 $column = $definition['column'] ?? null;
                 $nullable = $definition['nullable'] ?? null;
                 $temporal = $definition['temporal'] ?? null;
-                if (!is_string($type) || !is_string($column) || !is_bool($nullable) || !is_string($temporal)) {
+                $displayFormat = $definition['temporalDisplayFormat'] ?? null;
+                $displayTimezone = $definition['temporalDisplayTimezone'] ?? null;
+                if (!is_string($type) || !is_string($column) || !is_bool($nullable) || !is_string($temporal)
+                    || (!is_string($displayFormat) && $displayFormat !== null)
+                    || (!is_string($displayTimezone) && $displayTimezone !== null)) {
                     throw new MetadataException("$class::$property has invalid metadata cache field types");
                 }
                 $propertyReflection = $reflection->getProperty($property);
@@ -532,6 +569,8 @@ final class MetadataReader
                     $definition['generated'],
                     $definition['order'],
                     $temporal,
+                    $displayFormat,
+                    $displayTimezone,
                 );
             }
             $primary = [];

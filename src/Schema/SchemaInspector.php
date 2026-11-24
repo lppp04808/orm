@@ -165,7 +165,7 @@ final class SchemaInspector
     private function pgsqlColumns(string $table): array
     {
         $statement = $this->pdo->prepare(
-            'SELECT c.column_name, c.udt_name, c.data_type, c.is_nullable, c.column_default, c.is_identity, ' .
+            'SELECT c.column_name, c.udt_name, c.data_type, c.datetime_precision, c.is_nullable, c.column_default, c.is_identity, ' .
             'COALESCE(k.pk_order, 0) AS pk_order, ' .
             "(SELECT setting FROM pg_catalog.pg_settings WHERE name = 'server_encoding') AS server_encoding " .
             'FROM information_schema.columns c ' .
@@ -189,6 +189,10 @@ final class SchemaInspector
             $dataType = (string) $row['data_type'];
             if ($dataType === 'USER-DEFINED' || $dataType === 'ARRAY') {
                 $dataType = (string) $row['udt_name'];
+            }
+            $precision = $row['datetime_precision'] ?? null;
+            if (is_numeric($precision) && preg_match('/^(?:timestamp|time)(?: with(?:out)? time zone)?$/i', $dataType) === 1) {
+                $dataType .= '(' . (int) $precision . ')';
             }
             $columns[] = new ColumnSchema(
                 name: $name,

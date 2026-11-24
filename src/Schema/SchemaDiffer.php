@@ -49,7 +49,7 @@ final class SchemaDiffer
         'char' => 'string', 'varchar' => 'string', 'character varying' => 'string',
         'character' => 'string', 'text' => 'string', 'tinytext' => 'string',
         'mediumtext' => 'string', 'longtext' => 'string', 'uuid' => 'string',
-        'date' => 'string', 'time' => 'string', 'time without time zone' => 'string',
+        'time' => 'string', 'time without time zone' => 'string',
         'timestamp with time zone' => 'string', 'timestamptz' => 'string',
     ];
 
@@ -282,8 +282,21 @@ final class SchemaDiffer
             return self::TYPE_MAP[$name][$driver];
         }
         if ($name === DateTimeImmutable::class) {
-            if ($field->temporal === Temporal::UNIX) {
+            if (in_array($field->temporal, [Temporal::UNIX, Temporal::UNIX_MS], true)) {
                 return self::TYPE_MAP['int'][$driver];
+            }
+            if ($field->temporal === Temporal::DATE) {
+                return match ($driver) {
+                    'mysql', 'pgsql' => 'date',
+                    default => 'text',
+                };
+            }
+            if ($field->temporal === Temporal::TEXT_US) {
+                return match ($driver) {
+                    'mysql' => 'datetime(6)',
+                    'pgsql' => 'timestamp(6)',
+                    default => 'text',
+                };
             }
 
             return match ($driver) {
@@ -317,6 +330,16 @@ final class SchemaDiffer
         $type = strtolower(trim($type));
         $type = preg_replace('/\s+/', ' ', $type) ?? $type;
         $base = trim(explode('(', $type, 2)[0]);
+        if ($base === 'date') {
+            return 'date';
+        }
+        if ($driver !== 'sqlite' && in_array($base, ['datetime', 'timestamp', 'timestamp without time zone'], true)) {
+            if (preg_match('/\((\d+)\)/', $type, $matches) === 1) {
+                return 'datetime(' . $matches[1] . ')';
+            }
+
+            return 'datetime';
+        }
         if ($base === 'tinyint' && preg_match('/^tinyint\s*\(\s*1\s*\)/', $type) === 1) {
             return 'bool';
         }
@@ -341,7 +364,7 @@ final class SchemaDiffer
         if ($driver === 'sqlite' && $base === 'text') {
             return 'string';
         }
-        if ($driver !== 'sqlite' && in_array($base, ['datetime', 'timestamp', 'timestamp without time zone'], true)) {
+        if ($driver !== 'sqlite' && in_array($base, ['timestamp with time zone', 'timestamptz'], true)) {
             return 'datetime';
         }
 

@@ -84,11 +84,15 @@ final class Caster
                 throw $this->fail($model, $field, 'Expected a DateTimeImmutable value for database output');
             }
             $utc = $value->setTimezone(new DateTimeZone('UTC'));
-            if ($field->temporal === Temporal::UNIX) {
-                return $utc->getTimestamp();
-            }
 
-            return $utc->format(self::TIME_FORMAT);
+            return match ($field->temporal) {
+                Temporal::DATE => $utc->format('Y-m-d'),
+                Temporal::TEXT_US => $utc->format('Y-m-d H:i:s.u'),
+                Temporal::UNIX => $utc->getTimestamp(),
+                Temporal::UNIX_MS => $utc->getTimestamp() * 1000
+                    + intdiv((int) $utc->format('u'), 1000),
+                default => $utc->format(self::TIME_FORMAT),
+            };
         }
 
         if (is_a($name, \BackedEnum::class, true)) {
@@ -155,14 +159,34 @@ final class Caster
         return $this->toDb($model, $field, $this->toPhp($model, $field, $value));
     }
 
-    /** @internal 自动时间戳统一使用秒级 UTC 值，供单实体与批量写入共用。 */
+    /** @internal 自动时间戳保留旧秒级输入，同时按声明存储提供当前精度。 */
     public function currentTimestamp(FieldMeta $field, ?int $now = null): int|DateTimeImmutable
     {
         if ($field->typeName() === 'int') {
             return $now ?? time();
         }
+        if ($now === null && in_array($field->temporal, [Temporal::TEXT_US, Temporal::UNIX_MS], true)) {
+            $clock = DateTimeImmutable::createFromFormat('U.u', sprintf('%.6F', microtime(true)));
+            if ($clock === false) {
+                throw new \RuntimeException('Unable to read the system clock');
+            }
+
+            return $clock->setTimezone(new DateTimeZone('UTC'));
+        }
 
         return (new DateTimeImmutable('@' . ($now ?? time())))->setTimezone(new DateTimeZone('UTC'));
+    }
+
+    /** @internal 仅供 EntityGateway::toArray() 调用，不参与持久化或字段比较。 */
+    public function formatDisplay(string $model, FieldMeta $field, mixed $value): mixed
+    {
+        if ($value instanceof DateTimeImmutable && $field->temporalDisplayFormat !== null) {
+            return $value->setTimezone(
+                new DateTimeZone($field->temporalDisplayTimezone ?? 'UTC'),
+            )->format($field->temporalDisplayFormat);
+        }
+
+        return $this->toDb($model, $field, $value);
     }
 
     private function toInt(string $model, FieldMeta $field, mixed $value): int
@@ -298,22 +322,58 @@ final class Caster
         if ($value instanceof DateTimeImmutable) {
             return $value;
         }
-        if ($field->temporal === Temporal::UNIX) {
-            if (is_int($value) || (is_string($value) && preg_match('/^-?\d+$/', $value) === 1)) {
+        if (in_array($field->temporal, [Temporal::UNIX, Temporal::UNIX_MS], true)) {
+            if (!is_int($value) && !(is_string($value) && preg_match('/^-?\d+$/D', $value) === 1)) {
+                throw $this->fail($model, $field, 'Cannot parse value as a Unix timestamp');
+            }
+            if ($field->temporal === Temporal::UNIX) {
                 return (new DateTimeImmutable('@' . (int) $value))->setTimezone(new DateTimeZone('UTC'));
             }
-            throw $this->fail($model, $field, 'Cannot parse value as a Unix timestamp');
+            $milliseconds = (int) $value;
+            $seconds = intdiv($milliseconds, 1000);
+            $microseconds = ($milliseconds - $seconds * 1000) * 1000;
+            if ($microseconds < 0) {
+                $seconds--;
+                $microseconds += 1_000_000;
+            }
+            $parsed = DateTimeImmutable::createFromFormat(
+                '!U.u',
+                $seconds . '.' . sprintf('%06d', $microseconds),
+                new DateTimeZone('UTC'),
+            );
+            if ($parsed === false) {
+                throw $this->fail($model, $field, 'Cannot parse value as a Unix millisecond timestamp');
+            }
+
+            return $parsed->setTimezone(new DateTimeZone('UTC'));
         }
         if (!is_string($value)) {
             throw $this->fail($model, $field, 'Temporal database value must be a string');
         }
-        $parsed = DateTimeImmutable::createFromFormat('!' . self::TIME_FORMAT, $value, new DateTimeZone('UTC'));
+        $format = match ($field->temporal) {
+            Temporal::DATE => '!Y-m-d',
+            Temporal::TEXT_US => '!Y-m-d H:i:s.u',
+            default => '!' . self::TIME_FORMAT,
+        };
+        if ($field->temporal === Temporal::TEXT_US) {
+            $value = $this->microsecondText($value);
+        }
+        $parsed = DateTimeImmutable::createFromFormat($format, $value, new DateTimeZone('UTC'));
         $errors = DateTimeImmutable::getLastErrors();
         if ($parsed === false || ($errors['warning_count'] ?? 0) > 0 || ($errors['error_count'] ?? 0) > 0) {
             throw $this->fail($model, $field, 'Cannot parse temporal text');
         }
 
         return $parsed;
+    }
+
+    private function microsecondText(string $value): string
+    {
+        if (preg_match('/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?$/D', $value, $matches) !== 1) {
+            return $value;
+        }
+
+        return $matches[1] . '.' . str_pad($matches[2] ?? '', 6, '0');
     }
 
     private function toEnum(string $model, FieldMeta $field, mixed $value): \BackedEnum
