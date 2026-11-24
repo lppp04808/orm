@@ -713,7 +713,21 @@ PostgreSQL/SQLite 使用 `DELETE ... RETURNING` 读取实际删除主键；MySQL
 
 MySQL 预查与外部并发写之间不提供跨 Session/进程的一致性保证，`isNew()` 状态也不是分布式锁。需要严格并发一致性时，请使用事务、数据库约束和行锁。
 
-### 7.2 跨方言 UPSERT
+### 7.2 字段原子自增 / 自减
+
+```php
+$affected = Order::query()->where('id', 1)->increment('qty');              // qty = qty + 1
+$affected = Order::query()->where('id', 1)->decrement('qty', 2);          // qty = qty - 2
+$affected = Order::query()->where('id', 1)->increment('qty', 3, [
+    'updated_at' => time(),                                                // 在同一条 UPDATE 中更新
+]);
+```
+
+`increment()` 和 `decrement()` 使用一条参数化 SQL UPDATE 完成数据库原子运算，返回受影响行数。`$column` 支持模型属性名或真实列名，必须解析为非主键的 `int` 或 `float` 字段。`$amount` 必须是大于 0 的有限数值；int 字段只接受 int 步长，避免小数被静默截断。`$extra` 沿用 `update()` 的字段解析、主键保护和 Caster 类型转换，不能通过属性名或真实列名再次包含目标列。
+
+这两个方法与条件 `update()` 具有相同的 WHERE 和可写查询限制，保留软删除默认作用域，也可显式使用 `withTrashed()`。声明 `#[Version]` 的模型会被拒绝，因为批量增减无法保证逐实体版本语义。执行后清理该模型的行缓存；需要更新后的实体时应重新查询或调用 `refresh()`。已有实体实例不会被原地修改，也不会触发生命周期钩子。
+
+### 7.3 跨方言 UPSERT
 
 ```php
 Order::upsert($values);                    // 默认主键冲突，更新其余输入字段
@@ -733,7 +747,7 @@ Order::upsert($values, ['qty'], ['key']);  // 显式冲突键
 
 **MySQL 不能指定 conflict target，会响应任意唯一键冲突**。`$conflictColumns` 在 MySQL 只负责输入完整性校验，不会把 SQL 限制为指定索引。代理生成键只有显式作为冲突键时才允许写入。
 
-### 7.3 行锁
+### 7.4 行锁
 
 ```php
 Order::transaction(function (): void {

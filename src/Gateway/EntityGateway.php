@@ -758,6 +758,17 @@ final class EntityGateway
         return $this->bulk->executeUpdate($builder, $values);
     }
 
+    /** @internal 运算符只接受 Builder 传入的受控字面量。 */
+    public function executeDeltaUpdate(
+        Builder $builder,
+        string $column,
+        string $operator,
+        int|float $amount,
+        array $extra = [],
+    ): int {
+        return $this->bulk->executeDeltaUpdate($builder, $column, $operator, $amount, $extra);
+    }
+
     /** 批量恢复时按主键预查实际命中行，只同步这些已交付给调用方的实体。 */
     public function executeRestore(Builder $builder): int
     {

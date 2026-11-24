@@ -10,6 +10,7 @@ use InvalidArgumentException;
 use Pixiaoka\Orm\Cast\Decimal;
 use Pixiaoka\Orm\Exception\RelationException;
 use Pixiaoka\Orm\Gateway\EntityGateway;
+use Pixiaoka\Orm\Metadata\FieldMeta;
 use Pixiaoka\Orm\Relation\Subquery;
 
 /** @internal 结构化 SELECT/UNION/UPDATE/DELETE 的纯编译器；不持有 Builder。 */
@@ -77,15 +78,63 @@ final readonly class SqlCompiler
         $ctx = new RenderContext();
         $sets = [];
         foreach ($set as $column => $value) {
-            $field = $this->resolveField($class, $column);
-            if ($field === null) {
-                throw new InvalidArgumentException('Unknown UPDATE column: ' . $column);
-            }
-            if ($field->primary) {
-                throw new InvalidArgumentException('UPDATE cannot modify primary key column: ' . $field->column);
-            }
+            $field = $this->resolveUpdateField($class, $column);
             $casted = $this->castValue($class, $field->column, $value);
             $sets[] = $this->quote($field->column) . ' = ' . $ctx->bind($casted);
+        }
+        $where = $this->renderWhereClause($class, $state, $ctx);
+        if ($where === '') {
+            throw new InvalidArgumentException('UPDATE WHERE cannot be empty; full-table updates are rejected');
+        }
+        $sql = 'UPDATE ' . $this->quote($meta->table) . ' SET ' . implode(', ', $sets) . $where;
+
+        return ['sql' => $sql, 'params' => $ctx->params()];
+    }
+
+    /** @return array{sql: string, params: array<string, int|float|string|bool|null>} */
+    public function buildDeltaUpdate(
+        string $class,
+        QueryState $state,
+        string $column,
+        string $operator,
+        int|float $amount,
+        array $extra = [],
+    ): array {
+        $this->assertDeferredRelationExecution($state);
+        $this->relations->assertRelationParentSupported($class, $state);
+        $this->assertWritable($state);
+        if ($state->where === [] && $state->orGroups === []) {
+            throw new InvalidArgumentException('UPDATE requires a WHERE condition; full-table updates are rejected');
+        }
+        if (!in_array($operator, ['+', '-'], true)) {
+            throw new InvalidArgumentException('Delta UPDATE operator must be + or -');
+        }
+        if (is_nan($amount) || is_infinite($amount) || $amount <= 0.0) {
+            throw new InvalidArgumentException('Delta UPDATE amount must be a finite number greater than zero');
+        }
+        $field = $this->resolveUpdateField($class, $column);
+        $type = $field->typeName();
+        if (!in_array($type, ['int', 'float'], true)) {
+            throw new InvalidArgumentException('Delta UPDATE column must have an int or float type: ' . $field->column);
+        }
+        if ($type === 'int' && is_float($amount)) {
+            throw new InvalidArgumentException('Delta UPDATE on an int column requires an int amount: ' . $field->column);
+        }
+
+        $meta = $this->gateway->meta($class);
+        $ctx = new RenderContext();
+        $quotedColumn = $this->quote($field->column);
+        $sets = [$quotedColumn . ' = ' . $quotedColumn . ' ' . $operator . ' ' . $ctx->bind($amount)];
+        foreach ($extra as $extraColumn => $value) {
+            if (!is_string($extraColumn)) {
+                throw new InvalidArgumentException('Delta UPDATE extra field names must be strings');
+            }
+            $extraField = $this->resolveUpdateField($class, $extraColumn);
+            if ($extraField->column === $field->column) {
+                throw new InvalidArgumentException('Delta UPDATE extra fields cannot include the target column: ' . $field->column);
+            }
+            $sets[] = $this->quote($extraField->column) . ' = '
+                . $ctx->bind($this->castValue($class, $extraField->column, $value));
         }
         $where = $this->renderWhereClause($class, $state, $ctx);
         if ($where === '') {
@@ -820,7 +869,7 @@ final readonly class SqlCompiler
         return $this->assertScalar($value);
     }
 
-    private function resolveField(string $class, string $column): ?\Pixiaoka\Orm\Metadata\FieldMeta
+    private function resolveField(string $class, string $column): ?FieldMeta
     {
         foreach ($this->gateway->meta($class)->fields as $field) {
             if ($field->column === $column || $field->property === $column) {
@@ -829,6 +878,17 @@ final readonly class SqlCompiler
         }
 
         return null;
+    }
+
+    private function resolveUpdateField(string $class, string $column): FieldMeta
+    {
+        $field = $this->resolveField($class, $column)
+            ?? throw new InvalidArgumentException('Unknown UPDATE column: ' . $column);
+        if ($field->primary) {
+            throw new InvalidArgumentException('UPDATE cannot modify primary key column: ' . $field->column);
+        }
+
+        return $field;
     }
 
     private function assertScalar(mixed $value): int|float|string|bool|null

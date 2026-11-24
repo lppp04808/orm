@@ -236,6 +236,23 @@ final readonly class BulkWriter
         return $affected;
     }
 
+    /** @internal 运算符由 Builder 和 SQL 编译器再次校验，不接受外部 SQL 片段。 */
+    public function executeDeltaUpdate(
+        Builder $builder,
+        string $column,
+        string $operator,
+        int|float $amount,
+        array $extra = [],
+    ): int {
+        $meta = $this->metadata->read($builder->modelClass());
+        $this->assertVersionWrite($meta, 'conditional UPDATE');
+        $query = $builder->buildDeltaUpdate($column, $operator, $amount, $extra);
+        $affected = $this->executor->execute($query['sql'], $query['params'], $meta->class);
+        $this->cache->clearClass($meta->class);
+
+        return $affected;
+    }
+
     /**
      * @param EntityGateway $gateway
      * @param Builder $builder

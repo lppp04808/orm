@@ -681,6 +681,22 @@ final class Builder
         return $this->gateway->executeUpdate($this, $values);
     }
 
+    /** 按条件原子增加数值字段，可附带更新其他字段，返回受影响行数。 */
+    public function increment(string $column, int|float $amount = 1, array $extra = []): int
+    {
+        $this->compiler->assertDeferredRelationExecution($this->state);
+
+        return $this->gateway->executeDeltaUpdate($this, $column, '+', $amount, $extra);
+    }
+
+    /** 按条件原子减少数值字段，可附带更新其他字段，返回受影响行数。 */
+    public function decrement(string $column, int|float $amount = 1, array $extra = []): int
+    {
+        $this->compiler->assertDeferredRelationExecution($this->state);
+
+        return $this->gateway->executeDeltaUpdate($this, $column, '-', $amount, $extra);
+    }
+
     /** 按条件删除，返回受影响行数。无 WHERE 会被拒绝。 */
     public function delete(): int
     {
@@ -762,6 +778,12 @@ final class Builder
     public function buildUpdate(array $set): array
     {
         return $this->compiler->buildUpdate($this->class, $this->state, $set);
+    }
+
+    /** @internal @return array{sql: string, params: array<string, int|float|string|bool|null>} */
+    public function buildDeltaUpdate(string $column, string $operator, int|float $amount, array $extra = []): array
+    {
+        return $this->compiler->buildDeltaUpdate($this->class, $this->state, $column, $operator, $amount, $extra);
     }
 
     /** @return array{sql: string, params: array<string, int|float|string|bool|null>} */

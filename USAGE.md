@@ -713,7 +713,21 @@ PostgreSQL/SQLite use `DELETE ... RETURNING` to read actually deleted keys. MySQ
 
 The MySQL pre-query does not guarantee consistency against external concurrent writes across Sessions/processes, and `isNew()` is not a distributed lock. Use transactions, database constraints, and row locks for strict concurrency.
 
-### 7.2 Cross-dialect UPSERT
+### 7.2 Atomic field increments and decrements
+
+```php
+$affected = Order::query()->where('id', 1)->increment('qty');              // qty = qty + 1
+$affected = Order::query()->where('id', 1)->decrement('qty', 2);          // qty = qty - 2
+$affected = Order::query()->where('id', 1)->increment('qty', 3, [
+    'updated_at' => time(),                                                // Updated in the same UPDATE
+]);
+```
+
+`increment()` and `decrement()` execute one parameterized SQL UPDATE and return affected rows. `$column` accepts a model property or real column name and must resolve to a non-primary-key `int` or `float` field. `$amount` must be a finite number greater than zero; int fields accept only int steps, preventing silent truncation. `$extra` uses the same field resolution, primary-key protection, and Caster conversion as `update()` and cannot include the target column through either its property or real column name.
+
+These methods have the same WHERE and writable-query restrictions as conditional `update()`, retain the default soft-delete scope, and support `withTrashed()`. Models using `#[Version]` are rejected because a bulk delta cannot preserve per-entity version semantics. After execution, the model row cache is invalidated; reread or call `refresh()` when an updated entity is needed. Previously held entity instances are not changed in place, and lifecycle hooks are not invoked.
+
+### 7.3 Cross-dialect UPSERT
 
 ```php
 Order::upsert($values);                    // Default primary-key conflict; update other input fields
@@ -733,7 +747,7 @@ Order::upsert($values, ['qty'], ['key']);  // Explicit conflict key
 
 **MySQL cannot specify a conflict target and responds to any unique-key conflict.** `$conflictColumns` only validates input completeness on MySQL; it does not limit SQL to a particular index. A surrogate generated key may be written only when explicitly used as the conflict key.
 
-### 7.3 Row locks
+### 7.4 Row locks
 
 ```php
 Order::transaction(function (): void {
