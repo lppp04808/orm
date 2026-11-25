@@ -76,6 +76,14 @@ php tests/orm_soak.php --drivers=mysql --duration=20 --workers=1 --fault=worker_
 
 故障注入的 `expected_failure=true` 只表示测试器按预期发现了故障，绝不表示 ORM 通过正常运行。
 
+## 在 GitHub Actions 运行
+
+在仓库的 **Actions → Soak → Run workflow** 中可手动调整时长、每库并发进程数、驱动、操作间隔和故障注入。默认双库运行 1800 秒（30 分钟）、每库 2 个进程；手动时长上限为 18000 秒，给最终审计和产物上传留出时间。故障注入只能选择单 MySQL 驱动，按预期检测到的故障不会计为工作流失败。
+
+工作流每周日 03:00 UTC 定时运行一次，固定使用默认双库正常负载，不启用故障注入；同一分支的任务不会并发争抢数据库资源。运行结束后，在该次运行的 Artifacts 区域下载 `soak-reports`，其中保留完整 `build/soak` 目录 14 天，包含 `summary.json`、事件流、worker 日志和 stdout/stderr；即使运行失败也会尝试生成摘要并上传产物。
+
+GitHub 托管 runner 单次 job 上限为 6 小时，因此这里不适合运行 8 小时过夜任务。需要更长浸泡时，请按上面的本地示例在独立测试环境运行，并保留实际时长与审计报告。
+
 ## 报告与安全
 
 每次运行目录包含：

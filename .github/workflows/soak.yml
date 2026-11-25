@@ -1,0 +1,160 @@
+name: Soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Planned load duration in seconds (10-18000; leave time for final audits)'
+        required: true
+        type: string
+        default: '1800'
+      workers:
+        description: 'Independent worker processes per database (1-8)'
+        required: true
+        type: string
+        default: '2'
+      drivers:
+        description: 'Real database drivers'
+        required: true
+        type: choice
+        options: ['mysql,pgsql', 'mysql', 'pgsql']
+        default: 'mysql,pgsql'
+      delay_ms:
+        description: 'Delay between operations in milliseconds (non-negative integer)'
+        required: true
+        type: string
+        default: '10'
+      fault:
+        description: 'Fault injection; requires the single mysql driver'
+        required: true
+        type: choice
+        options: ['none', 'ledger', 'worker_crash']
+        default: 'none'
+  schedule:
+    - cron: '0 3 * * 0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: PHP 8.3 / real database soak
+    runs-on: ubuntu-latest
+    # Below the hosted runner's 360-minute limit; retain time for audits/uploads.
+    timeout-minutes: 330
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: local-only-password
+          MYSQL_DATABASE: orm_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -plocal-only-password"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: local-only-password
+          POSTGRES_DB: orm_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready -U postgres -d orm_test"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo, pdo_sqlite, pdo_mysql, pdo_pgsql
+          coverage: none
+      - uses: ramsey/composer-install@v3
+      - name: Validate soak parameters
+        env:
+          DURATION: ${{ github.event_name == 'schedule' && '1800' || inputs.duration }}
+          WORKERS: ${{ github.event_name == 'schedule' && '2' || inputs.workers }}
+          DRIVERS: ${{ github.event_name == 'schedule' && 'mysql,pgsql' || inputs.drivers }}
+          DELAY_MS: ${{ github.event_name == 'schedule' && '10' || inputs.delay_ms }}
+          FAULT: ${{ github.event_name == 'schedule' && 'none' || inputs.fault }}
+        run: |
+          [[ "$DURATION" =~ ^[0-9]+$ ]] || { echo 'DURATION must be a positive integer'; exit 2; }
+          (( DURATION >= 10 && DURATION <= 18000 )) || { echo 'DURATION must be between 10 and 18000'; exit 2; }
+          [[ "$WORKERS" =~ ^[0-9]+$ ]] || { echo 'WORKERS must be a positive integer'; exit 2; }
+          (( WORKERS >= 1 && WORKERS <= 8 )) || { echo 'WORKERS must be between 1 and 8'; exit 2; }
+          [[ "$DELAY_MS" =~ ^[0-9]+$ ]] || { echo 'DELAY_MS must be a non-negative integer'; exit 2; }
+          [[ "$DRIVERS" == 'mysql,pgsql' || "$DRIVERS" == 'mysql' || "$DRIVERS" == 'pgsql' ]] || { echo 'Invalid DRIVERS'; exit 2; }
+          [[ "$FAULT" == 'none' || "$FAULT" == 'ledger' || "$FAULT" == 'worker_crash' ]] || { echo 'Invalid FAULT'; exit 2; }
+          if [[ "$FAULT" != 'none' && "$DRIVERS" != 'mysql' ]]; then
+            echo 'Fault injection requires DRIVERS=mysql'
+            exit 2
+          fi
+      - name: Run real database soak
+        env:
+          DURATION: ${{ github.event_name == 'schedule' && '1800' || inputs.duration }}
+          WORKERS: ${{ github.event_name == 'schedule' && '2' || inputs.workers }}
+          DRIVERS: ${{ github.event_name == 'schedule' && 'mysql,pgsql' || inputs.drivers }}
+          DELAY_MS: ${{ github.event_name == 'schedule' && '10' || inputs.delay_ms }}
+          FAULT: ${{ github.event_name == 'schedule' && 'none' || inputs.fault }}
+          PIXIAOKA_ORM_SOAK_MYSQL_DSN: mysql:host=127.0.0.1;port=3306;dbname=orm_test;charset=utf8mb4
+          PIXIAOKA_ORM_SOAK_MYSQL_USER: root
+          PIXIAOKA_ORM_SOAK_MYSQL_PASSWORD: local-only-password
+          PIXIAOKA_ORM_SOAK_PGSQL_DSN: pgsql:host=127.0.0.1;port=5432;dbname=orm_test
+          PIXIAOKA_ORM_SOAK_PGSQL_USER: postgres
+          PIXIAOKA_ORM_SOAK_PGSQL_PASSWORD: local-only-password
+        run: |
+          mkdir -p build/soak
+          status=0
+          php tests/orm_soak.php \
+            "--duration=$DURATION" \
+            "--workers=$WORKERS" \
+            "--drivers=$DRIVERS" \
+            "--delay-ms=$DELAY_MS" \
+            "--sample=10" \
+            "--audit-interval=60" \
+            "--output=build/soak" \
+            "--fault=$FAULT" || status=$?
+          # A fault-injection run must fail for the expected reason, not pass normally.
+          if [[ "$FAULT" != 'none' ]]; then
+            [[ "$status" -eq 1 ]] || { echo "Fault injection expected exit 1, got $status"; exit 2; }
+            exit 0
+          fi
+          exit "$status"
+      - name: Write soak summary
+        if: always()
+        shell: bash
+        run: |
+          summary=$(find build/soak -type f -name summary.json -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)
+          if [[ -z "$summary" ]]; then
+            echo 'No soak summary.json was generated.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          php -- "$summary" "$GITHUB_STEP_SUMMARY" <<'PHP'
+          <?php
+          $report = json_decode((string) file_get_contents($argv[1]), true, 512, JSON_THROW_ON_ERROR);
+          $ok = ($report["ok"] ?? false) ? "true" : "false";
+          $failures = $report["failures"] ?? [];
+          $lines = [
+              "## Soak summary",
+              "- Result: " . $ok,
+              "- Planned seconds: " . ($report["planned_seconds"] ?? "unknown"),
+              "- Actual seconds: " . ($report["actual_seconds"] ?? "unknown"),
+              "- Stop reason: " . ($report["stop_reason"] ?? "unknown"),
+              "- Failure count: " . count($failures),
+          ];
+          if (($report["expected_failure"] ?? false) === true) {
+              $lines[] = "- Expected fault injection detected: true";
+          }
+          file_put_contents($argv[2], implode(PHP_EOL, $lines) . PHP_EOL, FILE_APPEND);
+          PHP
+      - name: Upload soak reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-reports
+          path: build/soak
+          if-no-files-found: warn
+          retention-days: 14
