@@ -22,8 +22,8 @@ final class SqlDialectLexerTest extends TestCase
     public function testPostgresJsonOperatorsAndNestedCommentsPreserveAllBoundParameters(): void
     {
         $sql = <<<'SQL'
-SELECT data #> :path AS inner_json,
-       data #>> :text_path AS inner_text,
+SELECT data #> :path::text[] AS inner_json,
+       data #>> :text_path::text[] AS inner_text,
        value::jsonb #>> '{name}' AS literal_text
 FROM payload
 /* outer :unused /* nested :also_unused */ still outer :unused */
@@ -116,15 +116,19 @@ SQL;
         }
         $pdo = new PDO($dsn, getenv('PIXIAOKA_ORM_LIVE_PGSQL_USER') ?: null, getenv('PIXIAOKA_ORM_LIVE_PGSQL_PASSWORD') ?: null);
         $connection = new PdoConnection($pdo);
-        $row = $connection->queryOne(<<<'SQL'
+        $sql = <<<'SQL'
 SELECT $tag$:not_a_parameter$tag$ AS body,
        :actual::int AS value,
-       /* outer /* :not_a_parameter */ :not_a_parameter */ E'\\':not_a_parameter' AS escaped
-SQL, ['actual' => 42]);
+       /* outer /* :not_a_parameter */ :not_a_parameter */
+SQL;
+        $row = $connection->queryOne(
+            $sql . " E'" . chr(92) . "':not_a_parameter' AS escaped",
+            ['actual' => 42],
+        );
         self::assertNotNull($row);
         self::assertSame(':not_a_parameter', $row['body']);
         self::assertSame(42, (int) $row['value']);
-        self::assertSame(":not_a_parameter", $row['escaped']);
+        self::assertSame("':not_a_parameter", $row['escaped']);
     }
 
     public function testRealPostgresJsonOperatorsAndCommentsBindEveryOccurrence(): void
@@ -136,7 +140,7 @@ SELECT data #> :path AS inner_json,
        data::jsonb #>> '{name}' AS literal_text
 FROM (SELECT '{"a":{"name":"Pixiaoka"},"name":"root"}'::jsonb AS data) AS payload
 /* outer :unused /* nested :also_unused */ still outer :unused */
-WHERE :id = :id
+WHERE :id::int = :id::int
 SQL, ['path' => '{a}', 'text_path' => '{a,name}', 'id' => 7]);
         self::assertNotNull($row);
         self::assertSame(['name' => 'Pixiaoka'], json_decode((string) $row['inner_json'], true, 512, JSON_THROW_ON_ERROR));
@@ -147,13 +151,13 @@ SQL, ['path' => '{a}', 'text_path' => '{a,name}', 'id' => 7]);
     public function testRealMysqlHashCommentAndBackslashPreserveBoundValues(): void
     {
         $connection = $this->liveConnection('mysql');
-        $row = $connection->queryOne(<<<'SQL'
-SELECT '\\':not_a_parameter' AS escaped, :first AS first_value, :second AS second_value # :not_a_parameter
-SQL, ['first' => "O'Reilly\\books", 'second' => 7]);
+        $sql = "SELECT '" . chr(92) . "'escaped' AS escaped_result, :first AS first_result, "
+            . ":second AS second_result # :not_a_parameter\n";
+        $row = $connection->queryOne($sql, ['first' => "O'Reilly\\books", 'second' => 7]);
         self::assertNotNull($row);
-        self::assertSame(':not_a_parameter', $row['escaped']);
-        self::assertSame("O'Reilly\\books", $row['first_value']);
-        self::assertSame(7, (int) $row['second_value']);
+        self::assertSame("'escaped", $row['escaped_result']);
+        self::assertSame("O'Reilly\\books", $row['first_result']);
+        self::assertSame(7, (int) $row['second_result']);
     }
 
     private function liveConnection(string $driver): PdoConnection

@@ -125,6 +125,103 @@ final class SqlLexer
         return $out;
     }
 
+    /** Mask comment pseudo-parameters for PDO; convert dollar-quoted text to an E string. */
+    public static function normalizePostgresForPdo(string $sql): string
+    {
+        $out = '';
+        $length = strlen($sql);
+        $blockDepth = 0;
+        $state = 'sql';
+        for ($i = 0; $i < $length; $i++) {
+            $char = $sql[$i];
+            $next = $sql[$i + 1] ?? '';
+            if ($state === 'line') {
+                $out .= $char;
+                if ($char === "\n" || $char === "\r") {
+                    $state = 'sql';
+                }
+                continue;
+            }
+            if ($state === 'block') {
+                if ($char === '/' && $next === '*') {
+                    $out .= '/*';
+                    $i++;
+                    $blockDepth++;
+                } elseif ($char === '*' && $next === '/') {
+                    $out .= '*/';
+                    $i++;
+                    if (--$blockDepth === 0) {
+                        $state = 'sql';
+                    }
+                } else {
+                    // PDO can count pseudo-parameters in nested comments even
+                    // when they occur after its own apparent closing delimiter.
+                    $out .= $char === ':' && preg_match('/[A-Za-z_]/', $next) === 1 ? ';' : $char;
+                }
+                continue;
+            }
+            if ($state !== 'sql') {
+                if ($char === ':' && $state === 'E' && preg_match('/[A-Za-z_]/', $next) === 1) {
+                    // PDO does not reliably honor backslash-escaped E quotes.
+                    // Hexadecimal escaping keeps the returned colon identical.
+                    $out .= '\\x3A';
+                    continue;
+                }
+                $out .= $char;
+                if ($char === '\\' && $state === 'E' && $next !== '') {
+                    $out .= $next;
+                    $i++;
+                    continue;
+                }
+                $quote = $state === 'E' ? "'" : $state;
+                if ($char === $quote) {
+                    if ($next === $char) {
+                        $out .= $next;
+                        $i++;
+                    } else {
+                        $state = 'sql';
+                    }
+                }
+                continue;
+            }
+            if ($char === "'") {
+                $out .= $char;
+                $state = self::isEscapeStringPrefix($sql, $i) ? 'E' : "'";
+            } elseif ($char === '"' || $char === '`') {
+                $out .= $char;
+                $state = $char;
+            } elseif ($char === '-' && $next === '-') {
+                $out .= '--';
+                $i++;
+                $state = 'line';
+            } elseif ($char === '/' && $next === '*') {
+                $out .= '/*';
+                $i++;
+                $blockDepth = 1;
+                $state = 'block';
+            } elseif ($char === '$'
+                && preg_match('/\G\$([A-Za-z_][A-Za-z0-9_]*)?\$/', $sql, $match, 0, $i) === 1) {
+                $tag = $match[0];
+                $start = $i + strlen($tag);
+                $end = strpos($sql, $tag, $start);
+                if ($end === false) {
+                    $out .= substr($sql, $i);
+                    break;
+                }
+                $content = substr($sql, $start, $end - $start);
+                if ($i > 0 && preg_match('/[A-Za-z0-9_$]/', $sql[$i - 1]) === 1) {
+                    $out .= ' ';
+                }
+                $out .= "E'" . str_replace(["\\", "'"], ["\\\\", "''"], $content) . "'";
+                $i = $end + strlen($tag) - 1;
+            } else {
+                $out .= $char;
+            }
+        }
+
+        return $out;
+    }
+
     /** @param callable(string): string $replace */
     private static function scan(string $sql, string $driver, callable $replace): string
     {

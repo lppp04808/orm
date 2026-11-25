@@ -127,13 +127,14 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
     }
 
     /**
-     * pdo_pgsql 会误把 dollar-quoted 文本里的 :name 当成绑定参数，导致服务端参数编号错位。
-     * 在交给 PDO 前把完整文本转换为等价的 SQL 字符串字面量；不改变开发者 SQL 或参数值。
+     * pdo_pgsql 会误把 dollar-quoted 文本和块注释里的 :name 当成绑定参数，导致
+     * 服务端参数编号错位。交给 PDO 前将完整文本转换为等价的转义字符串字面量，
+     * 并屏蔽注释内的伪参数标记；不改变开发者 SQL、注释内容或有效参数值。
      * 未闭合的 $tag$ 原样保留，由数据库报告语法错误，不能悄悄吞掉后续 SQL。
      */
     private function normalizePgDollarQuotes(string $sql): string
     {
-        return \Pixiaoka\Orm\Sql\SqlLexer::normalizePostgresDollarQuotes($sql);
+        return \Pixiaoka\Orm\Sql\SqlLexer::normalizePostgresForPdo($sql);
     }
 
     public function lastInsertId(): string
