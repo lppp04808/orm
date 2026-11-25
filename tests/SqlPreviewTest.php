@@ -322,7 +322,7 @@ $$:q0$$ AS dollar,
 $tag$:q0$tag$ AS tagged
 SQL;
         $query = PreviewPlainRecord::query()
-            ->selectRaw($projection)
+            ->selectRaw($projection, ['q0' => 'dollar value'])
             ->whereRaw("id = :actual::int AND ':q0' = ':q0' /* :q0 */ -- :q0\n", ['actual' => 7]);
         $sql = $query->preview()->rows();
 
@@ -332,8 +332,8 @@ SQL;
         self::assertStringContainsString('"""escaped"""', $sql);
         self::assertStringContainsString('`:q0` AS backtick', $sql);
         self::assertStringContainsString('```escaped```', $sql);
-        self::assertStringContainsString('$$:q0$$', $sql);
-        self::assertStringContainsString('$tag$:q0$tag$', $sql);
+        self::assertStringContainsString("$$'dollar value'$$", $sql);
+        self::assertStringContainsString('$tag$\'dollar value\'$tag$', $sql);
         self::assertStringContainsString('WHERE id = 7::int', $sql);
         self::assertStringContainsString("':q0' = ':q0'", $sql);
         self::assertStringContainsString('/* :q0 */', $sql);

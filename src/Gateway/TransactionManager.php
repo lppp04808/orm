@@ -109,11 +109,13 @@ final class TransactionManager
             // 旧装饰器没有物理保存点能力，维持原公共 transaction() 的“复用外层”契约。
             return $func();
         }
-        if (isset($this->transactionFailuresByContext[$ctx])) {
-            throw $this->transactionFailuresByContext[$ctx];
-        }
-
         if ($depth === 0) {
+            // A top-level transaction may follow a completed discard; stale failure
+            // markers must not permanently lock this Context. Poisoned connections
+            // are still rejected independently by assertConnectionUsable().
+            if ($this->transactionFailuresByContext !== null) {
+                unset($this->transactionFailuresByContext[$ctx]);
+            }
             $this->resetTransactionDepthTracking($ctx);
             Session::clearRollbackStatus($ctx, $sessionName);
             if ($this->confirmedRollbacks !== null) {
@@ -221,16 +223,13 @@ final class TransactionManager
                 }
                 if ($firstFailure !== null) {
                     // 内层或提交前检查已抛出首个失败，原样穿过剩余事务栈。
+                    $failure = $firstFailure;
                     $rollbackAttempted = $begun;
                     $discardAttempted = true;
                     $rollbackFailure = $firstFailure;
                     throw $firstFailure;
                 }
                 $failure = $e;
-                if ($e instanceof TransactionException && $this->transactionDepth($ctx) === 0
-                    && !Session::rollbackConfirmed($ctx, $sessionName)) {
-                    $rollbackAttempted = true;
-                }
                 if ($commitAttempted) {
                     $this->observeTransaction('commit', $ctx, $startedAt, $e);
                 }

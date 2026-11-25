@@ -1665,7 +1665,7 @@ function runRelationScenarios(string $driver, PDO $pdo, Check $check): void
         for ($index = 0; $index < 500; $index++) {
             $badRows[] = ['name' => 'prevalidated-' . $index];
         }
-        // 生成主键现在按契约单独拒绝；这里继续使用普通字段非法值验证整批类型预检。
+        // Generated keys have a separate contract; use an invalid ordinary field to verify whole-batch type prevalidation.
         $badRows[] = ['name' => ['invalid']];
         $inserts = 0;
         $unsubscribeInserts = $gateway->subscribe(static function (Event $event) use (&$inserts): void {

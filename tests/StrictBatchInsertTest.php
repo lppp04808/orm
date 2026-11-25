@@ -4,9 +4,13 @@ declare(strict_types=1);
 
 namespace Tests\Pixiaoka\Orm;
 
+use Pixiaoka\Orm\Cache\RowCache;
+use Pixiaoka\Orm\Exception\TransactionException;
 use Pixiaoka\Orm\Gateway\Connection;
 use Pixiaoka\Orm\Gateway\DriverAwareConnection;
 use Pixiaoka\Orm\Gateway\EntityGateway;
+use Pixiaoka\Orm\Gateway\ManagedConnection;
+use Pixiaoka\Orm\Gateway\PdoConnection;
 use Pixiaoka\Orm\Session;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -128,10 +132,80 @@ final class StrictBatchInsertTest extends TestCase
         }
     }
 
+    public function testTopLevelCommitFailureRetainsPublishedBatchStateAndFlushesCache(): void
+    {
+        $connection = new BatchCommitFailureConnection(new PdoConnection($this->pdo));
+        $gateway = new EntityGateway($connection);
+        Session::use($gateway);
+        $first = new BatchGeneratedRecord();
+        $first->body = 'first';
+        $second = new BatchGeneratedRecord();
+        $second->body = 'second';
+
+        try {
+            BatchGeneratedRecord::insertAll([$first, $second]);
+            self::fail('A failed top-level COMMIT must report an unknown transaction outcome');
+        } catch (TransactionException $e) {
+            self::assertSame('commit', $e->operation);
+            self::assertSame($connection->commitFailure, $e->getPrevious());
+        }
+
+        self::assertSame(2, $this->rowCount('batch_generated'), 'The injected failure occurs after the physical COMMIT');
+        foreach ([$first, $second] as $index => $row) {
+            self::assertFalse($row->isNew());
+            self::assertSame($gateway, $row->boundGateway());
+            self::assertGreaterThan(0, $row->id);
+            self::assertSame(1, $row->afterSaves);
+            self::assertSame(1, $row->afterInserts);
+            self::assertSame($index === 0 ? 'first' : 'second', $row->takeOriginal()['body']);
+        }
+        $cache = (new \ReflectionProperty(EntityGateway::class, 'cache'))->getValue($gateway);
+        self::assertInstanceOf(RowCache::class, $cache);
+        self::assertSame([], $cache->transactionSnapshot()['items']);
+        self::assertSame([], $cache->known());
+
+        try {
+            BatchGeneratedRecord::find(['id' => $first->id]);
+            self::fail('A connection with an unknown COMMIT outcome must not be reused');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('do not reuse this connection', $e->getMessage());
+        }
+        Session::discard();
+    }
+
     private function rowCount(string $table): int
     {
         return (int) $this->pdo->query('SELECT COUNT(*) FROM ' . $table)->fetchColumn();
     }
+}
+
+/** Commits through PDO before reporting a transport failure; the database outcome is deliberately uncertain. */
+final class BatchCommitFailureConnection implements ManagedConnection
+{
+    public readonly \RuntimeException $commitFailure;
+
+    public function __construct(private readonly PdoConnection $inner)
+    {
+        $this->commitFailure = new \RuntimeException('commit outcome unknown');
+    }
+
+    public function execute(string $sql, array $params): int { return $this->inner->execute($sql, $params); }
+    public function queryOne(string $sql, array $params): ?array { return $this->inner->queryOne($sql, $params); }
+    public function queryAll(string $sql, array $params): array { return $this->inner->queryAll($sql, $params); }
+    public function lastInsertId(): string { return $this->inner->lastInsertId(); }
+    public function quoteIdentifier(string $identifier): string { return $this->inner->quoteIdentifier($identifier); }
+    public function supportsReturning(): bool { return $this->inner->supportsReturning(); }
+    public function beginTransaction(): bool { return $this->inner->beginTransaction(); }
+
+    public function commit(): bool
+    {
+        $this->inner->commit();
+        throw $this->commitFailure;
+    }
+
+    public function rollback(): bool { return $this->inner->rollback(); }
+    public function ping(): bool { return $this->inner->ping(); }
+    public function forceRollback(): bool { return $this->inner->forceRollback(); }
 }
 
 final class BatchAliasRecord extends \Pixiaoka\Orm\Entity

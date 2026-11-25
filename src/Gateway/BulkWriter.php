@@ -41,8 +41,11 @@ final readonly class BulkWriter
 
         $meta = $this->metadata->read($class);
         $generated = $meta->generatedField();
+        /** @var array<string, FieldMeta> $columns */
+        $columns = [];
         $fieldList = [];
         foreach ($meta->fields as $field) {
+            $columns[$field->column] ??= $field;
             if ($field->generated) {
                 continue;
             }
@@ -59,7 +62,7 @@ final readonly class BulkWriter
         // 数组值、实体类型、新旧状态和归属先预检；失败批次不提前绑定新实体。
         foreach ($rows as $index => $row) {
             if (!$row instanceof Entity) {
-                $prepared[$index] = $this->prepareBatchRow($meta, $fieldList, $row, $now);
+                $prepared[$index] = $this->prepareBatchRow($meta, $columns, $fieldList, $row, $now);
                 continue;
             }
             if (!$row instanceof $class) {
@@ -93,25 +96,25 @@ final readonly class BulkWriter
             $this->fillVersion($row, $meta);
             $row->beforeSave();
             $row->beforeInsert();
-            $prepared[$index] = $this->prepareBatchRow($meta, $fieldList, $row, $now);
+            $prepared[$index] = $this->prepareBatchRow($meta, $columns, $fieldList, $row, $now);
         }
         ksort($prepared);
 
         // SQL 严格保留原始混批行序。所有分块共享一个事务边界，
         // 任一条 SQL 失败都不能留下已提交的前置分块。
         $this->gatewayTransaction($gateway, function () use (
-            $gateway, $class, $prepared, $fieldList, $generated, $entities, $cacheSet,
+            $gateway, $meta, $prepared, $fieldList, $generated, $entities, $cacheSet,
         ): void {
             $chunkSize = max(1, min(500, intdiv(65535, max(1, count($fieldList)))));
             $generatedIds = [];
             foreach (array_chunk($prepared, $chunkSize, true) as $chunk) {
-                $ids = $this->executeBatchChunk($this->metadata->read($class), $generated, $fieldList, array_values($chunk));
+                $ids = $this->executeBatchChunk($meta, $generated, $fieldList, array_values($chunk));
                 foreach (array_keys($chunk) as $position => $index) {
                     $generatedIds[$index] = $ids[$position] ?? null;
                 }
             }
             foreach ($entities as $index => $row) {
-                $this->publishBatchEntity($gateway, $row, $this->metadata->read($class), $generated, $generatedIds[$index] ?? null, $cacheSet);
+                $this->publishBatchEntity($gateway, $row, $meta, $generated, $generatedIds[$index] ?? null, $cacheSet);
             }
         });
     }
@@ -122,12 +125,12 @@ final readonly class BulkWriter
         $gateway->transaction($work);
     }
 
-    /** @param list<FieldMeta> $fieldList @return list<int|float|string|null> */
-    private function prepareBatchRow(ModelMeta $meta, array $fieldList, array|Entity $row, int $now): array
+    /** @param array<string, FieldMeta> $columns @param list<FieldMeta> $fieldList @return list<int|float|string|null> */
+    private function prepareBatchRow(ModelMeta $meta, array $columns, array $fieldList, array|Entity $row, int $now): array
     {
         $isEntity = $row instanceof Entity;
         if (!$isEntity) {
-            $resolved = $this->resolveArrayBatchFields($meta, $row);
+            $resolved = $this->resolveArrayBatchFields($meta, $columns, $row);
         }
         $values = [];
         foreach ($meta->fields as $field) {
@@ -164,13 +167,9 @@ final readonly class BulkWriter
         return $values;
     }
 
-    /** @return array<string, mixed> 属性名 => 原始输入值，重复来源不得按优先级吞掉。 */
-    private function resolveArrayBatchFields(ModelMeta $meta, array $row): array
+    /** @param array<string, FieldMeta> $columns @return array<string, mixed> 属性名 => 原始输入值，重复来源不得按优先级吞掉。 */
+    private function resolveArrayBatchFields(ModelMeta $meta, array $columns, array $row): array
     {
-        $columns = [];
-        foreach ($meta->fields as $field) {
-            $columns[$field->column] ??= $field;
-        }
         $resolved = [];
         $sources = [];
         foreach ($row as $key => $value) {

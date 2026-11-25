@@ -523,11 +523,21 @@ final class OrmComplexEdgeTest extends TestCase
         self::assertSame(7, (int) $row['y']);
     }
 
-    public function testRawIgnoresPostgresDollarQuotedText(): void
+    public function testRawTreatsDollarQuotesAccordingToDriver(): void
     {
-        $sql = 'SELECT $fn$:not_a_param$fn$ AS literal';
-        $built = ComplexOrder::query()->selectRaw($sql)->build();
-        self::assertSame('SELECT ' . $sql . ' FROM "complex_order"', $built['sql']);
+        $sql = 'SELECT $fn$:not_a_param$fn$ AS literal, :value AS value';
+        $built = ComplexOrder::query()->selectRaw($sql, [
+            'not_a_param' => 'SQLite text',
+            'value' => 7,
+        ])->build();
+        $expected = str_replace([':not_a_param', ':value'], [':q0', ':q1'], $sql);
+        self::assertSame('SELECT ' . $expected . ' FROM "complex_order"', $built['sql']);
+        self::assertSame(['q0' => 'SQLite text', 'q1' => 7], $built['params']);
+
+        Session::use(new EntityGateway(new FakeDialectConnection('pgsql')));
+        $literal = 'SELECT $fn$:not_a_param$fn$ AS literal';
+        $built = ComplexOrder::query()->selectRaw($literal)->build();
+        self::assertSame('SELECT ' . $literal . ' FROM "complex_order"', $built['sql']);
         self::assertSame([], $built['params']);
     }
 

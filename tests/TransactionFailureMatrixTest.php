@@ -172,6 +172,44 @@ final class TransactionFailureMatrixTest extends TestCase
         self::assertFalse($connection->pdo->inTransaction());
     }
 
+    public function testCaughtInnerFailureWithOuterBusinessExceptionRetainsFirstRollbackFailure(): void
+    {
+        $connection = new MatrixConnection(
+            rollbackResult: false,
+            rollbackFailure: new \RuntimeException('inner rollback failure'),
+            performFailedRollback: false,
+        );
+        $gateway = $this->bind($connection);
+        $innerFailure = null;
+        $outerFailure = new \DomainException('outer business failure');
+
+        try {
+            $gateway->transaction(static function () use ($gateway, &$innerFailure, $outerFailure): void {
+                try {
+                    $gateway->transaction(static function (): void {
+                        throw new \RuntimeException('inner business failure');
+                    });
+                } catch (TransactionException $e) {
+                    $innerFailure = $e;
+                }
+                throw $outerFailure;
+            });
+            self::fail('The first unknown rollback outcome must not be superseded by the outer callback');
+        } catch (TransactionException $e) {
+            self::assertSame($innerFailure, $e->getPrevious());
+            self::assertSame($outerFailure, $e->businessException);
+        }
+
+        self::assertSame(['begin', 'begin', 'rollback'], $connection->transactionCalls);
+        self::assertSame([
+            ['begin', true, null],
+            ['begin', true, null],
+            ['rollback', false, TransactionException::class],
+        ], $this->transactionEvents($connection->events));
+        $this->assertPoisonedConnection($connection, $gateway);
+        $this->assertDiscardCleansFailedSession($gateway, $connection);
+    }
+
     public function testPdoLostPhysicalTransactionCaughtInsideCallbackPoisonsConnection(): void
     {
         $connection = new PdoConnection(new PDO('sqlite::memory:'));

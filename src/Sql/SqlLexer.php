@@ -43,21 +43,9 @@ final class SqlLexer
         $length = strlen($sql);
         $blockDepth = 0;
         $state = 'sql';
-        /** @var string|null $delimiter */
-        $delimiter = null;
         for ($i = 0; $i < $length; $i++) {
             $char = $sql[$i];
             $next = $sql[$i + 1] ?? '';
-            if ($delimiter !== null) {
-                if (substr($sql, $i, strlen($delimiter)) === $delimiter) {
-                    $out .= $delimiter;
-                    $i += strlen($delimiter) - 1;
-                    $delimiter = null;
-                } else {
-                    $out .= $char;
-                }
-                continue;
-            }
             if ($state === 'line') {
                 $out .= $char;
                 if ($char === "\n" || $char === "\r") {
@@ -83,7 +71,7 @@ final class SqlLexer
             }
             if ($state !== 'sql') {
                 $out .= $char;
-                if ($char === '\\' && ($state === "'" || $state === 'E') && $next !== '') {
+                if ($char === '\\' && $state === 'E' && $next !== '') {
                     $out .= $next;
                     $i++;
                     continue;
@@ -124,6 +112,9 @@ final class SqlLexer
                     break;
                 }
                 $content = substr($sql, $start, $end - $start);
+                if ($i > 0 && preg_match('/[A-Za-z0-9_$]/', $sql[$i - 1]) === 1) {
+                    $out .= ' ';
+                }
                 $out .= "E'" . str_replace(["\\", "'"], ["\\\\", "''"], $content) . "'";
                 $i = $end + strlen($tag) - 1;
             } else {
@@ -164,7 +155,7 @@ final class SqlLexer
             }
             if ($state === 'block') {
                 $out .= $char;
-                if ($char === '/' && $next === '*') {
+                if ($driver === 'pgsql' && $char === '/' && $next === '*') {
                     $out .= $next;
                     $i++;
                     $blockDepth++;
@@ -198,7 +189,7 @@ final class SqlLexer
                 continue;
             }
 
-            if ($char === '$'
+            if ($driver === 'pgsql' && $char === '$'
                 && preg_match('/\G\$([A-Za-z_][A-Za-z0-9_]*)?\$/', $sql, $match, 0, $i) === 1) {
                 $delimiter = $match[0];
                 $out .= $delimiter;
