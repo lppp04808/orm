@@ -524,6 +524,30 @@ $u->delete();
 $u->save();  // INSERT again
 ```
 
+### fromArray() — construct an unpersisted entity
+
+```php
+// Property names and real database column names may be mixed.
+$user = User::fromArray([
+    'name' => 'Alice',
+    'age' => '28',
+]);
+
+// Unknown keys are rejected by default; true skips only unknown keys.
+$user = User::fromArray($requestData, ignoreUnknown: true);
+
+$user->isNew(); // true
+$user->save();  // Uses the normal INSERT path inside an explicit Session.
+```
+
+`fromArray()` invokes the ordinary constructor with `new static()`. Constructor-initialized defaults and uninitialized properties are preserved for fields absent from the input. The result has no Gateway binding and an empty original-value snapshot. Construction requires no active Session and performs no database operation, RowCache write, or entity lifecycle hook. Saving later still requires a Session, uses the normal insert rules, and refills a generated key.
+
+Only properties annotated with `#[Column]` are accepted, through either their PHP property names or real column names. Ordinary properties, relation methods, and internal `orm*` state are unknown keys. Non-string keys and providing the same field through both aliases always throw `InvalidArgumentException`, even if the values are equal or `ignoreUnknown` is enabled. Unknown keys throw by default; `ignoreUnknown: true` skips them without relaxing any other validation.
+
+Every accepted value is converted through the same strict Caster as database hydration. Scalars, arrays/JSON, temporal storage values, backed enums, Decimal, Castable, nullable fields, and already-instantiated target value objects are supported; conversion failures remain `CastException`. All keys, duplicate-field checks, and conversions must succeed before any property is assigned. A model constructor must be compatible with the base Entity constructor, normally a public zero-argument constructor.
+
+For fields without a custom temporal display format, `toArray()` output uses real column names and stored scalar representations and can be passed back to `fromArray()`. A custom `displayFormat` is presentation-only and need not be parseable as the field's storage value. An unbound entity's `toArray()` still requires a Session, just like an entity created with `new`.
+
 ### insert() — forced insertion
 
 ```php

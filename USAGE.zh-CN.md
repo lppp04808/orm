@@ -524,6 +524,30 @@ $u->delete();
 $u->save();  // 重新 INSERT
 ```
 
+### fromArray() —— 构造未持久化实体
+
+```php
+// 支持 PHP 属性名与真实数据库列名，也可混用。
+$user = User::fromArray([
+    'name' => '张三',
+    'age' => '28',
+]);
+
+// 默认拒绝未知键；true 只跳过未知键。
+$user = User::fromArray($requestData, ignoreUnknown: true);
+
+$user->isNew(); // true
+$user->save();  // 在显式 Session 中走正常 INSERT 路径。
+```
+
+`fromArray()` 通过 `new static()` 调用普通构造器。输入未提供的字段保留构造器设置的默认值和未初始化状态。返回实体没有 Gateway 绑定，原始值快照为空。构造本身不需要活跃 Session，不执行数据库操作、不写 RowCache，也不触发生命周期钩子；之后调用 `save()` 仍需 Session，并遵循正常插入规则、回填生成键。
+
+仅接受带 `#[Column]` 的字段，可使用 PHP 属性名或真实列名。普通属性、关系方法和内部 `orm*` 状态均属于未知键。非字符串键、同一字段同时通过属性名和列名出现，一律抛出 `InvalidArgumentException`，即使值相同或已启用 `ignoreUnknown` 也不例外。未知键默认抛错；`ignoreUnknown: true` 只跳过未知键，不放宽其他校验。
+
+所有已接受字段都经过与数据库水合相同的严格 Caster 转换，支持标量、数组/JSON、时间存储值、backed enum、Decimal、Castable、nullable 字段以及目标值对象的直接传入；转换失败继续抛出 `CastException`。必须完成全部键解析、重复字段检查和转换后，才会统一写入属性。模型构造器须与基础 Entity 构造器兼容，通常应是公开无参构造器。
+
+对于未配置自定义时间展示格式的字段，`toArray()` 使用真实列名和存储标量表示，可再传给 `fromArray()`。自定义 `displayFormat` 只用于展示，不保证能作为对应存储格式逆向解析。未绑定 Gateway 的实体调用 `toArray()` 时仍需 Session，这与直接 `new` 出来的实体一致。
+
 ### insert() —— 强制插入
 
 ```php

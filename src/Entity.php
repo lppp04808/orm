@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace Pixiaoka\Orm;
 
+use Pixiaoka\Orm\Cast\Caster;
 use Pixiaoka\Orm\Exception\IdentityException;
 use Pixiaoka\Orm\Gateway\EntityGateway;
+use Pixiaoka\Orm\Metadata\MetadataReader;
 use Pixiaoka\Orm\Metadata\ModelMeta;
 use Pixiaoka\Orm\Metadata\RelationMeta;
 use Pixiaoka\Orm\Query\Builder;
@@ -19,6 +21,8 @@ use WeakReference;
 /**
  * Active Record。字段是带 #[Column] 的类型化属性，表名由子类给出。
  * save / insert / delete 走当前 Session 并检查实体的弱 Gateway 归属，不在模型里写 SQL。
+ *
+ * @phpstan-consistent-constructor
  */
 abstract class Entity
 {
@@ -271,6 +275,57 @@ abstract class Entity
             throw new IdentityException(static::class . ' is not persisted and cannot be force-deleted');
         }
         $this->gateway()->forceDelete($this);
+    }
+
+    /**
+     * 从属性名或真实列名构造未持久化实体；完整校验和转换后才统一赋值。
+     * 不读取 Session，不绑定 Gateway，不写行缓存，也不触发生命周期钩子。
+     *
+     * @param array<string, mixed> $data
+     */
+    public static function fromArray(array $data, bool $ignoreUnknown = false): static
+    {
+        $meta = (new MetadataReader())->read(static::class);
+        $columns = [];
+        foreach ($meta->fields as $field) {
+            $columns[$field->column] ??= $field;
+        }
+
+        $fields = [];
+        $sources = [];
+        foreach ($data as $key => $value) {
+            if (!is_string($key)) {
+                throw new \InvalidArgumentException(static::class . '::fromArray() keys must be strings');
+            }
+            $field = $meta->fields[$key] ?? $columns[$key] ?? null;
+            if ($field === null) {
+                if ($ignoreUnknown) {
+                    continue;
+                }
+                throw new \InvalidArgumentException(static::class . '::fromArray() contains unknown key: ' . $key);
+            }
+            if (isset($sources[$field->property])) {
+                throw new \InvalidArgumentException(
+                    static::class . '::fromArray() field ' . $field->property
+                    . ' was provided more than once through keys ' . $sources[$field->property] . ' and ' . $key,
+                );
+            }
+            $fields[$field->property] = [$field, $value];
+            $sources[$field->property] = $key;
+        }
+
+        $values = [];
+        $caster = new Caster();
+        foreach ($fields as $property => [$field, $value]) {
+            $values[$property] = $caster->toPhp(static::class, $field, $value);
+        }
+
+        $entity = new static();
+        foreach ($values as $property => $value) {
+            $entity->{$property} = $value;
+        }
+
+        return $entity;
     }
 
     /** @return Builder<static> */
