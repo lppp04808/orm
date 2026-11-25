@@ -160,6 +160,9 @@ final class EntityFromArrayTest extends TestCase
             'original snapshot' => ['ormOriginal'],
             'loaded relations' => ['ormRelations'],
             'loaded relation flags' => ['ormLoadedRelations'],
+            'fromArray metadata' => ['fromArrayMetadata'],
+            'fromArray caster' => ['fromArrayCaster'],
+            'fromArray column cache' => ['fromArrayColumns'],
         ];
     }
 

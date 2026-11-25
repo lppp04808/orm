@@ -7,6 +7,7 @@ namespace Pixiaoka\Orm;
 use Pixiaoka\Orm\Cast\Caster;
 use Pixiaoka\Orm\Exception\IdentityException;
 use Pixiaoka\Orm\Gateway\EntityGateway;
+use Pixiaoka\Orm\Metadata\FieldMeta;
 use Pixiaoka\Orm\Metadata\MetadataReader;
 use Pixiaoka\Orm\Metadata\ModelMeta;
 use Pixiaoka\Orm\Metadata\RelationMeta;
@@ -30,6 +31,14 @@ abstract class Entity
 
     /** @var array<class-string, array<string, \ReflectionProperty>> 反射元数据按实际实体类与属性名复用，不进入持久化元数据。 */
     private static array $reflectionProperties = [];
+
+    /** fromArray 只缓存无状态组件和纯类元数据，不持有 Session、Gateway 或连接。 */
+    private static ?MetadataReader $fromArrayMetadata = null;
+
+    private static ?Caster $fromArrayCaster = null;
+
+    /** @var array<class-string<Entity>, array<string, FieldMeta>> */
+    private static array $fromArrayColumns = [];
 
     /** @var ?WeakReference<EntityGateway> 弱归属不延长 Gateway/连接生命周期；禁止跨连接隐式切换。 */
     private ?WeakReference $ormGateway = null;
@@ -285,11 +294,9 @@ abstract class Entity
      */
     public static function fromArray(array $data, bool $ignoreUnknown = false): static
     {
-        $meta = (new MetadataReader())->read(static::class);
-        $columns = [];
-        foreach ($meta->fields as $field) {
-            $columns[$field->column] ??= $field;
-        }
+        $metadata = self::$fromArrayMetadata ??= new MetadataReader();
+        $meta = $metadata->read(static::class);
+        $columns = self::$fromArrayColumns[static::class] ??= self::fromArrayColumns($meta);
 
         $fields = [];
         $sources = [];
@@ -315,7 +322,7 @@ abstract class Entity
         }
 
         $values = [];
-        $caster = new Caster();
+        $caster = self::$fromArrayCaster ??= new Caster();
         foreach ($fields as $property => [$field, $value]) {
             $values[$property] = $caster->toPhp(static::class, $field, $value);
         }
@@ -326,6 +333,17 @@ abstract class Entity
         }
 
         return $entity;
+    }
+
+    /** @return array<string, FieldMeta> */
+    private static function fromArrayColumns(ModelMeta $meta): array
+    {
+        $columns = [];
+        foreach ($meta->fields as $field) {
+            $columns[$field->column] ??= $field;
+        }
+
+        return $columns;
     }
 
     /** @return Builder<static> */
