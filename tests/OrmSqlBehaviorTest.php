@@ -122,7 +122,7 @@ final class OrmSqlBehaviorTest extends TestCase
     {
         $q = Item::query()->where('user_id', 1);
 
-        // 埋点：用 RecordingConnection 风格的简单替换验证 executeCount 换列
+        // COUNT(column) 的表达式由编译器生成，执行器不得再替换 SQL。
         $count = $q->count('sku');
         self::assertSame(0, $count);
     }

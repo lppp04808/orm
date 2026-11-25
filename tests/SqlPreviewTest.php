@@ -323,7 +323,7 @@ $tag$:q0$tag$ AS tagged
 SQL;
         $query = PreviewPlainRecord::query()
             ->selectRaw($projection)
-            ->whereRaw("id = :actual::int AND ':q0' = ':q0' /* :q0 */ -- :q0\n# :q0\n", ['actual' => 7]);
+            ->whereRaw("id = :actual::int AND ':q0' = ':q0' /* :q0 */ -- :q0\n", ['actual' => 7]);
         $sql = $query->preview()->rows();
 
         self::assertStringContainsString("SELECT ':q0' AS single_quoted", $sql);
@@ -338,7 +338,6 @@ SQL;
         self::assertStringContainsString("':q0' = ':q0'", $sql);
         self::assertStringContainsString('/* :q0 */', $sql);
         self::assertStringContainsString('-- :q0', $sql);
-        self::assertStringContainsString('# :q0', $sql);
         self::assertSame([], $this->connection->operations);
     }
 

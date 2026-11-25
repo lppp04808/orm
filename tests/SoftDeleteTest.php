@@ -158,7 +158,7 @@ final class SoftDeleteTest extends TestCase
         $active = SoftDeleteEntity::find(['id' => $active->id]);
         self::assertNotNull($active);
         $active->delete();
-        self::assertSame(1, SoftDeleteEntity::query()->onlyTrashed()->forceDelete());
+        self::assertSame(1, SoftDeleteEntity::query()->onlyTrashed()->where('id', $active->id)->forceDelete());
         self::assertSame(1, SoftDeleteEntity::query()->withTrashed()->count());
     }
 

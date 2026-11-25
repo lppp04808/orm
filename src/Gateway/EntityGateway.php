@@ -456,9 +456,16 @@ final class EntityGateway
             $sql .= ' AND ' . $this->quote($meta->versionField()->column) . ' = :orm_version';
             $params['orm_version'] = $expectedVersion;
         }
+        $softDelete = $meta->softDeleteField();
+        if ($softDelete !== null) {
+            $sql .= ' AND ' . $this->quote($softDelete->column) . ' IS NULL';
+        }
         $affected = $this->runExecute($sql, $params, $meta->class);
-        if ($expectedVersion !== null && $affected !== 1) {
-            throw new OptimisticLockException($meta->class, 'UPDATE', $expectedVersion);
+        if ($affected !== 1) {
+            if ($expectedVersion !== null) {
+                throw new OptimisticLockException($meta->class, 'UPDATE', $expectedVersion);
+            }
+            throw new IdentityException($meta->class . ' update must affect exactly one non-deleted row');
         }
         if ($expectedVersion !== null) {
             $entity->{$meta->version} = $expectedVersion + 1;
@@ -488,13 +495,18 @@ final class EntityGateway
                 throw new IdentityException($meta->class . ' is soft-deleted; use restore() or forceDelete()');
             }
             $deletedAt = $this->caster->currentTimestamp($softDelete);
+            $sets = [$this->quote($softDelete->column) . ' = :orm_deleted_at'];
+            $params['orm_deleted_at'] = $this->caster->toDb($meta->class, $softDelete, $deletedAt);
+            if ($expectedVersion !== null) {
+                $version = $meta->versionField() ?? throw new \LogicException('Version metadata is inconsistent');
+                $sets[] = $this->quote($version->column) . ' = ' . $this->quote($version->column) . ' + 1';
+            }
             $sql = sprintf(
-                'UPDATE %s SET %s = :orm_deleted_at WHERE %s',
+                'UPDATE %s SET %s WHERE %s',
                 $this->quote($meta->table),
-                $this->quote($softDelete->column),
+                implode(', ', $sets),
                 $this->where($meta, $params, $identity),
             );
-            $params['orm_deleted_at'] = $this->caster->toDb($meta->class, $softDelete, $deletedAt);
             $sql .= ' AND ' . $this->quote($softDelete->column) . ' IS NULL';
         } else {
             $sql = sprintf(
@@ -515,9 +527,14 @@ final class EntityGateway
         if ($expectedVersion === null && $affected !== 1) {
             throw new IdentityException($meta->class . ' delete must affect exactly one row');
         }
+        // 先清退旧可见性的缓存身份；回填时恢复缓存必须能还原事务前的有效状态。
+        $this->cacheClear($entity, $identity);
         $this->transactions->recordDeletedIdentity($entity, $identity->parts);
         if ($softDelete !== null) {
             $entity->{$softDelete->property} = $deletedAt;
+            if ($expectedVersion !== null) {
+                $entity->{$meta->version} = $expectedVersion + 1;
+            }
             $entity->markPersisted($this);
         } else {
             $entity->markDeleted();
@@ -534,19 +551,36 @@ final class EntityGateway
             ?? throw new \LogicException($meta->class . ' does not declare a soft-delete field');
         $identity = $this->identityOf($entity, $meta);
         $this->transactions->rememberEntity($entity);
+        $original = $entity->takeOriginal();
+        $expectedVersion = $this->expectedVersion($entity, $meta, $original);
         $params = [];
+        $sets = [$this->quote($field->column) . ' = NULL'];
+        if ($expectedVersion !== null) {
+            $version = $meta->versionField() ?? throw new \LogicException('Version metadata is inconsistent');
+            $sets[] = $this->quote($version->column) . ' = ' . $this->quote($version->column) . ' + 1';
+        }
         $sql = sprintf(
-            'UPDATE %s SET %s = NULL WHERE %s AND %s IS NOT NULL',
+            'UPDATE %s SET %s WHERE %s AND %s IS NOT NULL',
             $this->quote($meta->table),
-            $this->quote($field->column),
+            implode(', ', $sets),
             $this->where($meta, $params, $identity),
             $this->quote($field->column),
         );
+        if ($expectedVersion !== null) {
+            $sql .= ' AND ' . $this->quote($meta->versionField()->column) . ' = :orm_version';
+            $params['orm_version'] = $expectedVersion;
+        }
         $affected = $this->runExecute($sql, $params, $meta->class);
         if ($affected !== 1) {
+            if ($expectedVersion !== null) {
+                throw new OptimisticLockException($meta->class, 'RESTORE', $expectedVersion);
+            }
             throw new IdentityException($meta->class . ' restore must affect exactly one soft-deleted row');
         }
         $entity->{$field->property} = null;
+        if ($expectedVersion !== null) {
+            $entity->{$meta->version} = $expectedVersion + 1;
+        }
         $entity->markPersisted($this);
         $this->transactions->rememberEntity($entity);
         $this->cacheSet($entity);
@@ -946,8 +980,8 @@ final class EntityGateway
     }
 
     /**
-     * P0-2：直接执行 Builder::countSql() 结构化生成的 COUNT 查询。
-     * $column 非 '*' 时把 COUNT(*) 换成 COUNT("col")。
+     * 兼容入口：执行 Builder::countSql($column) 已编译的 COUNT 查询。
+     * COUNT 表达式只能由编译器决定，这里不能按字符串替换复杂 SQL。
      *
      * @param class-string<Entity> $class
      * @param array{sql: string, params: array<string, mixed>} $query
@@ -955,16 +989,8 @@ final class EntityGateway
     public function executeCount(string $class, array $query, string $column): int
     {
         $this->metadata->read($class);
-        $sql = $query['sql'];
-        if ($column !== '*') {
-            $sql = preg_replace('/COUNT\(\*\)/', 'COUNT(' . $this->quote($column) . ')', $sql, 1) ?? $sql;
-        }
-        $row = $this->runQueryOne($sql, $query['params'], $class);
-        if ($row === null) {
-            return 0;
-        }
 
-        return (int) (array_values($row)[0] ?? 0);
+        return $this->executeCountQuery($query);
     }
 
     // ---- 内部 ----

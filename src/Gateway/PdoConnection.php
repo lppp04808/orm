@@ -133,98 +133,7 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
      */
     private function normalizePgDollarQuotes(string $sql): string
     {
-        if (!str_contains($sql, '$')) {
-            return $sql;
-        }
-
-        $out = '';
-        $length = strlen($sql);
-        $state = 'sql';
-        $blockDepth = 0;
-        for ($i = 0; $i < $length; $i++) {
-            $char = $sql[$i];
-            $next = $sql[$i + 1] ?? '';
-
-            if ($state === 'line') {
-                $out .= $char;
-                if ($char === "\n" || $char === "\r") {
-                    $state = 'sql';
-                }
-                continue;
-            }
-            if ($state === 'block') {
-                if ($char === '/' && $next === '*') {
-                    $out .= '/*';
-                    $blockDepth++;
-                    $i++;
-                } elseif ($char === '*' && $next === '/') {
-                    $out .= '*/';
-                    $i++;
-                    if (--$blockDepth === 0) {
-                        $state = 'sql';
-                    }
-                } else {
-                    $out .= $char;
-                }
-                continue;
-            }
-            if ($state === "'" || $state === '"' || $state === 'E') {
-                $out .= $char;
-                if ($char === '\\' && $state === 'E' && $next !== '') {
-                    // PostgreSQL E'...' 使用反斜杠转义；普通标准字符串不把反斜杠当转义。
-                    $out .= $next;
-                    $i++;
-                    continue;
-                }
-                $quote = $state === 'E' ? "'" : $state;
-                if ($char === $quote) {
-                    if ($next === $char) {
-                        $out .= $next;
-                        $i++;
-                    } else {
-                        $state = 'sql';
-                    }
-                }
-                continue;
-            }
-
-            if ($char === "'") {
-                $prefix = $i > 0 ? $sql[$i - 1] : '';
-                $beforePrefix = $i > 1 ? $sql[$i - 2] : '';
-                $state = ($prefix === 'E' || $prefix === 'e')
-                    && !preg_match('/[A-Za-z0-9_$]/', $beforePrefix) ? 'E' : "'";
-                $out .= $char;
-            } elseif ($char === '"') {
-                $state = $char;
-                $out .= $char;
-            } elseif ($char === '-' && $next === '-') {
-                $out .= '--';
-                $i++;
-                $state = 'line';
-            } elseif ($char === '/' && $next === '*') {
-                $out .= '/*';
-                $i++;
-                $blockDepth = 1;
-                $state = 'block';
-            } elseif ($char === '$'
-                && preg_match('/\G\$([A-Za-z_][A-Za-z0-9_]*)?\$/', $sql, $match, 0, $i) === 1) {
-                $delimiter = $match[0];
-                $contentStart = $i + strlen($delimiter);
-                $closing = strpos($sql, $delimiter, $contentStart);
-                if ($closing === false) {
-                    $out .= substr($sql, $i);
-                    break;
-                }
-                $content = substr($sql, $contentStart, $closing - $contentStart);
-                // E 字符串在 standard_conforming_strings=off 时也能原样保留反斜杠。
-                $out .= "E'" . str_replace(["\\", "'"], ["\\\\", "''"], $content) . "'";
-                $i = $closing + strlen($delimiter) - 1;
-            } else {
-                $out .= $char;
-            }
-        }
-
-        return $out;
+        return \Pixiaoka\Orm\Sql\SqlLexer::normalizePostgresDollarQuotes($sql);
     }
 
     public function lastInsertId(): string
@@ -299,11 +208,13 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
             $begun = $this->pdo->beginTransaction();
             if ($begun) {
                 $this->transactionDepth = 1;
+                $this->assertConsistentTransactionState('begin');
             }
 
             return $begun;
         }
 
+        $this->assertConsistentTransactionState('begin');
         $depth = $this->transactionDepth + 1;
         $this->execute('SAVEPOINT sp_' . $depth, [], cacheable: false);
         $this->transactionDepth = $depth;
@@ -318,18 +229,22 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
             throw new \LogicException('The connection has no transaction to commit');
         }
         if ($depth > 1) {
+            $this->assertConsistentTransactionState('commit');
             $this->execute('RELEASE SAVEPOINT sp_' . $depth, [], cacheable: false);
             $this->transactionDepth--;
 
             return true;
         }
 
+        $this->assertConsistentTransactionState('commit');
         $committed = $this->pdo->commit();
-        if ($committed) {
-            $this->transactionDepth = 0;
+        if (!$committed) {
+            return false;
         }
+        $this->transactionDepth = 0;
+        $this->assertConsistentTransactionState('commit');
 
-        return $committed;
+        return true;
     }
 
     public function rollback(): bool
@@ -339,6 +254,7 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
             return true;
         }
         if ($depth > 1) {
+            $this->assertConsistentTransactionState('rollback');
             // MySQL、PostgreSQL、SQLite 均支持：回滚保存点后释放同名保存点。
             // 两条语句都成功才减少深度；失败交由 Gateway 禁止复用该连接。
             $this->execute('ROLLBACK TO SAVEPOINT sp_' . $depth, [], cacheable: false);
@@ -348,16 +264,13 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
             return true;
         }
 
-        if ($this->pdo->inTransaction()) {
-            $rolledBack = $this->pdo->rollBack();
-            if ($rolledBack) {
-                $this->transactionDepth = 0;
-            }
-
-            return $rolledBack;
+        $this->assertConsistentTransactionState('rollback');
+        $rolledBack = $this->pdo->rollBack();
+        if (!$rolledBack) {
+            return false;
         }
-
         $this->transactionDepth = 0;
+        $this->assertConsistentTransactionState('rollback');
 
         return true;
     }
@@ -370,14 +283,28 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
             return true;
         }
 
-        $rolledBack = true;
-        if ($this->pdo->inTransaction()) {
-            $rolledBack = $this->pdo->rollBack();
+        $this->assertConsistentTransactionState('forceRollback');
+        $rolledBack = $this->pdo->rollBack();
+        if (!$rolledBack) {
+            return false;
         }
-        if ($rolledBack) {
-            $this->transactionDepth = 0;
-        }
+        $this->transactionDepth = 0;
+        $this->assertConsistentTransactionState('forceRollback');
 
-        return $rolledBack;
+        return true;
+    }
+
+    /** 非零逻辑深度必须对应真实 PDO 事务；隐式提交后的回滚结果只能视为未知。 */
+    private function assertConsistentTransactionState(string $operation): void
+    {
+        $inTransaction = $this->pdo->inTransaction();
+        if ($inTransaction !== ($this->transactionDepth > 0)) {
+            throw new \LogicException(sprintf(
+                'Database transaction state mismatch during %s: managed depth is %d but PDO::inTransaction() is %s',
+                $operation,
+                $this->transactionDepth,
+                $inTransaction ? 'true' : 'false',
+            ));
+        }
     }
 }

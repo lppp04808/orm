@@ -248,6 +248,8 @@ final class SoakRunner
             'activity' => microtime(true),
             'last_log' => null,
             'heartbeat' => null,
+            'memory_samples' => [],
+            'heartbeat_memory' => [],
             'max' => [],
         ];
         $this->write('process_started', ['driver' => $driver, 'worker' => $worker, 'pid' => proc_get_status($handle)['pid']]);
@@ -259,7 +261,6 @@ final class SoakRunner
         $this->readLog($process, true);
         $heartbeat = $this->latestHeartbeat($process);
         $process['heartbeat'] = $heartbeat;
-        $heartbeat = $this->latestHeartbeat($process);
         if ($heartbeat !== null) {
             $this->mergeStats($process['driver'], $heartbeat['stats'] ?? []);
         }
@@ -327,6 +328,14 @@ final class SoakRunner
                 $process['activity'] = microtime(true);
                 if ($event['type'] === 'heartbeat') {
                     $process['heartbeat'] = $event;
+                    if (isset($event['memory']) && is_array($event['memory'])) {
+                        $process['heartbeat_memory'][] = $event['memory'];
+                    }
+                }
+                if (isset($event['memory_samples']) && is_array($event['memory_samples'])
+                    && $event['memory_samples'] !== []) {
+                    // 后续无统计的 stopped 事件不能抹掉完成事件中的完整序列。
+                    $process['memory_samples'] = $event['memory_samples'];
                 }
                 if ($event['type'] === 'unexpected_exception' || $event['type'] === 'worker_failed' || $event['type'] === 'audit_failed') {
                     $this->failures[] = $event['type'] . ':' . $process['driver'] . ':' . $process['worker'];
@@ -556,11 +565,9 @@ final class SoakRunner
 
     private function memorySummary(array $process): array
     {
-        $heartbeat = $process['heartbeat'];
-        $last = $process['last_log'];
-        $samples = $last['memory_samples'] ?? [];
-        if ($samples === [] && $heartbeat !== null) {
-            $samples = [$heartbeat['memory'] ?? []];
+        $samples = $process['memory_samples'];
+        if ($samples === []) {
+            $samples = $process['heartbeat_memory'];
         }
         $values = array_values(array_filter(array_map(static fn (array $sample): int => (int) ($sample['real'] ?? 0), $samples)));
         $count = count($values);
@@ -628,56 +635,58 @@ function soakUsage(): never
     exit(2);
 }
 
-$args = $argv;
-array_shift($args);
-$options = [
-    'duration' => 1800,
-    'workers' => 4,
-    'drivers' => ['mysql', 'pgsql'],
-    'sample' => 10,
-    'audit_interval' => 60,
-    'rotate' => 25,
-    'accounts' => 12,
-    'delay_ms' => 10,
-    'memory_growth' => 67108864,
-    'memory_limit' => '256M',
-    'heartbeat_timeout' => 90,
-    'grace' => 30,
-    'output' => '',
-    'seed' => 20261120,
-    'fault' => 'none',
-    'weights' => ['transfer' => 45, 'rollback' => 15, 'exception' => 10, 'contention' => 10, 'relation' => 20],
-    'php_args' => [],
-];
-foreach ($args as $arg) {
-    if ($arg === '--help' || $arg === '-h') {
+if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
+    $args = $argv;
+    array_shift($args);
+    $options = [
+        'duration' => 1800,
+        'workers' => 4,
+        'drivers' => ['mysql', 'pgsql'],
+        'sample' => 10,
+        'audit_interval' => 60,
+        'rotate' => 25,
+        'accounts' => 12,
+        'delay_ms' => 10,
+        'memory_growth' => 67108864,
+        'memory_limit' => '256M',
+        'heartbeat_timeout' => 90,
+        'grace' => 30,
+        'output' => '',
+        'seed' => 20261120,
+        'fault' => 'none',
+        'weights' => ['transfer' => 45, 'rollback' => 15, 'exception' => 10, 'contention' => 10, 'relation' => 20],
+        'php_args' => [],
+    ];
+    foreach ($args as $arg) {
+        if ($arg === '--help' || $arg === '-h') {
+            soakUsage();
+        }
+        if (!str_starts_with($arg, '--') || !str_contains($arg, '=')) {
+            soakUsage();
+        }
+        [$key, $value] = explode('=', substr($arg, 2), 2);
+        $key = str_replace('-', '_', $key);
+        if (!array_key_exists($key, $options)) {
+            soakUsage();
+        }
+        $options[$key] = match ($key) {
+            'drivers' => array_values(array_filter(explode(',', $value))),
+            'fault' => $value,
+            'output', 'memory_limit' => $value,
+            default => is_numeric($value) ? (int) $value : $value,
+        };
+    }
+    foreach (['duration', 'workers', 'sample', 'audit_interval', 'rotate', 'accounts', 'heartbeat_timeout', 'grace', 'memory_growth'] as $key) {
+        if (!is_int($options[$key]) || $options[$key] < 1) {
+            soakUsage();
+        }
+    }
+    if ($options['delay_ms'] < 0 || $options['accounts'] < 4 || $options['duration'] < 10
+        || !in_array($options['fault'], ['none', 'ledger', 'worker_crash'], true)
+        || $options['drivers'] === [] || array_diff($options['drivers'], ['mysql', 'pgsql']) !== []
+        || array_sum($options['weights']) !== 100) {
         soakUsage();
     }
-    if (!str_starts_with($arg, '--') || !str_contains($arg, '=')) {
-        soakUsage();
-    }
-    [$key, $value] = explode('=', substr($arg, 2), 2);
-    $key = str_replace('-', '_', $key);
-    if (!array_key_exists($key, $options)) {
-        soakUsage();
-    }
-    $options[$key] = match ($key) {
-        'drivers' => array_values(array_filter(explode(',', $value))),
-        'fault' => $value,
-        'output', 'memory_limit' => $value,
-        default => is_numeric($value) ? (int) $value : $value,
-    };
+    $options['drivers'] = array_values(array_unique($options['drivers']));
+    exit((new SoakRunner($options))->run());
 }
-foreach (['duration', 'workers', 'sample', 'audit_interval', 'rotate', 'accounts', 'heartbeat_timeout', 'grace', 'memory_growth'] as $key) {
-    if (!is_int($options[$key]) || $options[$key] < 1) {
-        soakUsage();
-    }
-}
-if ($options['delay_ms'] < 0 || $options['accounts'] < 4 || $options['duration'] < 10
-    || !in_array($options['fault'], ['none', 'ledger', 'worker_crash'], true)
-    || $options['drivers'] === [] || array_diff($options['drivers'], ['mysql', 'pgsql']) !== []
-    || array_sum($options['weights']) !== 100) {
-    soakUsage();
-}
-$options['drivers'] = array_values(array_unique($options['drivers']));
-exit((new SoakRunner($options))->run());

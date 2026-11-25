@@ -25,88 +25,13 @@ final readonly class SqlCompiler
     /** 仅供 SQL 调试预览使用；输出不得作为参数化执行的替代。 @param array<string, int|float|string|bool|null> $params */
     public static function interpolate(string $sql, array $params, string $driver): string
     {
-        $out = '';
-        $length = strlen($sql);
-        $state = 'sql';
-        for ($i = 0; $i < $length; $i++) {
-            $char = $sql[$i];
-            $next = $sql[$i + 1] ?? '';
-            if ($state !== 'sql') {
-                $out .= $char;
-                if (str_starts_with($state, '$')) {
-                    if (substr($sql, $i, strlen($state)) === $state) {
-                        $out .= substr($state, 1);
-                        $i += strlen($state) - 1;
-                        $state = 'sql';
-                    }
-                    continue;
-                }
-                if ($state === 'line') {
-                    if ($char === "\n" || $char === "\r") {
-                        $state = 'sql';
-                    }
-                    continue;
-                }
-                if ($state === 'block') {
-                    if ($char === '*' && $next === '/') {
-                        $out .= $next;
-                        $i++;
-                        $state = 'sql';
-                    }
-                    continue;
-                }
-                if ($char === '\\' && $driver === 'mysql' && ($state === "'" || $state === '"') && $next !== '') {
-                    $out .= $next;
-                    $i++;
-                    continue;
-                }
-                if ($char === $state) {
-                    if ($next === $char) {
-                        $out .= $next;
-                        $i++;
-                    } else {
-                        $state = 'sql';
-                    }
-                }
-                continue;
+        $out = \Pixiaoka\Orm\Sql\SqlLexer::replacePlaceholders($sql, $driver, static function (string $name) use ($params, $driver): string {
+            if (!array_key_exists($name, $params)) {
+                throw new InvalidArgumentException('SQL preview is missing parameter: ' . $name);
             }
 
-            if ($char === '$' && preg_match('/\G\$([A-Za-z_][A-Za-z0-9_]*)?\$/', $sql, $match, 0, $i) === 1) {
-                $state = $match[0];
-                $out .= $state;
-                $i += strlen($state) - 1;
-            } elseif ($char === "'" || $char === '"' || $char === '`') {
-                $state = $char;
-                $out .= $char;
-            } elseif ($char === '-' && $next === '-') {
-                $state = 'line';
-                $out .= '--';
-                $i++;
-            } elseif ($char === '#') {
-                $state = 'line';
-                $out .= $char;
-            } elseif ($char === '/' && $next === '*') {
-                $state = 'block';
-                $out .= '/*';
-                $i++;
-            } elseif ($char === ':' && $next === ':') {
-                $out .= '::';
-                $i++;
-            } elseif ($char === ':' && preg_match('/[A-Za-z_]/', $next) === 1) {
-                $end = $i + 1;
-                while ($end + 1 < $length && preg_match('/[A-Za-z0-9_]/', $sql[$end + 1]) === 1) {
-                    $end++;
-                }
-                $name = substr($sql, $i + 1, $end - $i);
-                if (!array_key_exists($name, $params)) {
-                    throw new InvalidArgumentException('SQL preview is missing parameter: ' . $name);
-                }
-                $out .= self::literal($params[$name], $driver);
-                $i = $end;
-            } else {
-                $out .= $char;
-            }
-        }
+            return self::literal($params[$name], $driver);
+        });
 
         return $out;
     }
@@ -177,6 +102,10 @@ final readonly class SqlCompiler
             return ['sql' => $sql, 'params' => $ctx->params()];
         }
 
+        if ($column !== '*') {
+            $column = $this->complexCountColumn($state, $column);
+        }
+
         // 复杂查询：包裹去 ORDER/LIMIT/OFFSET/lock 的完整 SELECT。
         $clone = clone $state;
         $clone->orderBy = [];
@@ -185,9 +114,38 @@ final readonly class SqlCompiler
         $clone->lockMode = null;
         $ctx = new RenderContext();
         $inner = $this->renderSelect($class, $clone, $ctx);
-        $sql = 'SELECT COUNT(*) FROM (' . $inner . ') AS ' . $this->quote('orm_count');
+        $expression = $column === '*' ? '*' : $this->quote($column);
+        $sql = 'SELECT COUNT(' . $expression . ') FROM (' . $inner . ') AS ' . $this->quote('orm_count');
 
         return ['sql' => $sql, 'params' => $ctx->params()];
+    }
+
+    /** COUNT(column) 只允许结果集语义明确、可直接定位的输出别名；不能用 COUNT(*) 冒充。 */
+    private function complexCountColumn(QueryState $state, string $column): string
+    {
+        $unsupported = static fn (): \LogicException => new \LogicException(
+            'This complex query does not support COUNT(' . $column . '); use count() for result rows or an explicit aggregate() for column semantics',
+        );
+        if ($state->groupBy !== [] || $state->having !== [] || $state->joins !== []
+            || $state->unions !== [] || $state->derivedFrom !== null || $state->projection === []) {
+            throw $unsupported();
+        }
+        if (count($state->projection) !== 1) {
+            throw $unsupported();
+        }
+        $projection = $state->projection[0];
+        if ($projection['kind'] === 'raw') {
+            throw $unsupported();
+        }
+        $name = match ($projection['kind']) {
+            'as', 'aggregate' => $projection['alias'],
+            default => ($parts = explode('.', $projection['column']))[count($parts) - 1],
+        };
+        if (!is_string($name) || strcasecmp($name, $column) !== 0) {
+            throw $unsupported();
+        }
+
+        return $name;
     }
 
     /** @return array{sql: string, params: array<string, int|float|string|bool|null>} */
@@ -199,7 +157,7 @@ final readonly class SqlCompiler
         if ($set === []) {
             throw new InvalidArgumentException('UPDATE SET cannot be empty');
         }
-        if ($state->where === [] && $state->orGroups === []) {
+        if (!$this->hasUserCondition($state)) {
             throw new InvalidArgumentException('UPDATE requires a WHERE condition; full-table updates are rejected');
         }
 
@@ -232,7 +190,7 @@ final readonly class SqlCompiler
         $this->assertDeferredRelationExecution($state);
         $this->relations->assertRelationParentSupported($class, $state);
         $this->assertWritable($state);
-        if ($state->where === [] && $state->orGroups === []) {
+        if (!$this->hasUserCondition($state)) {
             throw new InvalidArgumentException('UPDATE requires a WHERE condition; full-table updates are rejected');
         }
         if (!in_array($operator, ['+', '-'], true)) {
@@ -280,8 +238,7 @@ final readonly class SqlCompiler
         $this->assertDeferredRelationExecution($state);
         $this->relations->assertRelationParentSupported($class, $state);
         $this->assertWritable($state);
-        if ($state->where === [] && $state->orGroups === []
-            && $this->gateway->meta($class)->softDeleteField() === null) {
+        if (!$this->hasUserCondition($state)) {
             throw new InvalidArgumentException('DELETE requires a WHERE condition; full-table deletes are rejected');
         }
         $meta = $this->gateway->meta($class);
@@ -354,7 +311,7 @@ final readonly class SqlCompiler
             $parts = [];
             foreach ($state->having as $having) {
                 if ($having['kind'] === 'raw') {
-                    $parts[] = $ctx->mergeRaw($having['sql'], $having['params'] ?? []);
+                    $parts[] = $ctx->mergeRaw($having['sql'], $having['params'] ?? [], $this->connectionDriver());
                 } else {
                     $expr = $this->renderHavingExpression($having['expression']);
                     $parts[] = $expr . ' ' . $having['operator'] . ' ' . $ctx->bind($this->assertScalar($having['value']));
@@ -451,7 +408,7 @@ final readonly class SqlCompiler
                         $parts[] = $this->quote($proj['column']) . ' AS ' . $this->quote($proj['alias']);
                         break;
                     case 'raw':
-                        $parts[] = $ctx->mergeRaw($proj['sql'], $proj['params'] ?? []);
+                        $parts[] = $ctx->mergeRaw($proj['sql'], $proj['params'] ?? [], $this->connectionDriver());
                         break;
                     case 'aggregate':
                         $inner = $proj['column'] === '*' ? '*' : $this->quote($this->relations->relationColumn($class, $state, $proj['column']));
@@ -495,7 +452,7 @@ final readonly class SqlCompiler
         $sql = '';
         foreach ($state->joins as $join) {
             if ($join['type'] === 'RAW') {
-                $sql .= ' ' . $ctx->mergeRaw($join['raw'], $join['params'] ?? []);
+                $sql .= ' ' . $ctx->mergeRaw($join['raw'], $join['params'] ?? [], $this->connectionDriver());
                 continue;
             }
             $sql .= ' ' . $join['type'] . ' JOIN ' . $this->quote($join['table']) . ' AS ' . $this->quote($join['alias']);
@@ -577,7 +534,7 @@ final readonly class SqlCompiler
                 /** @var Expression $expr */
                 $expr = $value;
 
-                return $ctx->mergeRaw($expr->sql, $expr->params);
+                return $ctx->mergeRaw($expr->sql, $expr->params, $this->connectionDriver());
 
             case 'CORRELATION':
                 // 仅由 RelationCompiler 用已校验的字段元数据和内部别名构造。
@@ -686,7 +643,7 @@ final readonly class SqlCompiler
         $parts = [];
         foreach ($orderBy as $order) {
             $parts[] = $order['kind'] === 'raw'
-                ? $ctx->mergeRaw($order['sql'], $order['params'] ?? [])
+                ? $ctx->mergeRaw($order['sql'], $order['params'] ?? [], $this->connectionDriver())
                 : $this->quote($order['column']) . ' ' . $order['direction'];
         }
 
@@ -960,9 +917,48 @@ final readonly class SqlCompiler
         return [$class, $first];
     }
 
+    /** 空 OR 分组不是用户条件；空 IN/NOT IN 仍须保留其显式恒假/恒真语义。 */
+    private function hasUserCondition(QueryState $state): bool
+    {
+        if ($state->where !== []) {
+            return true;
+        }
+        foreach ($state->orGroups as $group) {
+            if ($this->hasGroupCondition($group)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function hasGroupCondition(array $group): bool
+    {
+        if ($group['conditions'] !== []) {
+            return true;
+        }
+        foreach ($group['groups'] as $nested) {
+            if ($this->hasGroupCondition($nested)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private function baseTable(string $class): string
     {
         return $this->gateway->meta($class)->table;
+    }
+
+    /** 旧 Connection 装饰器没有能力声明时，不臆测 MySQL/PostgreSQL 方言。 */
+    private function connectionDriver(): ?string
+    {
+        $connection = $this->gateway->connection();
+
+        return $connection instanceof \Pixiaoka\Orm\Gateway\DriverAwareConnection
+            ? $connection->driver()
+            : null;
     }
 
     private function quote(string $identifier): string

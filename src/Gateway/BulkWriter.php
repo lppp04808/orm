@@ -97,38 +97,60 @@ final readonly class BulkWriter
         }
         ksort($prepared);
 
-        // SQL 严格保留原始混批行序。RETURNING 的每个结果仍对应全局原始索引，
-        // 所有 SQL 成功后才按输入顺序回填实体、执行后置钩子和发布缓存。
-        $chunkSize = max(1, min(500, intdiv(65535, max(1, count($fieldList)))));
-        $generatedIds = [];
-        foreach (array_chunk($prepared, $chunkSize, true) as $chunk) {
-            $ids = $this->executeBatchChunk($meta, $generated, $fieldList, array_values($chunk));
-            foreach (array_keys($chunk) as $position => $index) {
-                $generatedIds[$index] = $ids[$position] ?? null;
+        // SQL 严格保留原始混批行序。所有分块共享一个事务边界，
+        // 任一条 SQL 失败都不能留下已提交的前置分块。
+        $this->gatewayTransaction($gateway, function () use (
+            $gateway, $class, $prepared, $fieldList, $generated, $entities, $cacheSet,
+        ): void {
+            $chunkSize = max(1, min(500, intdiv(65535, max(1, count($fieldList)))));
+            $generatedIds = [];
+            foreach (array_chunk($prepared, $chunkSize, true) as $chunk) {
+                $ids = $this->executeBatchChunk($this->metadata->read($class), $generated, $fieldList, array_values($chunk));
+                foreach (array_keys($chunk) as $position => $index) {
+                    $generatedIds[$index] = $ids[$position] ?? null;
+                }
             }
-        }
-        foreach ($entities as $index => $row) {
-            $this->publishBatchEntity($gateway, $row, $meta, $generated, $generatedIds[$index] ?? null, $cacheSet);
-        }
+            foreach ($entities as $index => $row) {
+                $this->publishBatchEntity($gateway, $row, $this->metadata->read($class), $generated, $generatedIds[$index] ?? null, $cacheSet);
+            }
+        });
+    }
+
+    private function gatewayTransaction(EntityGateway $gateway, callable $work): void
+    {
+        // 仅通过公共事务入口建立边界；已有外层事务复用 SAVEPOINT。
+        $gateway->transaction($work);
     }
 
     /** @param list<FieldMeta> $fieldList @return list<int|float|string|null> */
     private function prepareBatchRow(ModelMeta $meta, array $fieldList, array|Entity $row, int $now): array
     {
         $isEntity = $row instanceof Entity;
+        if (!$isEntity) {
+            $resolved = $this->resolveArrayBatchFields($meta, $row);
+        }
         $values = [];
+        foreach ($meta->fields as $field) {
+            if ($field->generated) {
+                if (($isEntity && $row->propSet($field->property))
+                    || (!$isEntity && array_key_exists($field->property, $resolved))) {
+                    throw new \InvalidArgumentException($meta->class . '::' . $field->property . ' is generated and cannot be provided for batch insert');
+                }
+                continue;
+            }
+        }
         foreach ($fieldList as $field) {
             $isTimestamp = in_array($field->property, $meta->timestamps, true);
             $isVersion = $field->property === $meta->version;
             $has = $isEntity
                 ? $row->propSet($field->property)
-                : (array_key_exists($field->column, $row) || array_key_exists($field->property, $row));
+                : array_key_exists($field->property, $resolved);
             if (($isTimestamp || $isVersion) && !$has) {
                 $value = $isVersion ? 1 : $this->caster->currentTimestamp($field, $now);
             } elseif ($has) {
                 $value = $isEntity
                     ? $row->{$field->property}
-                    : (array_key_exists($field->column, $row) ? $row[$field->column] : $row[$field->property]);
+                    : $resolved[$field->property];
             } else {
                 throw new IdentityException($meta->class . '::' . $field->property . ' is missing a value for batch insert');
             }
@@ -140,6 +162,34 @@ final readonly class BulkWriter
         }
 
         return $values;
+    }
+
+    /** @return array<string, mixed> 属性名 => 原始输入值，重复来源不得按优先级吞掉。 */
+    private function resolveArrayBatchFields(ModelMeta $meta, array $row): array
+    {
+        $columns = [];
+        foreach ($meta->fields as $field) {
+            $columns[$field->column] ??= $field;
+        }
+        $resolved = [];
+        $sources = [];
+        foreach ($row as $key => $value) {
+            if (!is_string($key)) {
+                throw new \InvalidArgumentException($meta->class . ' batch insert keys must be strings');
+            }
+            $field = $meta->fields[$key] ?? $columns[$key] ?? null;
+            if ($field === null) {
+                throw new \InvalidArgumentException($meta->class . ' batch insert contains unknown field: ' . $key);
+            }
+            if (isset($sources[$field->property])) {
+                throw new \InvalidArgumentException($meta->class . '::' . $field->property
+                    . ' was provided more than once through keys ' . $sources[$field->property] . ' and ' . $key);
+            }
+            $sources[$field->property] = $key;
+            $resolved[$field->property] = $value;
+        }
+
+        return $resolved;
     }
 
     /** @param callable(Entity, bool=, string=): void $cacheSet SQL 成功后才发布实体身份与缓存。 */

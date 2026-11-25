@@ -126,7 +126,12 @@ final class Caster
                 throw $this->fail($model, $field, 'Expected a numeric value for database output');
             }
 
-            return (float) $value;
+            $number = (float) $value;
+            if (!is_finite($number)) {
+                throw $this->fail($model, $field, 'Database output float must be finite');
+            }
+
+            return $number;
         }
         if ($name === 'string') {
             if (!is_string($value)) {
@@ -194,19 +199,29 @@ final class Caster
         if (is_int($value)) {
             return $value;
         }
-        if (is_string($value) && preg_match('/^-?\d+$/', $value) === 1) {
-            return (int) $value;
+        if (is_string($value) && preg_match('/^-?\d+$/D', $value) === 1) {
+            $digits = ltrim($value, '-');
+            $normalized = ltrim($digits, '0');
+            $normalized = $normalized === '' ? '0' : $normalized;
+            $limit = ltrim((string) (str_starts_with($value, '-') ? PHP_INT_MIN : PHP_INT_MAX), '-');
+            if (strlen($normalized) < strlen($limit)
+                || (strlen($normalized) === strlen($limit) && strcmp($normalized, $limit) <= 0)) {
+                return (int) $value;
+            }
+            throw $this->fail($model, $field, 'Integer value exceeds PHP integer range');
         }
         throw $this->fail($model, $field, 'Cannot parse value as int');
     }
 
     private function toFloat(string $model, FieldMeta $field, mixed $value): float
     {
-        if (is_int($value) || is_float($value)) {
-            return (float) $value;
-        }
-        if (is_string($value) && is_numeric($value)) {
-            return (float) $value;
+        if (is_int($value) || is_float($value) || (is_string($value) && is_numeric($value))) {
+            $number = (float) $value;
+            if (!is_finite($number)) {
+                throw $this->fail($model, $field, 'Cannot parse a non-finite float');
+            }
+
+            return $number;
         }
         throw $this->fail($model, $field, 'Cannot parse value as float');
     }

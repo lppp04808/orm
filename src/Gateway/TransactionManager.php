@@ -69,6 +69,12 @@ final class TransactionManager
     /** @var \WeakMap<Context, float> 仅用于物理事务开始事件的耗时。 */
     private \WeakMap $txnStartedAt;
 
+    /** @var \WeakMap<Context, TransactionException>|null 同一嵌套栈只保留首次未知事务结果。 */
+    private ?\WeakMap $transactionFailuresByContext = null;
+
+    /** @var \WeakMap<Context, TransactionException>|null discard 已清理深度，仍需把首次失败交给活动事务帧。 */
+    private ?\WeakMap $discardFailures = null;
+
     public function __construct(
         private readonly Connection $connection,
         private readonly RowCache $cache,
@@ -103,12 +109,18 @@ final class TransactionManager
             // 旧装饰器没有物理保存点能力，维持原公共 transaction() 的“复用外层”契约。
             return $func();
         }
+        if (isset($this->transactionFailuresByContext[$ctx])) {
+            throw $this->transactionFailuresByContext[$ctx];
+        }
 
         if ($depth === 0) {
             $this->resetTransactionDepthTracking($ctx);
             Session::clearRollbackStatus($ctx, $sessionName);
             if ($this->confirmedRollbacks !== null) {
                 unset($this->confirmedRollbacks[$ctx]);
+            }
+            if ($this->discardFailures !== null) {
+                unset($this->discardFailures[$ctx]);
             }
             $this->pendingInsertStates = new \WeakMap();
             $this->inTransactionByContext[$ctx] = true;
@@ -150,6 +162,7 @@ final class TransactionManager
                     $failure = $e;
                     $this->invalidateConnection();
                     $transactionFailure = new TransactionException('begin', null, $e);
+                    $this->rememberTransactionFailure($ctx, $transactionFailure);
                     $this->observeTransaction('begin', $ctx, $startedAt, $transactionFailure);
                     throw $transactionFailure;
                 }
@@ -172,7 +185,14 @@ final class TransactionManager
                         throw new \LogicException('The Session was discarded during the transaction; commit is forbidden and the connection must not be reused');
                     }
                     $discardConfirmed = true;
+                    if (isset($this->transactionFailuresByContext[$ctx])) {
+                        throw $this->transactionFailuresByContext[$ctx];
+                    }
                     throw new \LogicException('The Session was discarded during the transaction; the work was rolled back and cannot be committed');
+                }
+                if (isset($this->transactionFailuresByContext[$ctx])) {
+                    // 内层未知结果即使被业务代码捕获，也不能被后续 RELEASE/commit 变成成功。
+                    throw $this->transactionFailuresByContext[$ctx];
                 }
                 $commitAttempted = true;
                 if (!$this->connection->commit()) {
@@ -180,20 +200,58 @@ final class TransactionManager
                 }
                 $committed = true;
             } catch (\Throwable $e) {
+                $firstFailure = $this->transactionFailuresByContext[$ctx]
+                    ?? $this->discardFailures[$ctx]
+                    ?? ($e instanceof TransactionException && $this->transactionDepth($ctx) === 0 ? $e : null);
+                if ($e instanceof \LogicException && !$commitAttempted
+                    && Session::rollbackConfirmed($ctx, $sessionName)) {
+                    // Session::discard() 已确认整链回滚；此时禁止 commit，但不伪造未知结果。
+                    $discardConfirmed = true;
+                    $failure = $e;
+                    throw $e;
+                }
+                if ($firstFailure !== null && $e !== $firstFailure) {
+                    // 首个失败已使实体回滚状态不可信；保留后续业务异常，但不执行可能成功的第二次回滚。
+                    $failure = $e;
+                    $rollbackAttempted = true;
+                    $discardAttempted = true;
+                    $rollbackFailure = $firstFailure;
+                    $this->invalidateConnection();
+                    throw new TransactionException('rollback', $e, $firstFailure);
+                }
+                if ($firstFailure !== null) {
+                    // 内层或提交前检查已抛出首个失败，原样穿过剩余事务栈。
+                    $rollbackAttempted = $begun;
+                    $discardAttempted = true;
+                    $rollbackFailure = $firstFailure;
+                    throw $firstFailure;
+                }
                 $failure = $e;
                 if ($e instanceof TransactionException && $this->transactionDepth($ctx) === 0
                     && !Session::rollbackConfirmed($ctx, $sessionName)) {
                     $rollbackAttempted = true;
-                    $discardAttempted = true;
-                    $rollbackFailure = $e;
-                    throw $e;
                 }
                 if ($commitAttempted) {
                     $this->observeTransaction('commit', $ctx, $startedAt, $e);
                 }
                 $discardAttempted = Session::rollbackAttempted($ctx, $sessionName);
-                if ($this->transactionDepth($ctx) === 0 && Session::rollbackConfirmed($ctx, $sessionName)) {
-                    $discardConfirmed = true;
+                if ($this->transactionDepth($ctx) === 0 && !$discardConfirmed
+                    && (!Session::rollbackConfirmed($ctx, $sessionName) || $commitAttempted)) {
+                    // discard() 的未知回滚不能被逻辑深度归零误报为完整回滚成功。
+                    $transactionFailure = new TransactionException(
+                        'rollback',
+                        $commitAttempted ? null : $e,
+                        $e,
+                    );
+                    $this->rememberTransactionFailure($ctx, $transactionFailure);
+                    $this->invalidateConnection();
+                    if ($commitAttempted) {
+                        $commitAttempted = false;
+                        $discardAttempted = true;
+                        $rollbackAttempted = true;
+                        $rollbackFailure = $transactionFailure;
+                    }
+                    throw $transactionFailure;
                 }
                 if ($this->transactionDepth($ctx) === $depth + 1 && !$discardAttempted) {
                     $rollbackAttempted = true;
@@ -223,6 +281,7 @@ final class TransactionManager
                     $commitAttempted ? null : $failure,
                     !$commitAttempted && $rollbackFailure !== null ? $rollbackFailure : $failure,
                 );
+                $this->rememberTransactionFailure($ctx, $transactionFailure);
                 if ($rollbackAttempted) {
                     $rollbackFailure = $transactionFailure;
                 }
@@ -276,6 +335,9 @@ final class TransactionManager
         } catch (\Throwable $e) {
             $failure = $e;
             $transactionFailure = new TransactionException('rollback', null, $e);
+            $this->discardFailures ??= new \WeakMap();
+            $this->discardFailures[$context] = $transactionFailure;
+            $this->rememberTransactionFailure($context, $transactionFailure);
         } finally {
             if ($transactionFailure !== null) {
                 $this->invalidateConnection();
@@ -360,6 +422,12 @@ final class TransactionManager
     {
         $this->pendingInsertStates = new \WeakMap();
         $this->outerTransactionStates = new \WeakMap();
+        if ($this->transactionFailuresByContext !== null) {
+            unset($this->transactionFailuresByContext[$context]);
+        }
+        if ($this->discardFailures !== null) {
+            unset($this->discardFailures[$context]);
+        }
         unset(
             $this->transactionDepthByContext[$context],
             $this->transactionFramesByContext[$context],
@@ -377,6 +445,12 @@ final class TransactionManager
     private function transactionDepth(Context $context): int
     {
         return $this->transactionDepthByContext[$context] ?? 0;
+    }
+
+    private function rememberTransactionFailure(Context $context, TransactionException $failure): void
+    {
+        $this->transactionFailuresByContext ??= new \WeakMap();
+        $this->transactionFailuresByContext[$context] ??= $failure;
     }
 
     private function resetTransactionDepthTracking(Context $context): void

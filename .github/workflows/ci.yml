@@ -67,6 +67,12 @@ jobs:
           PIXIAOKA_ORM_LIVE_PGSQL_DSN: pgsql:host=127.0.0.1;port=5432;dbname=orm_test
           PIXIAOKA_ORM_LIVE_PGSQL_USER: postgres
           PIXIAOKA_ORM_LIVE_PGSQL_PASSWORD: local-only-password
+          ORM_TEST_MYSQL_DSN: mysql:host=127.0.0.1;port=3306;dbname=orm_test;charset=utf8mb4
+          ORM_TEST_MYSQL_USER: root
+          ORM_TEST_MYSQL_PASSWORD: local-only-password
+          ORM_TEST_PGSQL_DSN: pgsql:host=127.0.0.1;port=5432;dbname=orm_test
+          ORM_TEST_PGSQL_USER: postgres
+          ORM_TEST_PGSQL_PASSWORD: local-only-password
           DB_MYSQL_HOST: 127.0.0.1
           DB_MYSQL_PORT: 3306
           DB_MYSQL_NAME: orm_test

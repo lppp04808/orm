@@ -377,7 +377,9 @@ $n = Article::query()->onlyTrashed()->where('tenant_id', 7)->restore();
 $n = Article::query()->withTrashed()->where('id', 7)->forceDelete();
 ```
 
-Builder 的 `delete()` 在声明软删除的模型上写时间戳，`restore()` 只恢复符合当前条件的已删除行，`forceDelete()` 才物理删除。默认 `delete()` / `forceDelete()` 不包含已软删除行，需要时用 `withTrashed()` 或 `onlyTrashed()` 明确范围。软删除范围本身就是写入边界，所以即使没有其他显式 WHERE，也不会像普通模型 DELETE 一样被拒绝；`restore()` 也只针对回收站。特别地，`withTrashed()->forceDelete()` 且没有其他条件可能物理清空整表，应谨慎使用。`restore()` / `forceDelete()` 对未声明软删除的模型会拒绝执行。批量写不触发实体钩子，必要时刷新已持有对象。
+Builder 的 `delete()` 在声明软删除的模型上写时间戳，`restore()` 只恢复符合当前条件的已删除行，`forceDelete()` 才物理删除。默认 `delete()` / `forceDelete()` 不包含已软删除行，需要时用 `withTrashed()` 或 `onlyTrashed()` 明确范围。**软删除作用域或空 OR 分组不能代替显式 WHERE**：条件删除、恢复、物理删除都必须具有实际用户条件。空 `IN` 是恒假条件，可安全返回 0；空 `NOT IN` 是恒真条件，执行前必须确认目标范围。`restore()` / `forceDelete()` 对未声明软删除的模型会拒绝执行。批量写不触发实体钩子，必要时刷新已持有对象。
+
+普通实体 `save()` 只会更新 `deleted_at IS NULL` 的行，不能复活已被其他连接软删除的记录；已软删除的实体必须显式 `restore()` 后才能普通保存或再次软删除。模型同时声明 `#[Version]` 时，单实体软删除、恢复和普通保存都检查原始版本并在成功后递增版本，物理删除也检查版本；冲突时抛 `OptimisticLockException`，实体字段、版本和原始快照不因失败被标记为成功。`#[Version]` 模型的 Builder 条件 UPDATE/DELETE/RESTORE 仍被拒绝，因为无法保持逐实体版本语义。
 
 普通查询、关系加载、关系过滤与计数都应用目标模型的软删除范围。关系约束闭包中可显式调用 `withTrashed()` 包含目标回收站；软删除不是关联加载的额外全局功能开关，而是目标模型元数据的一部分。
 
@@ -749,6 +751,8 @@ $users = Order::query()->select('user_id')->distinct()->count();
 
 聚合函数只允许 COUNT/SUM/AVG/MIN/MAX。结构化 HAVING 仅接受标识符或上述聚合表达式；复杂条件使用参数化 `havingRaw()`。
 
+`count()` 表示查询结果行数，复杂查询会包裹派生 SELECT 后使用 `COUNT(*)`；`count('column')` 表示对应输出列的非 NULL 值数量，不能静默替换为 `COUNT(*)`。简单基表查询可直接统计模型列；无 JOIN/GROUP/HAVING/UNION/派生表且只有一个结构化输出列或别名的复杂查询，也可统计该列（包括 DISTINCT）。其他复杂 `count(column)` 会抛出 `LogicException`，请改用 `count()` 获取结果行数，或显式 `aggregate()` 表达需要的列聚合语义。
+
 ### 6.4 子查询与派生表
 
 ```php
@@ -894,9 +898,11 @@ User::insertAll([$a, $b]);
 // $a、$b 的 created_at 被填充，状态变为 persisted
 ```
 
-数组与 Entity 可以混批，SQL 保留输入行序，每块最多 500 行，并同时受 65535 个绑定参数上限约束。首条 INSERT 前会完成整批可预知检查：数组字段和类型转换、实体模型/新旧状态/Gateway 归属、自动时间与版本默认值、前置钩子、钩子执行后的最终值和版本校验。后续分块存在坏行时，前面的分块不会先写入；失败批次也不会给未绑定 Entity 留下 Gateway 归属。
+数组与 Entity 可以混批，SQL 保留输入行序，每块最多 500 行，并同时受 65535 个绑定参数上限约束。首条 INSERT 前会完成整批可预知检查：未知数组字段、属性名/真实列名或别名重复赋值、缺失必填值、错误提供生成主键、类型转换、实体模型/新旧状态/Gateway 归属、自动时间与版本默认值、前置钩子、钩子执行后的最终值和版本校验。数组显式 `null` 会按字段的可空性处理，不被误判为缺失；失败批次不会提前回填主键或发布实体。
 
-`beforeSave()` / `beforeInsert()` 可以补齐必填字段，每个 Entity 只执行一次；SQL 全部成功后才回填生成键、标记 persisted、执行 `afterSave()` / `afterInsert()` 并发布缓存。预检失败不假装撤销已经运行的前置钩子、字段自动填值或外部副作用。数据库约束冲突、SQL/连接失败、生成键回填或后置钩子失败同样不承诺自动原子撤销，需要整批原子性时必须使用显式事务。事务成功回滚则恢复前置钩子及自动填值之前的持久化字段、未初始化状态、生成键、版本和缓存身份；非字段业务属性及外部副作用仍由业务负责。
+所有分块自动共享一个事务；调用方已有事务时嵌套为 SAVEPOINT。后续分块 SQL 失败会明确回滚本批已执行的前置分块，只有回滚成功才恢复实体和缓存；结果未知时保留异常并禁止复用连接。MySQL 的 DDL 隐式提交等结果未知场景不能当成回滚成功。
+
+`beforeSave()` / `beforeInsert()` 可以补齐必填字段，每个 Entity 只执行一次；SQL 全部成功后才回填生成键、标记 persisted、执行 `afterSave()` / `afterInsert()` 并发布缓存。预检失败不假装撤销已经运行的前置钩子、字段自动填值或外部副作用。数据库约束冲突、SQL/连接失败、生成键回填或后置钩子失败也只在数据库明确回滚成功时恢复内存；非字段业务属性及外部副作用仍由业务负责。
 
 带生成键的多行混批或纯 Entity 批次要求连接支持 `INSERT ... RETURNING`；MySQL 会在钩子及 SQL 前拒绝这类调用，请逐行 `save()`。纯数组行无需回填，仍可在 MySQL 批量插入。
 

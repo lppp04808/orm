@@ -118,6 +118,9 @@ final class SqlExecutor
                 if (!is_scalar($value) && $value !== null) {
                     throw new \InvalidArgumentException('Raw SQL parameter values must be scalar or null');
                 }
+                if (is_float($value) && !is_finite($value)) {
+                    throw new \InvalidArgumentException('Raw SQL floating-point parameter values must be finite');
+                }
             }
 
             return $query;
@@ -129,6 +132,9 @@ final class SqlExecutor
         foreach ($params as $value) {
             if (!is_scalar($value) && $value !== null) {
                 throw new \InvalidArgumentException('Raw SQL parameter values must be scalar or null');
+            }
+            if (is_float($value) && !is_finite($value)) {
+                throw new \InvalidArgumentException('Raw SQL floating-point parameter values must be finite');
             }
         }
 
@@ -142,69 +148,9 @@ final class SqlExecutor
                 throw new \InvalidArgumentException('Raw SQL parameters must use named placeholders');
             }
         }
-        // 用于识别命名占位符的状态机：忽略字符串、标识符、注释、PG dollar quote 和 :: 类型转换。
-        $used = [];
-        $length = strlen($sql);
-        $state = 'sql';
-        for ($i = 0; $i < $length; $i++) {
-            $char = $sql[$i];
-            $next = $sql[$i + 1] ?? '';
-            if ($state !== 'sql') {
-                if (str_starts_with($state, '$')) {
-                    if (substr($sql, $i, strlen($state)) === $state) {
-                        $i += strlen($state) - 1;
-                        $state = 'sql';
-                    }
-                    continue;
-                }
-                if ($state === 'line') {
-                    if ($char === "\n" || $char === "\r") {
-                        $state = 'sql';
-                    }
-                    continue;
-                }
-                if ($state === 'block') {
-                    if ($char === '*' && $next === '/') {
-                        $state = 'sql';
-                        $i++;
-                    }
-                    continue;
-                }
-                if ($char === $state) {
-                    if ($next === $char && $state !== '`') {
-                        $i++;
-                    } else {
-                        $state = 'sql';
-                    }
-                }
-                continue;
-            }
-            if ($char === '$' && preg_match('/\$([A-Za-z_][A-Za-z0-9_]*)?\$/', substr($sql, $i), $match) === 1) {
-                $state = $match[0];
-                $i += strlen($state) - 1;
-            } elseif ($char === "'" || $char === '"' || $char === '`') {
-                $state = $char;
-            } elseif ($char === '-' && $next === '-') {
-                $state = 'line';
-                $i++;
-            } elseif ($char === '#') {
-                $state = 'line';
-            } elseif ($char === '/' && $next === '*') {
-                $state = 'block';
-                $i++;
-            } elseif ($char === ':' && $next === ':') {
-                $i++;
-            } elseif ($char === ':' && preg_match('/[A-Za-z_]/', $next) === 1) {
-                $j = $i + 1;
-                while ($j + 1 < $length && preg_match('/[A-Za-z0-9_]/', $sql[$j + 1]) === 1) {
-                    $j++;
-                }
-                $used[] = substr($sql, $i + 1, $j - $i);
-                $i = $j;
-            } elseif ($char === '?') {
-                throw new \InvalidArgumentException('Raw SQL must use named placeholders to avoid parameter misalignment in complex queries');
-            }
-        }
+        // 用于识别命名占位符的统一方言扫描：忽略字符串、标识符、注释、PG dollar quote 和 :: 类型转换。
+        $driver = $this->connection instanceof DriverAwareConnection ? $this->connection->driver() : 'pgsql';
+        $used = \Pixiaoka\Orm\Sql\SqlLexer::placeholders($sql, $driver);
         $used = array_values(array_unique($used));
         sort($used);
         $provided = array_keys($params);

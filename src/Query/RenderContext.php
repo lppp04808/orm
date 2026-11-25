@@ -80,7 +80,7 @@ final class RenderContext
      *
      * @param array<string, int|float|string|bool|null> $rawParams
      */
-    public function mergeRaw(string $sql, array $rawParams): string
+    public function mergeRaw(string $sql, array $rawParams, ?string $driver = null): string
     {
         foreach ($rawParams as $name => $value) {
             if (!is_string($name) || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1) {
@@ -89,89 +89,20 @@ final class RenderContext
             if (!is_scalar($value) && $value !== null) {
                 throw new InvalidArgumentException('Raw SQL parameter values must be scalar or null');
             }
+            if (is_float($value) && !is_finite($value)) {
+                throw new InvalidArgumentException('Raw SQL floating-point parameter values must be finite');
+            }
         }
 
         $used = [];
-        $out = '';
-        $length = strlen($sql);
-        $state = 'sql';
-        for ($i = 0; $i < $length; $i++) {
-            $char = $sql[$i];
-            $next = $sql[$i + 1] ?? '';
-            if ($state !== 'sql') {
-                $out .= $char;
-                if (str_starts_with($state, '$')) {
-                    if (substr($sql, $i, strlen($state)) === $state) {
-                        $out .= substr($state, 1);
-                        $i += strlen($state) - 1;
-                        $state = 'sql';
-                    }
-                    continue;
-                }
-                if ($state === 'line') {
-                    if ($char === "\n" || $char === "\r") {
-                        $state = 'sql';
-                    }
-                    continue;
-                }
-                if ($state === 'block') {
-                    if ($char === '*' && $next === '/') {
-                        $out .= $next;
-                        $i++;
-                        $state = 'sql';
-                    }
-                    continue;
-                }
-                if ($char === $state) {
-                    if ($next === $char) {
-                        $out .= $next;
-                        $i++;
-                    } else {
-                        $state = 'sql';
-                    }
-                }
-                continue;
+        $out = \Pixiaoka\Orm\Sql\SqlLexer::replacePlaceholders($sql, $driver, function (string $name) use ($rawParams, &$used): string {
+            if (!array_key_exists($name, $rawParams)) {
+                throw new InvalidArgumentException('Raw SQL is missing parameter: ' . $name);
             }
+            $used[$name] = true;
 
-            if ($char === '$' && preg_match('/\G\$([A-Za-z_][A-Za-z0-9_]*)?\$/', $sql, $match, 0, $i) === 1) {
-                $state = $match[0];
-                $out .= $state;
-                $i += strlen($state) - 1;
-            } elseif ($char === "'" || $char === '"' || $char === '`') {
-                $state = $char;
-                $out .= $char;
-            } elseif ($char === '-' && $next === '-') {
-                $state = 'line';
-                $out .= '--';
-                $i++;
-            } elseif ($char === '#') {
-                $state = 'line';
-                $out .= $char;
-            } elseif ($char === '/' && $next === '*') {
-                $state = 'block';
-                $out .= '/*';
-                $i++;
-            } elseif ($char === '?') {
-                throw new InvalidArgumentException('Raw SQL requires named placeholders; ? placeholders are not supported');
-            } elseif ($char === ':' && $next === ':') {
-                $out .= '::';
-                $i++;
-            } elseif ($char === ':' && preg_match('/[A-Za-z_]/', $next) === 1) {
-                $end = $i + 1;
-                while ($end + 1 < $length && preg_match('/[A-Za-z0-9_]/', $sql[$end + 1]) === 1) {
-                    $end++;
-                }
-                $name = substr($sql, $i + 1, $end - $i);
-                if (!array_key_exists($name, $rawParams)) {
-                    throw new InvalidArgumentException('Raw SQL is missing parameter: ' . $name);
-                }
-                $used[$name] = true;
-                $out .= $this->bind($rawParams[$name]);
-                $i = $end;
-            } else {
-                $out .= $char;
-            }
-        }
+            return $this->bind($rawParams[$name]);
+        });
 
         $missing = array_diff(array_keys($rawParams), array_keys($used));
         if ($missing !== []) {
