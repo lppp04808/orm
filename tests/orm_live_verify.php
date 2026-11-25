@@ -1665,7 +1665,8 @@ function runRelationScenarios(string $driver, PDO $pdo, Check $check): void
         for ($index = 0; $index < 500; $index++) {
             $badRows[] = ['name' => 'prevalidated-' . $index];
         }
-        $badRows[] = ['id' => 'invalid'];
+        // 生成主键现在按契约单独拒绝；这里继续使用普通字段非法值验证整批类型预检。
+        $badRows[] = ['name' => ['invalid']];
         $inserts = 0;
         $unsubscribeInserts = $gateway->subscribe(static function (Event $event) use (&$inserts): void {
             if ($event instanceof SqlEvent && $event->operation === 'INSERT') {
@@ -1676,7 +1677,7 @@ function runRelationScenarios(string $driver, PDO $pdo, Check $check): void
             try {
                 VerifyRelationCustomer::insertAll($badRows);
                 $check->no('s24. 500+1 坏数组行在第一条 INSERT 前拒绝', '没有抛出预期异常');
-            } catch (IdentityException|\TypeError) {
+            } catch (IdentityException|\TypeError|\Pixiaoka\Orm\Exception\CastException) {
                 $afterBadBatch = (int) $pdo->query('SELECT COUNT(*) FROM ' . VerifyRelationCustomer::table())->fetchColumn();
                 $check->assert($inserts === 0 && $afterBadBatch === $beforeBadBatch,
                     's24. 500+1 坏数组行在第一条 INSERT 前拒绝', 'inserts=' . $inserts);
