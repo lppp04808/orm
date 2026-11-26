@@ -86,7 +86,7 @@ Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
 ```
 
 `Session::scope()` restores the previous session on return or exception.
-Use independent PDO/Gateway instances for concurrent Fibers or coroutines.
+Bind an independent PDO/Gateway inside each Fiber or coroutine. `Session::get()` only looks in the current context.
 
 ## Documentation
 

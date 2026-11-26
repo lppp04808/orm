@@ -86,7 +86,7 @@ Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
 ```
 
 `Session::scope()` 在正常返回或异常时都会恢复此前的会话。
-并发 Fiber 或协程必须使用各自独立的 PDO/Gateway 实例。
+每个 Fiber 或协程都需要在内部绑定独立的 PDO/Gateway。`Session::get()` 只查找当前上下文的会话。
 
 ## 文档导航
 

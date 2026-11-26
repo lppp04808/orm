@@ -24,13 +24,11 @@ final class SessionLifecycleTest extends TestCase
     protected function setUp(): void
     {
         Session::discard();
-        Session::strict(false);
         $this->rootGateway = self::gateway(':memory:');
     }
 
     protected function tearDown(): void
     {
-        Session::strict(false);
         Session::discard();
     }
 
@@ -130,28 +128,35 @@ final class SessionLifecycleTest extends TestCase
         Session::discard();
     }
 
-    public function testStrictFiberMustOwnSessionInsteadOfUsingRoot(): void
+    public function testStaticEntityQueryRequiresSessionInCurrentFiber(): void
     {
         Session::use($this->rootGateway);
-        Session::strict();
-        $fiber = new \Fiber(static fn (): string => Session::get()->gateway::class);
+        $fiber = new \Fiber(static fn () => LifecycleRecord::query());
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessage('strict mode forbids root fallback');
+        $this->expectExceptionMessage('in the current Fiber/coroutine');
         $fiber->start();
     }
 
-    public function testStrictModePreservesExplicitFiberAndRootUsage(): void
+    public function testExplicitFiberAndRootSessionsRemainIndependent(): void
     {
-        Session::use($this->rootGateway);
-        Session::strict();
-        $fiber = new \Fiber(function (): void {
-            $gateway = self::gateway(':memory:');
-            Session::use($gateway);
-            self::assertSame($gateway, Session::get()->gateway);
+        $rootSession = Session::use($this->rootGateway);
+        $rootNamed = Session::use(self::gateway(':memory:'), 'readonly');
+        $gateway = self::gateway(':memory:');
+        $fiber = new \Fiber(static function () use ($gateway): void {
+            $session = Session::use($gateway);
+            $named = Session::use($gateway, 'readonly');
+            \Fiber::suspend();
+            self::assertSame($session, Session::get());
+            self::assertSame($named, Session::get('readonly'));
+            Session::discard();
         });
         $fiber->start();
+        self::assertSame($rootSession, Session::get());
+        self::assertSame($rootNamed, Session::get('readonly'));
+        $fiber->resume();
         self::assertTrue($fiber->isTerminated());
-        self::assertSame($this->rootGateway, Session::get()->gateway);
+        self::assertSame($rootSession, Session::get());
+        self::assertSame($rootNamed, Session::get('readonly'));
     }
 
     public function testScopeRestoresPreviousSessionAndReturnsCallbackValue(): void
@@ -422,7 +427,6 @@ final class SessionLifecycleTest extends TestCase
             return new \Fiber(static function () use (&$states): void {
                 $connection = new IndependentLifecycleConnection();
                 Session::use(new EntityGateway($connection));
-                Session::strict();
                 $connection->onSuspend = static function (): void {
                     \Fiber::suspend();
                 };
@@ -523,12 +527,23 @@ final class SessionLifecycleTest extends TestCase
         self::fail('128 次独立分配/释放后仍未覆盖 Fiber 数字 ID 复用，请检查测试前提');
     }
 
-    public function testLegacyFiberRootFallbackRemainsOptInCompatible(): void
+    public function testNamedFiberScopeDoesNotRestoreRootSession(): void
     {
-        Session::use($this->rootGateway);
-        $fiber = new \Fiber(static fn (): EntityGateway => Session::get()->gateway);
-        $fiber->start();
-        self::assertSame($this->rootGateway, $fiber->getReturn());
+        $root = Session::use($this->rootGateway, 'readonly');
+        $gateway = self::gateway(':memory:');
+        $fiber = new \Fiber(static function () use ($gateway): void {
+            Session::scope($gateway, static function () use ($gateway): void {
+                self::assertSame($gateway, Session::get('readonly')->gateway);
+            }, 'readonly');
+            Session::get('readonly');
+        });
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage("Session::use(..., 'readonly') registration exists in the current Fiber/coroutine");
+        try {
+            $fiber->start();
+        } finally {
+            self::assertSame($root, Session::get('readonly'));
+        }
     }
 
     public function testActiveFiberCannotShareGatewayWithoutTransaction(): void

@@ -6,7 +6,7 @@ Namespace: `Pixiaoka\Orm\`. The standalone Composer package lives in `src/`. Thi
 
 ## 1. Initialization
 
-The ORM does not depend on webman, own PDO, or require a connection pool. With ordinary PHP-FPM, register a Session at the start of a request and call `Session::discard()` in `finally`. Long-running workers and concurrent Fibers/coroutines should use strict mode and explicit scopes:
+The ORM does not depend on webman, own PDO, or require a connection pool. With ordinary PHP-FPM, register a Session at the start of a request and call `Session::discard()` in `finally`. For concurrent work, bind a Session inside each execution context. A scope clears the binding when the operation exits.
 
 ```php
 use Pixiaoka\Orm\Gateway\EntityGateway;
@@ -23,11 +23,14 @@ try {
     Session::discard();
 }
 
-// Each Fiber/coroutine uses its own connection; the application or an optional pool supplies it.
-Session::strict();
-Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
-    // The previous Session is restored on both normal return and exceptions.
+// Create or borrow an independent connection inside each Fiber/coroutine.
+$fiber = new \Fiber(static function (): void {
+    $pdo = new \PDO('mysql:host=...;dbname=...', 'user', 'pass');
+    Session::scope(new EntityGateway(new PdoConnection($pdo)), static function (): void {
+        // Application operations in this Fiber.
+    });
 });
+$fiber->start();
 
 // Alternatively, omit the callback and manage the scope manually; close it in the same Context.
 $scope = Session::scope(new EntityGateway(new PdoConnection($pdo)));
@@ -83,7 +86,7 @@ try {
 }
 ```
 
-The `$name` argument of `use()`, `get()`, and `scope()` defaults to `'default'`. Omitting the argument to `discard()` clears only `default`; pass explicit `null` to clear all. Named sessions maintain separate transaction and rollback state, and an entity cannot implicitly switch data sources. Multiple sessions need independent PDO/Gateway instances; this API does not make one physical connection safe for concurrent use.
+The `$name` argument of `use()`, `get()`, and `scope()` defaults to `'default'`. Calling `discard()` with no argument or with `null` clears all bindings in the current context. Pass a name to clear just that binding. Named sessions maintain separate transaction and rollback state, and an entity cannot implicitly switch data sources. Multiple sessions need independent PDO/Gateway instances; this API does not make one physical connection safe for concurrent use.
 
 ### ManagedConnection and connection pools
 
@@ -95,7 +98,9 @@ The `$name` argument of `use()`, `get()`, and `scope()` defaults to `'default'`.
 
 A pool may call `ping()` when lending or returning a connection, but must first clean up the ORM context normally through `Session::discard()`. `ping()` does not establish the result of an uncommitted transaction, and `forceRollback()` must not hide an unknown commit/rollback result. After an unknown result, discard the connection, Gateway, and associated entities. A decorator implementing only the legacy `Connection` interface need not add these methods, but it has no physical SAVEPOINT capability; see [Transactions](#9-transactions) for nested behavior.
 
-`Session` associates Fiber or runtime coroutine objects through `WeakMap`, rather than reusable numeric IDs; transaction contexts are likewise isolated by object identity. `Session::strict()` prevents an unregistered Fiber/coroutine from implicitly falling back to the root Session. It is disabled by default for backward compatibility. `Session::scope()` restores the previous Session on normal return or exception. Without a callback, the returned `SessionScope` must be closed manually with `close()` and cannot be closed from another context.
+`Session::get($name)` only looks up `$name` in the current execution context. If the name has no binding there, it throws `LogicException`, even when that name is bound in the root context. Session and transaction contexts use object identity through `WeakMap`. `Session::scope()` restores the previous binding in the same context on return or exception. Without a callback, close the returned `SessionScope` with `close()` in the context that opened it.
+
+**Upgrading from older releases.** Remove calls to `Session::strict()` and `Session::isStrict()`. If a Fiber or coroutine relied on a root binding, bind its own Gateway with `Session::use()` or `Session::scope()` before using a static model API.
 
 **webman is only an optional integration.** Application middleware may create the scope for each request; do not implicitly share a root PDO with all Fibers. Nested contexts must explicitly select connections and do not inherit a parent transaction. PHP-FPM needs no pool for one connection per request; long-running workers and concurrent Fibers/coroutines rely on the application or an optional adapter to lend and return connections. SQLite does not permit multiple uncommitted write transactions in parallel. Fiber tests with independent PDO instances validate lifecycle, not concurrent SQLite writes. Validate Swoole/Swow with their real extensions; Fiber tests are not a substitute.
 

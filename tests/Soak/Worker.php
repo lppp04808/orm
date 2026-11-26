@@ -51,7 +51,6 @@ final class Worker
         $worker = (int) $this->config['worker'];
         $prefix = $this->config['prefix'];
         SoakTables::configure($prefix);
-        Session::strict();
         mt_srand($this->config['seed'] + $worker * 1009);
         $deadline = (float) $this->config['deadline'];
         $pdo = null;

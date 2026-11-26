@@ -29,14 +29,9 @@ final class Session
     /** @var WeakMap<Context, WeakMap<EntityGateway, int>>|null 同上下文多次绑定同一网关的引用计数。 */
     private static ?WeakMap $gatewayReferences = null;
 
-    /** @var array<string, self> */
-    private static array $mainSessions = [];
-
     private static ?bool $hasSwoole = null;
 
     private static ?bool $hasSwow = null;
-
-    private static bool $strict = false;
 
     /** @var \WeakMap<Context, array<string, array{rolledBack: bool, failed: bool}>>|null 各命名会话的独立回滚结果。 */
     private static ?\WeakMap $rollbackStatuses = null;
@@ -136,20 +131,7 @@ final class Session
         }
     }
 
-    /**
-     * 严格模式下 Fiber/协程不得隐式使用根 Session。
-     * 默认关闭以保持旧应用兼容；常驻进程和并发应用建议开启。
-     */
-    public static function strict(bool $enabled = true): void
-    {
-        self::$strict = $enabled;
-    }
-
-    public static function isStrict(): bool
-    {
-        return self::$strict;
-    }
-
+    /** 仅查找当前执行上下文中的指定会话。 */
     public static function get(string $name = 'default'): self
     {
         self::assertSessionName($name);
@@ -159,14 +141,14 @@ final class Session
             return $session;
         }
 
-        if (self::$strict && (\Fiber::getCurrent() !== null || self::runtimeCoroutine() !== null)) {
-            throw new LogicException('No Pixiaoka\Orm\Session::use() registration exists in the current Fiber/coroutine; strict mode forbids root fallback: ' . $name);
+        $message = $name === 'default'
+            ? 'No Pixiaoka\Orm\Session::use() registration exists'
+            : "No Pixiaoka\\Orm\\Session::use(..., '$name') registration exists";
+        if ($context !== Context::root()) {
+            $message .= ' in the current Fiber/coroutine';
         }
 
-        return self::$mainSessions[$name]
-            ?? throw new LogicException($name === 'default'
-                ? 'No Pixiaoka\Orm\Session::use() registration exists'
-                : "No Pixiaoka\\Orm\\Session::use(..., '$name') registration exists");
+        throw new LogicException($message);
     }
 
     /**
@@ -234,9 +216,6 @@ final class Session
                 }
             }
             self::releaseGateway($session->gateway, $context);
-            if ($context === Context::root()) {
-                unset(self::$mainSessions[$name]);
-            }
             $session->gateway->observeSession('discard', $context, $exception);
         }
     }
@@ -258,13 +237,6 @@ final class Session
     {
         if (self::$contextSessions !== null && isset(self::$contextSessions[$context])) {
             foreach (self::$contextSessions[$context] as $name => $session) {
-                if ($session->gateway === $gateway) {
-                    return $name;
-                }
-            }
-        }
-        if ($context === Context::root()) {
-            foreach (self::$mainSessions as $name => $session) {
                 if ($session->gateway === $gateway) {
                     return $name;
                 }
@@ -382,9 +354,6 @@ final class Session
         $sessions = self::$contextSessions[$context] ?? [];
         $sessions[$name] = $session;
         self::$contextSessions[$context] = $sessions;
-        if ($context === Context::root()) {
-            self::$mainSessions[$name] = $session;
-        }
     }
 
     private static function lookup(Context $context, string $name): ?self

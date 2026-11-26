@@ -6,7 +6,7 @@ English: [USAGE.md](./USAGE.md) | 首页：[README.zh-CN.md](./README.zh-CN.md)
 
 ## 1. 初始化
 
-ORM 不依赖 webman，也不拥有 PDO 或强制连接池。普通 PHP-FPM 可在请求开始时登记 Session，并在 `finally` 中调用 `Session::discard()`。常驻进程和并发 Fiber/协程建议使用严格模式与作用域：
+ORM 不依赖 webman，也不拥有 PDO 或强制连接池。普通 PHP-FPM 可在请求开始时登记 Session，并在 `finally` 中调用 `Session::discard()`。并发执行时，在各自的上下文中绑定 Session。可以用作用域在操作退出时自动清理绑定。
 
 ```php
 use Pixiaoka\Orm\Gateway\EntityGateway;
@@ -23,11 +23,14 @@ try {
     Session::discard();
 }
 
-// 每个 Fiber/协程使用自己的连接；连接可由应用或可选连接池提供。
-Session::strict();
-Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
-    // 正常返回、异常均自动恢复此前的 Session。
+// 在每个 Fiber/协程内部创建或借用独立连接。
+$fiber = new \Fiber(static function (): void {
+    $pdo = new \PDO('mysql:host=...;dbname=...', 'user', 'pass');
+    Session::scope(new EntityGateway(new PdoConnection($pdo)), static function (): void {
+        // 此 Fiber 中的业务操作。
+    });
 });
+$fiber->start();
 
 // 也可省略回调，手动管理作用域；必须在同一个 Context 中关闭。
 $scope = Session::scope(new EntityGateway(new PdoConnection($pdo)));
@@ -83,7 +86,7 @@ try {
 }
 ```
 
-`use()`、`get()` 与 `scope()` 的 `$name` 默认都是 `'default'`；`discard()` 省略参数只清理 `default`，只有显式 `null` 才清理全部。命名会话分别维护事务与回滚状态，跨数据源的实体不能隐式换绑。多个会话需要各自独立的 PDO/Gateway，不能借此共享一个并发物理连接。
+`use()`、`get()` 与 `scope()` 的 `$name` 默认都是 `'default'`。`discard()` 省略参数或传入 `null` 时，清理当前上下文的全部绑定。传入名称时，只清理该名称的绑定。命名会话分别维护事务与回滚状态，跨数据源的实体不能隐式换绑。多个会话需要各自独立的 PDO/Gateway，不能借此共享一个并发物理连接。
 
 ### ManagedConnection 与连接池
 
@@ -95,7 +98,9 @@ try {
 
 连接池可在借出或归还时调用 `ping()`，但归还前必须先通过 `Session::discard()` 正常清理 ORM 上下文。`ping()` 不证明未提交事务的结果，`forceRollback()` 也不能被用来掩盖 commit/rollback 结果未知；结果未知时仍应废弃连接、Gateway 和关联实体。只实现旧 `Connection` 的装饰器无需添加这两个方法，但它没有物理 SAVEPOINT 能力，嵌套事务行为见[事务](#9-事务)。
 
-`Session` 使用 `WeakMap` 关联 Fiber 或运行时协程对象，不依赖可能被复用的数字 ID；事务上下文同样按对象身份隔离。`Session::strict()` 禁止未登记的 Fiber/协程隐式回退到根 Session，默认关闭以保持向后兼容。`Session::scope()` 在正常返回或异常时恢复先前 Session；省略回调后返回的 `SessionScope` 必须手动 `close()`，且不允许跨上下文关闭。
+`Session::get($name)` 只在当前执行上下文查找 `$name`。缺少绑定时抛出 `LogicException`，即使根上下文已绑定同名会话也一样。Session 与事务均通过 `WeakMap` 按上下文对象身份隔离。`Session::scope()` 在正常返回或异常时恢复同一上下文中先前的绑定。如果省略回调，必须在创建作用域的上下文中调用 `close()`。
+
+**从旧版本升级。** 删除 `Session::strict()` 和 `Session::isStrict()` 的调用。原来依赖根会话的 Fiber 或协程，需要先用 `Session::use()` 或 `Session::scope()` 绑定自己的 Gateway，再调用模型静态 API。
 
 **webman 只是可选适配方式**，可在应用中间件中为每个请求调用上述作用域；不要把根 PDO 隐式共享给所有 Fiber。嵌套上下文必须显式选择连接，不隐式继承父上下文事务。PHP-FPM 每请求单连接无需池化；常驻进程和并发 Fiber/协程由应用或可选适配器负责连接租借与归还。SQLite 不允许多个未提交写事务并行；独立 PDO 的 Fiber 测试验证生命周期，不代表 SQLite 支持多个同时写事务。Swoole/Swow 仍应在真实扩展环境验证，不能仅以 Fiber 测试替代。
 

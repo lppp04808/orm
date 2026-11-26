@@ -11,7 +11,7 @@ use WeakMap;
  * 框架无关的执行上下文身份。
  *
  * 对象身份避免 Fiber/协程数字 ID 重用。WeakMap 不延长 Fiber 或运行时协程的生命周期；
- * 根上下文由 Session 的根 Session 保持有效。
+ * 根上下文由本类的静态引用保持有效。
  *
  * @internal
  */

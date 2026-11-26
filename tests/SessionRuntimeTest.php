@@ -44,7 +44,6 @@ namespace Tests\Pixiaoka\Orm {
         protected function setUp(): void
         {
             Session::discard();
-            Session::strict(false);
             $this->root = self::gateway();
             Session::use($this->root);
         }
@@ -55,7 +54,6 @@ namespace Tests\Pixiaoka\Orm {
             if (method_exists(SwooleCoroutine::class, 'setCurrentForTest')) {
                 SwooleCoroutine::setCurrentForTest(null);
             }
-            Session::strict(false);
             Session::discard();
         }
 
@@ -78,15 +76,14 @@ namespace Tests\Pixiaoka\Orm {
             SwooleCoroutine::setCurrentForTest(null);
         }
 
-        public function testStrictSwooleContextCannotFallbackToRoot(): void
+        public function testUnboundSwooleContextCannotUseRootSession(): void
         {
             if (!method_exists(SwooleCoroutine::class, 'setCurrentForTest')) {
                 self::markTestSkipped('真实 Swoole 扩展的并发适配需在独立扩展环境验收');
             }
             SwooleCoroutine::setCurrentForTest(new \stdClass());
-            Session::strict();
             $this->expectException(\LogicException::class);
-            $this->expectExceptionMessage('strict mode forbids root fallback');
+            $this->expectExceptionMessage('in the current Fiber/coroutine');
             try {
                 Session::get();
             } finally {
@@ -96,7 +93,6 @@ namespace Tests\Pixiaoka\Orm {
 
         public function testRuntimeObjectsDoNotShareSessionOrTransactionContext(): void
         {
-            Session::strict();
             $first = new SwowCoroutine();
             $second = new SwowCoroutine();
             $firstGateway = self::gateway();
@@ -142,7 +138,6 @@ namespace Tests\Pixiaoka\Orm {
             SwowCoroutine::setCurrent($runtime);
             $readonly = self::gateway();
             Session::use($readonly, 'readonly');
-            self::assertSame($this->root, Session::get()->gateway);
             self::assertSame($readonly, Session::get('readonly')->gateway);
             for ($i = 0; $i < 3; $i++) {
                 self::assertSame(Context::coroutine($runtime), Session::context());
@@ -152,9 +147,15 @@ namespace Tests\Pixiaoka\Orm {
                 self::assertIsBool($cached->getValue());
             }
             Session::discard('readonly');
-            self::assertSame($this->root, Session::get()->gateway);
-            Session::discard();
-            SwowCoroutine::setCurrent(null);
+            $this->expectException(\LogicException::class);
+            $this->expectExceptionMessage('in the current Fiber/coroutine');
+            try {
+                Session::get();
+            } finally {
+                Session::discard();
+                SwowCoroutine::setCurrent(null);
+                self::assertSame($this->root, Session::get()->gateway);
+            }
         }
 
         public function testAnotherActiveRuntimeCannotUseSameGateway(): void
