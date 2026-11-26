@@ -29,6 +29,8 @@ enum MetaSampleStatus: int
 {
     case Off = 0;
     case On = 1;
+    case Minimum = PHP_INT_MIN;
+    case Maximum = PHP_INT_MAX;
 }
 
 /**
@@ -188,6 +190,27 @@ final class OrmCastMetadataTest extends TestCase
         $field = $this->fieldOf(TypedRow::class, 'n_enum');
         $enum = $this->caster->toPhp(TypedRow::class, $field, '1');
         self::assertSame(MetaSampleStatus::On, $enum);
+    }
+
+    public function testCasterAcceptsSignedIntegerEnumBoundaryStrings(): void
+    {
+        $field = $this->fieldOf(TypedRow::class, 'n_enum');
+        self::assertSame(MetaSampleStatus::Minimum, $this->caster->toPhp(TypedRow::class, $field, (string) PHP_INT_MIN));
+        self::assertSame(MetaSampleStatus::Maximum, $this->caster->toPhp(TypedRow::class, $field, (string) PHP_INT_MAX));
+    }
+
+    public function testCasterRejectsIntegerEnumOverflow(): void
+    {
+        $field = $this->fieldOf(TypedRow::class, 'n_enum');
+        $this->expectException(CastException::class);
+        $this->caster->toPhp(TypedRow::class, $field, PHP_INT_MAX . '0');
+    }
+
+    public function testMalformedTemporalValueWithNullByteThrowsCastException(): void
+    {
+        $field = $this->fieldOf(TypedRow::class, 'n_time');
+        $this->expectException(CastException::class);
+        $this->caster->toPhp(TypedRow::class, $field, "2026-01-01 00:00:00\0");
     }
 
     public function testCasterRejectsMalformedTimeText(): void

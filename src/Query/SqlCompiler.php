@@ -51,7 +51,10 @@ final readonly class SqlCompiler
             if (is_nan($value) || is_infinite($value)) {
                 throw new InvalidArgumentException('SQL preview requires finite floating-point parameters');
             }
-            $literal = (string) $value;
+            $literal = sprintf('%.14H', $value);
+            if ((float) $literal !== $value) {
+                $literal = sprintf('%.17H', $value);
+            }
 
             // 保留浮点类型，避免把 1.0 悄悄变成整数字面量。
             return preg_match('/^[+-]?\d+$/', $literal) === 1 ? $literal . '.0' : $literal;
@@ -166,8 +169,11 @@ final readonly class SqlCompiler
         $sets = [];
         foreach ($set as $column => $value) {
             $field = $this->resolveUpdateField($class, $column);
+            if (isset($sets[$field->column])) {
+                throw new InvalidArgumentException('Duplicate UPDATE column: ' . $field->column);
+            }
             $casted = $this->castValue($class, $field->column, $value);
-            $sets[] = $this->quote($field->column) . ' = ' . $ctx->bind($casted);
+            $sets[$field->column] = $this->quote($field->column) . ' = ' . $ctx->bind($casted);
         }
         $where = $this->renderWhereClause($class, $state, $ctx);
         if ($where === '') {
@@ -211,7 +217,7 @@ final readonly class SqlCompiler
         $meta = $this->gateway->meta($class);
         $ctx = new RenderContext();
         $quotedColumn = $this->quote($field->column);
-        $sets = [$quotedColumn . ' = ' . $quotedColumn . ' ' . $operator . ' ' . $ctx->bind($amount)];
+        $sets = [$field->column => $quotedColumn . ' = ' . $quotedColumn . ' ' . $operator . ' ' . $ctx->bind($amount)];
         foreach ($extra as $extraColumn => $value) {
             if (!is_string($extraColumn)) {
                 throw new InvalidArgumentException('Delta UPDATE extra field names must be strings');
@@ -220,7 +226,10 @@ final readonly class SqlCompiler
             if ($extraField->column === $field->column) {
                 throw new InvalidArgumentException('Delta UPDATE extra fields cannot include the target column: ' . $field->column);
             }
-            $sets[] = $this->quote($extraField->column) . ' = '
+            if (isset($sets[$extraField->column])) {
+                throw new InvalidArgumentException('Duplicate UPDATE column: ' . $extraField->column);
+            }
+            $sets[$extraField->column] = $this->quote($extraField->column) . ' = '
                 . $ctx->bind($this->castValue($class, $extraField->column, $value));
         }
         $where = $this->renderWhereClause($class, $state, $ctx);

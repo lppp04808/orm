@@ -128,6 +128,27 @@ final class GeneratedOnlyInsertTest extends TestCase
         self::assertCount($before, $connection->queries);
     }
 
+    public function testDefaultValueBatchRejectsRepeatedEntityBeforeHooksAndSql(): void
+    {
+        $pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $pdo->exec('CREATE TABLE generated_only (id INTEGER PRIMARY KEY AUTOINCREMENT)');
+        Session::use(new EntityGateway(new PdoConnection($pdo)));
+        $row = new GeneratedOnlyHookRow();
+        $row->failBeforeInsert = true;
+
+        try {
+            GeneratedOnlyHookRow::insertAll([$row, [], $row]);
+            self::fail('同一实体不能对应批次内的两行默认值');
+        } catch (\InvalidArgumentException $e) {
+            self::assertStringContainsString('same entity instance', $e->getMessage());
+        }
+
+        self::assertSame(0, (int) $pdo->query('SELECT COUNT(*) FROM generated_only')->fetchColumn());
+        self::assertTrue($row->isNew());
+        self::assertFalse($row->hasGatewayBinding());
+        self::assertFalse($row->propSet('id'));
+    }
+
     public function testDefaultValueBatchBeforeHookFailureDoesNotBindOrWriteAnyEntity(): void
     {
         $pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);

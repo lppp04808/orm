@@ -361,18 +361,14 @@ final class TemporalStorageTest extends TestCase
         self::assertNull($relation->targetKey[0]->temporalDisplayFormat);
     }
 
-    /** @return array<string, array{string, string}> */
+    /** @return array<string, array{string}> */
     public static function temporalSchemaTypes(): array
     {
-        return [
-            'mysql' => ['mysql', '`temporal_schema_record`'],
-            'pgsql' => ['pgsql', '"temporal_schema_record"'],
-            'sqlite' => ['sqlite', '"temporal_schema_record"'],
-        ];
+        return ['mysql' => ['mysql'], 'pgsql' => ['pgsql'], 'sqlite' => ['sqlite']];
     }
 
     #[DataProvider('temporalSchemaTypes')]
-    public function testTemporalSchemaPreviewsAndCompatibleTypes(string $driver, string $quotedTable): void
+    public function testTemporalSchemaPreviewsAndCompatibleTypes(string $driver): void
     {
         $types = match ($driver) {
             'mysql' => ['on_date' => 'date', 'at_micros' => 'datetime(6)', 'at_millis' => 'bigint'],
@@ -396,13 +392,13 @@ final class TemporalStorageTest extends TestCase
             }
             $changes[$change['name']] = $change;
             self::assertSame($expected[$change['name']] ?? null, $change['expected']);
-            self::assertStringContainsString('ALTER TABLE ' . $quotedTable . ' ADD COLUMN', $change['sql']);
+            self::assertFalse($change['executable']);
         }
         self::assertSame(['on_date', 'at_micros', 'at_millis'], array_values(array_diff(array_keys($changes), ['id'])));
 
         $columns = [];
         foreach ($expected as $name => $type) {
-            $columns[] = new ColumnSchema($name, strtoupper($type), false, null, 0, false);
+            $columns[] = new ColumnSchema($name, strtoupper($type), false, null, $name === 'id' ? 1 : 0, false);
         }
         $matching = new TableSchema('temporal_schema_record', $columns);
         self::assertSame([], $differ->compare($meta, $matching, $driver)['changes']);
@@ -413,7 +409,7 @@ final class TemporalStorageTest extends TestCase
     {
         return [
             'MySQL micros' => ['mysql', 'at_micros', 'datetime'],
-            'PostgreSQL micros' => ['pgsql', 'at_micros', 'timestamp without time zone'],
+            'PostgreSQL micros' => ['pgsql', 'at_micros', 'timestamp(3) without time zone'],
             'MySQL date' => ['mysql', 'on_date', 'datetime'],
             'PostgreSQL date' => ['pgsql', 'on_date', 'timestamp without time zone'],
         ];

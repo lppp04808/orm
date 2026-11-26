@@ -42,15 +42,19 @@ composer require pixiaoka/orm
 ## 30 秒快速开始
 
 下面使用内存 SQLite 演示；实际应用请自行创建并维护表结构。
-精简模型与完整 `Session::scope()` 示例合在一起便于直接阅读。
+安装包后，把示例保存为 Composer 项目根目录下的 `quick-start.php`，执行 `php quick-start.php`。
 
 ```php
+<?php
+
 use Pixiaoka\Orm\Annotation\Column;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Gateway\EntityGateway;
 use Pixiaoka\Orm\Gateway\PdoConnection;
 use Pixiaoka\Orm\Session;
+
+require __DIR__ . '/vendor/autoload.php';
 
 final class User extends Entity
 {
@@ -98,7 +102,9 @@ Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
 | 条件、排序、分页与查询克隆 | [查询构建器](./USAGE.zh-CN.md#5-查询构建器) |
 | JOIN、聚合、子查询、UNION 与原生 SQL | [复杂查询](./USAGE.zh-CN.md#6-复杂查询) |
 | 条件写、UPSERT 与行锁 | [条件写入](./USAGE.zh-CN.md#7-条件-update--deleteupsert-与行锁) |
+| 批量插入与仅有生成主键的模型 | [批量插入](./USAGE.zh-CN.md#8-批量插入) |
 | 嵌套事务与回滚保证 | [事务](./USAGE.zh-CN.md#9-事务) |
+| 已持久化实体身份与复合主键 | [主键规则](./USAGE.zh-CN.md#13-主键规则) |
 | 数据库结构读取与模型生成 | [独立模型生成器](./USAGE.zh-CN.md#14-独立模型生成器) |
 | 索引声明与绝不自动执行的 Schema 差异 | [Schema 差异对比](./USAGE.zh-CN.md#16-索引声明与-schema-差异对比) |
 | SQL、事务与会话事件 | [可观测性](./USAGE.zh-CN.md#17-可观测性) |
@@ -119,7 +125,7 @@ Session::scope(new EntityGateway(new PdoConnection($pdo)), function (): void {
 | 500 次主键读取 | 1.880 / 6.334 | 75.368 / 47.457 | 101.454 / 51.947 |
 | 200 次原子自增 | 0.591 / 1.866 | 37.193 / 22.720 | 46.725 / 20.439 |
 
-PDO 主键路径读取数组；`Entity::find()` 绕过行缓存并水合实体。ORM 自增使用 `Builder::increment()`，PDO 对照执行等价的参数化 SQL。不同后端的绝对耗时不能直接解释为 ORM 本身的算法开销。
+PDO 主键路径读取数组。ORM 基准在每次 `Entity::find()` 前清空行缓存，测量缓存未命中时的实体水合路径。ORM 自增使用 `Builder::increment()`，PDO 对照执行等价的参数化 SQL。不同后端的绝对耗时不能直接解释为 ORM 本身的算法开销。
 
 同一低层 SQL 的连接层对照，每轮使用新的连接封装：
 

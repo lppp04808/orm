@@ -86,6 +86,19 @@ final class PdoConnectionStatementCacheTest extends TestCase
         self::assertSame(1, $this->prepareCount($sql));
     }
 
+    #[DataProvider('statementCacheSizes')]
+    public function testBindingOrderAndOptionalColonDoNotChangeTheSelectedRow(int $cacheSize): void
+    {
+        $connection = new PdoConnection($this->pdo, statementCacheSize: $cacheSize);
+        $sql = 'SELECT value FROM statement_cache_item WHERE id = :id AND value = :value';
+
+        self::assertSame(['value' => 'one'], $connection->queryOne($sql, ['id' => 1, ':value' => 'one']));
+        self::assertSame(['value' => 'two'], $connection->queryOne($sql, ['value' => 'two', ':id' => 2]));
+        self::assertSame(1, $connection->execute('UPDATE statement_cache_item SET value = :value WHERE id = :id', ['id' => 2, 'value' => 'updated']));
+        self::assertSame(['value' => 'updated'], $connection->queryOne($sql, [':id' => 2, ':value' => 'updated']));
+        self::assertSame($cacheSize > 0 ? 1 : 3, $this->prepareCount($sql));
+    }
+
     public function testLeastRecentlyUsedStatementIsEvicted(): void
     {
         $connection = new PdoConnection($this->pdo, statementCacheSize: 2);
@@ -266,11 +279,12 @@ final class PdoConnectionStatementCacheTest extends TestCase
     public function testMissingParametersOnReusedStatementNeverReusePreviousValues(int $cacheSize): void
     {
         $connection = new PdoConnection($this->pdo, statementCacheSize: $cacheSize);
-        $sql = 'INSERT INTO statement_cache_item (id, value) VALUES (:id, :value)';
+        $this->pdo->exec('CREATE TABLE parameter_cache_item (id INTEGER PRIMARY KEY, value TEXT NOT NULL)');
+        $sql = 'INSERT INTO parameter_cache_item (id, value) VALUES (:id, :value)';
         self::assertSame(1, $connection->execute($sql, ['id' => 3, 'value' => 'three']));
 
         try {
-            $connection->execute($sql, ['id' => 3]);
+            $connection->execute($sql, ['id' => 4]);
             self::fail('A missing bound parameter must not silently reuse the previous value');
         } catch (\PDOException) {
         }
@@ -278,7 +292,17 @@ final class PdoConnectionStatementCacheTest extends TestCase
         self::assertSame([
             ['id' => 3, 'value' => 'three'],
             ['id' => 4, 'value' => 'four'],
-        ], $connection->queryAll('SELECT id, value FROM statement_cache_item WHERE id >= 3 ORDER BY id', []));
+        ], $connection->queryAll('SELECT id, value FROM parameter_cache_item ORDER BY id', []));
+    }
+
+    #[DataProvider('statementCacheSizes')]
+    public function testSqliteMissingOptionalBindingMatchesAFreshStatement(int $cacheSize): void
+    {
+        $connection = new PdoConnection($this->pdo, statementCacheSize: $cacheSize);
+        $sql = 'SELECT :value AS value';
+        self::assertSame(['value' => 'previous'], $connection->queryOne($sql, ['value' => 'previous']));
+        self::assertSame(['value' => null], $connection->queryOne($sql, []));
+        self::assertSame(['value' => 'current'], $connection->queryOne($sql, ['value' => 'current']));
     }
 
     /** @return array<string, array{int}> */
@@ -309,7 +333,7 @@ final class PdoConnectionStatementCacheTest extends TestCase
             $sql = "INSERT INTO $quote$table$quote (id, value) VALUES (:id, :value)";
             $connection->execute($sql, ['id' => 1, 'value' => 'one']);
             try {
-                $connection->execute($sql, ['id' => 1]);
+                $connection->execute($sql, ['id' => 2]);
                 self::fail('A missing parameter must fail instead of writing a stale value');
             } catch (\PDOException) {
             }
@@ -331,7 +355,7 @@ final class PdoConnectionStatementCacheTest extends TestCase
     {
         $property = new \ReflectionProperty(PdoConnection::class, 'statementCache');
 
-        return $property->getValue($connection);
+        return array_map(static fn (array $entry): PDOStatement => $entry['statement'], $property->getValue($connection));
     }
 
     private function prepareCount(string $sql): int

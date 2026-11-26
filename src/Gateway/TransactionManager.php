@@ -181,20 +181,18 @@ final class TransactionManager
                 if (Session::currentContext() !== $ctx) {
                     throw new \LogicException('A transaction callback must not switch Fiber/coroutine context before committing');
                 }
+                $firstFailure = $this->transactionFailuresByContext[$ctx] ?? $this->discardFailures[$ctx] ?? null;
+                if ($firstFailure !== null) {
+                    // 内层未知结果即使被业务代码捕获，也不能被后续 RELEASE/commit 变成成功。
+                    throw $firstFailure;
+                }
                 if ($this->transactionDepth($ctx) !== $depth + 1) {
-                    if (!Session::rollbackConfirmed($ctx, $sessionName)) {
+                    if (!$this->rollbackWasConfirmed($ctx)) {
                         $this->invalidateConnection();
                         throw new \LogicException('The Session was discarded during the transaction; commit is forbidden and the connection must not be reused');
                     }
                     $discardConfirmed = true;
-                    if (isset($this->transactionFailuresByContext[$ctx])) {
-                        throw $this->transactionFailuresByContext[$ctx];
-                    }
                     throw new \LogicException('The Session was discarded during the transaction; the work was rolled back and cannot be committed');
-                }
-                if (isset($this->transactionFailuresByContext[$ctx])) {
-                    // 内层未知结果即使被业务代码捕获，也不能被后续 RELEASE/commit 变成成功。
-                    throw $this->transactionFailuresByContext[$ctx];
                 }
                 $commitAttempted = true;
                 if (!$this->connection->commit()) {
@@ -205,9 +203,8 @@ final class TransactionManager
                 $firstFailure = $this->transactionFailuresByContext[$ctx]
                     ?? $this->discardFailures[$ctx]
                     ?? ($e instanceof TransactionException && $this->transactionDepth($ctx) === 0 ? $e : null);
-                if ($e instanceof \LogicException && !$commitAttempted
-                    && Session::rollbackConfirmed($ctx, $sessionName)) {
-                    // Session::discard() 已确认整链回滚；此时禁止 commit，但不伪造未知结果。
+                if (!$commitAttempted && $this->rollbackWasConfirmed($ctx)) {
+                    // 当前网关已确认整链回滚，透传后续业务异常。
                     $discardConfirmed = true;
                     $failure = $e;
                     throw $e;
@@ -233,9 +230,9 @@ final class TransactionManager
                 if ($commitAttempted) {
                     $this->observeTransaction('commit', $ctx, $startedAt, $e);
                 }
-                $discardAttempted = Session::rollbackAttempted($ctx, $sessionName);
+                $discardAttempted = $this->transactionDepth($ctx) === 0 && Session::rollbackAttempted($ctx, $sessionName);
                 if ($this->transactionDepth($ctx) === 0 && !$discardConfirmed
-                    && (!Session::rollbackConfirmed($ctx, $sessionName) || $commitAttempted)) {
+                    && (!$this->rollbackWasConfirmed($ctx) || $commitAttempted)) {
                     // discard() 的未知回滚不能被逻辑深度归零误报为完整回滚成功。
                     $transactionFailure = new TransactionException(
                         'rollback',
@@ -317,7 +314,6 @@ final class TransactionManager
         $startedAt = $active
             ? ($this->txnStartedAt[$context] ?? $this->clock->now())
             : $this->clock->now();
-        $failure = null;
         $transactionFailure = null;
         try {
             if ($active) {
@@ -332,16 +328,17 @@ final class TransactionManager
                 $this->confirmedRollbacks[$context] = true;
             }
         } catch (\Throwable $e) {
-            $failure = $e;
             $transactionFailure = new TransactionException('rollback', null, $e);
-            $this->discardFailures ??= new \WeakMap();
-            $this->discardFailures[$context] = $transactionFailure;
-            $this->rememberTransactionFailure($context, $transactionFailure);
         } finally {
             if ($transactionFailure !== null) {
                 $this->invalidateConnection();
             }
             $this->clearTransaction($context);
+            if ($transactionFailure !== null) {
+                // 逻辑事务已清理，但仍在执行的回调必须看到原始回滚失败。
+                $this->discardFailures ??= new \WeakMap();
+                $this->discardFailures[$context] = $transactionFailure;
+            }
             if ($active) {
                 $this->observeTransaction('rollback', $context, $startedAt, $transactionFailure);
             }
@@ -740,9 +737,9 @@ final class TransactionManager
         }
         // 首次 rememberEntity() 常发生在业务属性已赋值、SQL 尚未执行时。
         // 此时原持久化值在 original 中，而不是当前属性中。
-        $original = $entity->takeOriginal();
+        $original = $entity->takeOriginal() + $entity->takeOriginalPrimary();
         foreach ($meta->fields as $field) {
-            if (!$field->primary && array_key_exists($field->property, $original)) {
+            if (array_key_exists($field->property, $original)) {
                 $state['values'][$field->property] = $original[$field->property];
             }
         }
@@ -754,13 +751,12 @@ final class TransactionManager
     private function identityParts(Entity $entity, ModelMeta $meta): array
     {
         $parts = [];
+        // 事务身份记录描述已持久化的行，不能随已交付实体的当前主键变化。
+        $original = $entity->takeOriginalPrimary();
         foreach ($meta->primaryKey as $field) {
-            if (!$entity->propSet($field->property)) {
-                throw new IdentityException($meta->class . ' is missing primary key column ' . $field->column);
-            }
-            $value = $entity->{$field->property};
+            $value = $original[$field->property] ?? null;
             if ($value === null) {
-                throw new IdentityException($meta->class . ' primary key column ' . $field->column . ' must not be null');
+                throw new IdentityException($meta->class . ' is missing persisted primary key column ' . $field->column);
             }
             $parts[$field->column] = $this->caster->toDb($meta->class, $field, $value);
         }

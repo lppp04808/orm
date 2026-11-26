@@ -8,6 +8,7 @@ use Pixiaoka\Orm\Cache\RowCache;
 use Pixiaoka\Orm\Context;
 use Pixiaoka\Orm\Cast\Caster;
 use Pixiaoka\Orm\Entity;
+use Pixiaoka\Orm\Exception\CastException;
 use Pixiaoka\Orm\Exception\IdentityException;
 use Pixiaoka\Orm\Exception\OptimisticLockException;
 use Pixiaoka\Orm\Identity\Identity;
@@ -133,7 +134,7 @@ final class EntityGateway
     /** @internal 关系图优先复用本次主查询对象，其次复用 canonical 缓存对象。 */
     public function relationTarget(string $class, array $identity): ?Entity
     {
-        return $this->cache->get($class, $identity);
+        return $this->cachedEntity($this->metadata->read($class), $identity);
     }
 
     /** @internal @return array<string, int|float|string|bool|null>|null */
@@ -243,14 +244,33 @@ final class EntityGateway
     public function constrainRelationTuples(array $fields, array $tuples): Expression
     {
         $params = [];
+        if (count($fields) === 1) {
+            $placeholders = [];
+            foreach ($tuples as $index => $tuple) {
+                $name = 'relation_' . $index;
+                $placeholders[] = ':' . $name;
+                $params[$name] = $tuple[0];
+            }
+
+            return new Expression($this->quote($fields[0]->column) . ' IN (' . implode(', ', $placeholders) . ')', $params);
+        }
+
         $groups = [];
         foreach ($tuples as $index => $tuple) {
             $predicate = $this->relationTuplePredicate($fields, $tuple, 'relation_' . $index . '_');
             $groups[] = '(' . $predicate->sql . ')';
             $params += $predicate->params;
         }
+        // Keep the depth logarithmic even when the query combines this filter with other predicates.
+        while (count($groups) > 1) {
+            $next = [];
+            foreach (array_chunk($groups, 2) as $pair) {
+                $next[] = count($pair) === 1 ? $pair[0] : '(' . $pair[0] . ' OR ' . $pair[1] . ')';
+            }
+            $groups = $next;
+        }
 
-        return new Expression('(' . implode(' OR ', $groups) . ')', $params);
+        return new Expression($groups[0], $params);
     }
 
     /**
@@ -666,7 +686,7 @@ final class EntityGateway
     {
         $meta = $this->metadata->read($class);
         $identity = $this->identityFrom($meta, $key);
-        $cached = $this->cache->get($class, $identity->parts);
+        $cached = $this->cachedEntity($meta, $identity->parts);
         if ($cached !== null) {
             $this->forEntity($cached);
             $softDelete = $meta->softDeleteField();
@@ -1252,6 +1272,27 @@ final class EntityGateway
         $entity->{$property} = $this->caster->currentTimestamp($field);
     }
 
+    /** @param array<string, int|float|string|bool|null> $identity */
+    private function cachedEntity(ModelMeta $meta, array $identity): ?Entity
+    {
+        $cached = $this->cache->get($meta->class, $identity);
+        if ($cached === null) {
+            return null;
+        }
+        try {
+            if ($this->persistedIdentityOf($cached, $meta)->parts === $identity) {
+                return $cached;
+            }
+        } catch (IdentityException|CastException) {
+            // 缺失或无法转换的主键也使条目失效。
+        }
+
+        // 只清退强缓存条目，保留已交付对象的弱身份和本地修改。
+        $this->cache->clear($meta->class, $identity);
+
+        return null;
+    }
+
     private function cacheSet(Entity $entity, bool $inserted = false, string $softDeleteMode = 'default'): void
     {
         $meta = $this->metadata->read($entity::class);
@@ -1269,7 +1310,7 @@ final class EntityGateway
             // 普通缓存回填还要匹配曾交付对象的弱身份，拒绝发布篡改后的另一主键。
             $this->persistedIdentityOf($entity, $meta, !$inserted);
         }
-        $cached = $this->cache->get($entity::class, $parts);
+        $cached = $this->cachedEntity($meta, $parts);
         if ($cached !== null && $cached !== $entity) {
             $softDelete = $meta->softDeleteField();
             if ($softDelete !== null && $cached->propSet($softDelete->property)) {

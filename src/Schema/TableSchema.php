@@ -18,11 +18,15 @@ final readonly class TableSchema
     /**
      * @param list<ColumnSchema> $columns
      * @param list<IndexSchema> $indexes
+     * @param array<string, string> $columnDependencies 受数据库约束保护的列及手工迁移说明。
+     * @param array<string, string> $indexDependencies 支撑数据库约束的可见索引及手工迁移说明。
      */
     public function __construct(
         public string $name,
         array $columns,
         public array $indexes = [],
+        public array $columnDependencies = [],
+        public array $indexDependencies = [],
     ) {
         if ($columns === []) {
             throw new InvalidArgumentException("Table $name has no fields to generate");

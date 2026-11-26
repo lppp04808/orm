@@ -164,6 +164,26 @@ final class OrmBatchInsertTest extends TestCase
         }
     }
 
+    public function testRepeatedGeneratedEntityIsRejectedBeforeHooksAndSql(): void
+    {
+        $row = new BatchGeneratedRecord();
+
+        try {
+            BatchGeneratedRecord::insertAll([$row, ['body' => 'array'], $row]);
+            self::fail('同一实体不能对应批次内的两行');
+        } catch (\InvalidArgumentException $e) {
+            self::assertStringContainsString('same entity instance', $e->getMessage());
+        }
+
+        self::assertSame([], $this->connection->writes);
+        self::assertSame(0, $this->rowCount('batch_generated'));
+        self::assertTrue($row->isNew());
+        self::assertFalse($row->hasGatewayBinding());
+        self::assertFalse($row->propSet('id'));
+        self::assertSame(0, $row->beforeSaves);
+        self::assertSame(0, $row->beforeInserts);
+    }
+
     public function testMixedRowsKeepOriginalOrderAndGeneratedIdsAcrossChunks(): void
     {
         $rows = [];

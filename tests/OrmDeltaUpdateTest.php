@@ -135,6 +135,29 @@ final class OrmDeltaUpdateTest extends TestCase
         ], $this->storedCounter($row->id));
     }
 
+    #[DataProvider('duplicateAssignments')]
+    public function testColumnAndPropertyNamesCannotAssignTheSameFieldTwice(bool $delta): void
+    {
+        $row = new DeltaCounter();
+        $row->save();
+        $query = DeltaCounter::query()->where('id', $row->id);
+        $assignments = ['revision' => 1, 'changed_at' => 2];
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Duplicate UPDATE column: changed_at');
+        if ($delta) {
+            $query->increment('count', 1, $assignments);
+        } else {
+            $query->update($assignments);
+        }
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function duplicateAssignments(): array
+    {
+        return ['update' => [false], 'increment' => [true]];
+    }
+
     public function testFloatIncrementAndDecrementUseDatabaseArithmetic(): void
     {
         $row = new DeltaCounter();

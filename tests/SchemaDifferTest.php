@@ -139,14 +139,17 @@ final class SchemaDifferTest extends TestCase
         $pgsql = $differ->compare($meta, $table, 'pgsql');
         $sqlite = $differ->compare($meta, $table, 'sqlite');
 
-        self::assertStringContainsString('ALTER TABLE `differ_rows` MODIFY COLUMN `enabled` tinyint(1) NOT NULL;', $this->sql($mysql));
+        self::assertStringNotContainsString('MODIFY COLUMN `enabled`', $this->sql($mysql));
         self::assertStringContainsString('ALTER TABLE `differ_rows` MODIFY COLUMN `happened_at` datetime NULL;', $this->sql($mysql));
         self::assertStringContainsString('ALTER TABLE `differ_rows` DROP INDEX `idx_schema_name`;', $this->sql($mysql));
         self::assertStringContainsString('ALTER TABLE `differ_rows` ADD INDEX `idx_schema_name` (`name`, `tenant_id`);', $this->sql($mysql));
         self::assertStringContainsString('ALTER TABLE `differ_rows` ADD UNIQUE INDEX `uniq_schema_email` (`email`);', $this->sql($mysql));
 
         self::assertStringContainsString('ALTER TABLE "differ_rows" ALTER COLUMN "enabled" TYPE boolean;', $this->sql($pgsql));
-        self::assertStringContainsString('ALTER TABLE "differ_rows" ALTER COLUMN "enabled" SET NOT NULL;', $this->sql($pgsql));
+        $pgsqlNullable = array_values(array_filter($pgsql['changes'], static fn (array $change): bool => $change['kind'] === 'change_nullable'));
+        self::assertCount(1, $pgsqlNullable);
+        self::assertFalse($pgsqlNullable[0]['executable']);
+        self::assertStringContainsString('Backfill', (string) $pgsqlNullable[0]['note']);
         self::assertStringContainsString('ALTER TABLE "differ_rows" ALTER COLUMN "happened_at" TYPE timestamp without time zone;', $this->sql($pgsql));
         self::assertStringContainsString('DROP INDEX "idx_schema_name";', $this->sql($pgsql));
         self::assertStringContainsString('CREATE INDEX "idx_schema_name" ON "differ_rows" ("name", "tenant_id");', $this->sql($pgsql));
@@ -197,7 +200,7 @@ final class SchemaDifferTest extends TestCase
     public function testColumnPrecisionLengthAndTimezoneAreSignificant(string $driver, string $actual): void
     {
         $differ = $this->typedDiffer();
-        $table = new TableSchema('typed_schema', [$this->column('amount', $actual, false)]);
+        $table = new TableSchema('typed_schema', [$this->column('amount', $actual, false, primaryOrder: 1)]);
         $changes = array_values(array_filter(
             $differ->compare($this->typedMeta(), $table, $driver)['changes'],
             static fn (array $change): bool => $change['kind'] === 'change_type',
@@ -228,14 +231,14 @@ final class SchemaDifferTest extends TestCase
             'pgsql' => 'numeric(10,2)',
             'sqlite' => 'TEXT',
         ] as $driver => $actual) {
-            $table = new TableSchema('typed_schema', [$this->column('amount', $actual, false)]);
+            $table = new TableSchema('typed_schema', [$this->column('amount', $actual, false, primaryOrder: 1)]);
             self::assertSame([], $differ->compare($this->typedMeta(), $table, $driver)['changes']);
         }
         foreach ([
             'mysql' => 'VARCHAR(50)',
             'pgsql' => 'character varying(50)',
         ] as $driver => $actual) {
-            $table = new TableSchema('typed_schema', [$this->column('amount', $actual, false)]);
+            $table = new TableSchema('typed_schema', [$this->column('amount', $actual, false, primaryOrder: 1)]);
             $differ = new SchemaDiffer([TypedSchemaValue::class => [
                 'mysql' => 'varchar(50)', 'pgsql' => 'varchar(50)', 'sqlite' => 'text',
             ]]);
@@ -258,6 +261,78 @@ final class SchemaDifferTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('rebuild the table manually');
         $differ->previewSql($meta, $table, 'sqlite');
+    }
+
+    public function testSqliteUsesDeclaredAffinityInSqlitePrecedenceOrder(): void
+    {
+        $pdo = new PDO('sqlite::memory:');
+        $pdo->exec('CREATE TABLE differ_rows (id INTEGER PRIMARY KEY, name CLOB NOT NULL, tenant_id "FLOATING POINT" NOT NULL, email VARCHAR(25), enabled BOOLEAN NOT NULL, happened_at DATETIME)');
+        $pdo->exec('CREATE INDEX idx_schema_name ON differ_rows (name, tenant_id)');
+        $pdo->exec('CREATE UNIQUE INDEX uniq_schema_email ON differ_rows (email)');
+        $table = (new SchemaInspector($pdo))->table('differ_rows');
+        $meta = (new MetadataReader())->read(DifferEntity::class);
+        $changes = (new SchemaDiffer())->compare($meta, $table, 'sqlite')['changes'];
+
+        self::assertSame(['enabled', 'happened_at'], array_column($changes, 'name'));
+        self::assertSame(['change_type', 'change_type'], array_column($changes, 'kind'));
+    }
+
+    public function testSqliteRejectsAddingRequiredColumnAndChangingPrimaryKey(): void
+    {
+        $pdo = new PDO('sqlite::memory:');
+        $pdo->exec('CREATE TABLE differ_rows (name TEXT PRIMARY KEY, email TEXT, enabled INTEGER NOT NULL, happened_at TEXT)');
+        $pdo->exec("INSERT INTO differ_rows VALUES ('existing', NULL, 1, NULL)");
+        $table = (new SchemaInspector($pdo))->table('differ_rows');
+        $meta = (new MetadataReader())->read(DifferEntity::class);
+        $differ = new SchemaDiffer();
+        $report = $differ->compare($meta, $table, 'sqlite');
+        $required = array_values(array_filter($report['changes'], static fn (array $change): bool => $change['kind'] === 'add_column' && $change['name'] === 'tenant_id'));
+        self::assertCount(1, $required);
+        self::assertFalse($required[0]['executable']);
+        self::assertContains('change_primary_key', array_column($report['changes'], 'kind'));
+        $this->expectException(\InvalidArgumentException::class);
+        $differ->previewSql($meta, $table, 'sqlite');
+    }
+
+    public function testInvalidColumnDefaultsCannotMakeAMigrationExecutable(): void
+    {
+        $pdo = new PDO('sqlite::memory:');
+        $pdo->exec('CREATE TABLE differ_rows (id INTEGER PRIMARY KEY AUTOINCREMENT)');
+        $table = (new SchemaInspector($pdo))->table('differ_rows');
+        $model = (new MetadataReader())->read(DifferEntity::class);
+        $differ = new SchemaDiffer(columnDefaults: ['differ_rows' => [
+            'name' => "invalid\0text",
+            'tenant_id' => '123',
+            'email' => "\xFF",
+            'enabled' => 1,
+        ]]);
+        $report = $differ->compare($model, $table, 'sqlite');
+        $blocked = array_filter($report['changes'], static fn (array $change): bool => !$change['executable']);
+        self::assertSame(['name', 'tenant_id', 'email', 'enabled'], array_column($blocked, 'name'));
+        self::assertTrue($report['hasUnsupported']);
+        $this->expectException(\InvalidArgumentException::class);
+        $differ->previewSql($model, $table, 'sqlite');
+    }
+
+    public function testSqliteDoesNotDropForeignKeyOrUniqueDependencies(): void
+    {
+        $pdo = new PDO('sqlite::memory:');
+        $pdo->exec('PRAGMA foreign_keys = ON');
+        $pdo->exec('CREATE TABLE differ_rows (id INTEGER PRIMARY KEY, name TEXT NOT NULL, tenant_id INTEGER NOT NULL, email TEXT, enabled INTEGER NOT NULL, happened_at TEXT, ref_id INTEGER, protected TEXT UNIQUE)');
+        $pdo->exec('CREATE UNIQUE INDEX uq_legacy_ref ON differ_rows (ref_id)');
+        $pdo->exec('CREATE TABLE children (ref_id INTEGER REFERENCES differ_rows(ref_id))');
+        $pdo->exec('CREATE INDEX idx_schema_name ON differ_rows (name, tenant_id)');
+        $pdo->exec('CREATE UNIQUE INDEX uniq_schema_email ON differ_rows (email)');
+        $pdo->exec("INSERT INTO differ_rows VALUES (1, 'old', 1, NULL, 1, NULL, 2, 'yes')");
+        $pdo->exec('INSERT INTO children VALUES (2)');
+        $table = (new SchemaInspector($pdo))->table('differ_rows');
+        $model = (new MetadataReader())->read(DifferEntity::class);
+        $differ = new SchemaDiffer();
+        $report = $differ->compare($model, $table, 'sqlite');
+        self::assertSame(['uq_legacy_ref', 'ref_id', 'protected'], array_column($report['changes'], 'name'));
+        self::assertSame([false, false, false], array_column($report['changes'], 'executable'));
+        $this->expectException(\InvalidArgumentException::class);
+        $differ->previewSql($model, $table, 'sqlite');
     }
 
     private function typedMeta(): \Pixiaoka\Orm\Metadata\ModelMeta

@@ -371,6 +371,9 @@ final class Caster
         if ($field->temporal === Temporal::TEXT_US) {
             $value = $this->microsecondText($value);
         }
+        if (str_contains($value, "\0")) {
+            throw $this->fail($model, $field, 'Cannot parse temporal text');
+        }
         $parsed = DateTimeImmutable::createFromFormat($format, $value, new DateTimeZone('UTC'));
         $errors = DateTimeImmutable::getLastErrors();
         if ($parsed === false || ($errors['warning_count'] ?? 0) > 0 || ($errors['error_count'] ?? 0) > 0) {
@@ -421,19 +424,13 @@ final class Caster
         if (!is_int($value) && !is_string($value)) {
             throw $this->fail($model, $field, 'Invalid enum backing value type');
         }
-        // backing type 是 int 而传了数字字符串（SQLite/PG 驱动常见）时，
-        // tryFrom('1') 对 int 枚举直接 TypeError 而非返回 null，须捕获后转 int 重试
         try {
             $enum = $name::tryFrom($value);
         } catch (\TypeError) {
-            $enum = null;
-        }
-        if ($enum === null && is_string($value) && ctype_digit($value)) {
-            try {
-                $enum = $name::tryFrom((int) $value);
-            } catch (\TypeError) {
-                $enum = null;
-            }
+            // 某些驱动将整数枚举读为字符串，沿用普通 int 字段的符号和范围校验。
+            $enum = is_string($value) && preg_match('/^-?\d+$/D', $value) === 1
+                ? $name::tryFrom($this->toInt($model, $field, $value))
+                : null;
         }
         if (!$enum instanceof \BackedEnum) {
             throw $this->fail($model, $field, 'Cannot restore enum from its backing value');

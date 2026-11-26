@@ -55,26 +55,33 @@ final readonly class BulkWriter
             }
             $fieldList[] = $field;
         }
+        $seenEntities = [];
+        foreach ($rows as $index => $row) {
+            if (!$row instanceof Entity) {
+                $prepared[$index] = $this->prepareBatchRow($meta, $columns, $fieldList, $row, $now);
+                continue;
+            }
+            if (!$row instanceof $class) {
+                throw new \InvalidArgumentException('Batch insert entities must be ' . $class . ', got ' . $row::class);
+            }
+            if (!$row->isNew()) {
+                throw new IdentityException($row::class . ' is already persisted and cannot be batch-inserted');
+            }
+            $objectId = spl_object_id($row);
+            if (isset($seenEntities[$objectId])) {
+                throw new \InvalidArgumentException('Batch insert cannot contain the same entity instance more than once');
+            }
+            $seenEntities[$objectId] = true;
+            if ($row->hasGatewayBinding()) {
+                $bound = $row->boundGateway()
+                    ?? throw new \LogicException($row::class . ' has a destroyed Gateway; query it explicitly through a new Gateway');
+                $gateway->assertSame($bound, 'batch insert');
+            }
+            $entities[$index] = $row;
+        }
+
         if ($fieldList === []) {
             // 生成键是唯一字段时，空数组/未初始化实体都表示一行数据库默认值。
-            foreach ($rows as $index => $row) {
-                if (!$row instanceof Entity) {
-                    $prepared[$index] = $this->prepareBatchRow($meta, $columns, [], $row, $now);
-                    continue;
-                }
-                if (!$row instanceof $class) {
-                    throw new \InvalidArgumentException('Batch insert entities must be ' . $class . ', got ' . $row::class);
-                }
-                if (!$row->isNew()) {
-                    throw new IdentityException($row::class . ' is already persisted and cannot be batch-inserted');
-                }
-                if ($row->hasGatewayBinding()) {
-                    $bound = $row->boundGateway()
-                        ?? throw new \LogicException($row::class . ' has a destroyed Gateway; query it explicitly through a new Gateway');
-                    $gateway->assertSame($bound, 'batch insert');
-                }
-                $entities[$index] = $row;
-            }
             foreach ($entities as $index => $row) {
                 $this->transactions->rememberEntity($row);
                 $row->beforeSave();
@@ -94,25 +101,6 @@ final readonly class BulkWriter
             });
 
             return;
-        }
-
-        foreach ($rows as $index => $row) {
-            if (!$row instanceof Entity) {
-                $prepared[$index] = $this->prepareBatchRow($meta, $columns, $fieldList, $row, $now);
-                continue;
-            }
-            if (!$row instanceof $class) {
-                throw new \InvalidArgumentException('Batch insert entities must be ' . $class . ', got ' . $row::class);
-            }
-            if (!$row->isNew()) {
-                throw new IdentityException($row::class . ' is already persisted and cannot be batch-inserted');
-            }
-            if ($row->hasGatewayBinding()) {
-                $bound = $row->boundGateway()
-                    ?? throw new \LogicException($row::class . ' has a destroyed Gateway; query it explicitly through a new Gateway');
-                $gateway->assertSame($bound, 'batch insert');
-            }
-            $entities[$index] = $row;
         }
 
         // P0-3：多行含实体 + 生成列时，RETURNING 是唯一可靠的批量回填途径。

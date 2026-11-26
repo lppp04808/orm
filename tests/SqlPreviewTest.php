@@ -290,6 +290,9 @@ final class SqlPreviewTest extends TestCase
     public function testWholeFloatAndNonFiniteFloatFormatting(): void
     {
         self::assertSame('SELECT 1.0', SqlCompiler::interpolate('SELECT :q0', ['q0' => 1.0], 'sqlite'));
+        $value = 0.12345678901234567;
+        $sql = SqlCompiler::interpolate('SELECT :q0', ['q0' => $value], 'sqlite');
+        self::assertSame($value, $this->pdo->query($sql)->fetchColumn());
         foreach ([NAN, INF, -INF] as $value) {
             try {
                 SqlCompiler::interpolate('SELECT :q0', ['q0' => $value], 'sqlite');

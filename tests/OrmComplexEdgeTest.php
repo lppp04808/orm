@@ -119,6 +119,13 @@ final class OrmComplexEdgeTest extends TestCase
         self::assertNull($rows[0]['tag_label'], 'ON 值条件不满足时 LEFT JOIN 同样保留基表行');
     }
 
+    public function testBetweenRejectsAnArrayWithoutPositionalBounds(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('BETWEEN requires an array of exactly two values');
+        ComplexOrder::query()->whereOp('qty', 'BETWEEN', ['min' => 2, 'max' => 4])->build();
+    }
+
     // ==================== GROUP 两组断言（含被 HAVING 排除组的真实内容） ====================
 
     public function testGroupByTwoGroupsExactAggregates(): void

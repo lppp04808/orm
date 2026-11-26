@@ -286,9 +286,9 @@ public DateTimeImmutable $published_at;
 | `Temporal::UNIX` | Unix 整数秒 | UTC 的 `DateTimeImmutable` |
 | `Temporal::UNIX_MS` | Unix 整数毫秒 | 保留毫秒的 UTC 时间 |
 
-`TEXT_US` 的数据库字段应保留六位小数，MySQL 用 `DATETIME(6)`，PostgreSQL 用 `TIMESTAMP(6)`，SQLite 用 `TEXT`。`DATE` 在 MySQL/PostgreSQL 用 `DATE`、SQLite 用 `TEXT`；两种 Unix 存储在 MySQL/PostgreSQL 用 `BIGINT`、SQLite 用 `INTEGER`。SchemaDiffer 会区分 `DATE` 与日期时间，以及 MySQL/PostgreSQL 的小数秒精度。迁移已有秒级字段到 `TEXT_US` 或 `UNIX_MS` 时须先转换数据库值，不能只改注解。
+`TEXT_US` 的数据库字段应保留六位小数，MySQL 用 `DATETIME(6)`，PostgreSQL 用 `TIMESTAMP(6) WITHOUT TIME ZONE`，SQLite 用 `TEXT`。`DATE` 在 MySQL/PostgreSQL 用 `DATE`、SQLite 用 `TEXT`；两种 Unix 存储在 MySQL/PostgreSQL 用 `BIGINT`、SQLite 用 `INTEGER`。SchemaDiffer 会区分 `DATE` 与日期时间，以及 MySQL/PostgreSQL 的小数秒精度。迁移已有秒级字段到 `TEXT_US` 或 `UNIX_MS` 时须先转换数据库值，不能只改注解。
 
-所有时间落库前统一转为 UTC。`DATE` 截取的是 **UTC 日期**，不是原时区的墙上日期；按当地日历日存储时，请先在业务层转为该日 UTC 零点，或使用普通字符串字段。毫秒转换使用整数运算，支持负时间戳。非法日期、超过六位的小数、带时区的存储文本及非整数 Unix 值会抛 `CastException`，不会静默修正。
+所有时间落库前统一转为 UTC。`DATE` 截取的是 **UTC 日期**，不是原时区的墙上日期；按当地日历日存储时，请先在业务层转为该日 UTC 零点，或使用普通字符串字段。毫秒转换使用整数运算，支持负时间戳。非法日期、含时区或超过六位小数的存储文本，以及非整数 Unix 值都会抛出 `CastException`。Unix 输入必须落在 PHP 整数范围内，`UNIX_MS` 将日期时间转成存储值时也会检查该范围。
 
 `displayFormat` 使用 PHP 日期格式，`displayTimezone` 默认 UTC，单独设置时区而不设置格式会被拒绝。展示配置不影响 INSERT/UPDATE/UPSERT、WHERE 绑定、关系键、脏跟踪、主键缓存或 `refresh()`；它只改变 `toArray()` 的对应值。未设置展示格式时，`toArray()` 仍返回存储表示。
 
@@ -444,7 +444,9 @@ if ($customer->relationLoaded('orders')) {
 }
 ```
 
-`hasMany()` 的 `get()` 返回实体列表；`hasOne()`、`belongsTo()` 的 `get()` 返回实体或 `null`。三者 `first()` 都返回实体或 `null`。`loadedRelation()` 未加载时抛异常，不会隐式执行 SQL。关联键未初始化会拒绝查询；任一侧关联键为 `null` 时，结果为 `null` 或空数组，且不执行关系 SQL。空主结果也不执行预加载。复合键使用参数化 OR-of-AND 元组条件，按每批最多 1000 个关系参数分批，不会把不同父记录的键错误组合。
+`hasMany()` 的 `get()` 返回实体列表。`hasOne()` 和 `belongsTo()` 的 `get()` 返回实体或 `null`。三者的 `first()` 都返回实体或 `null`。`loadedRelation()` 在关系尚未加载时抛异常。源关联键未初始化时拒绝查询。含 `null` 的源键元组返回空结果，且不加入查询条件。主查询结果为空时跳过预加载。
+
+预加载按完整的键元组分批绑定参数，避免把不同父记录的键列错误组合。数据库根据目标列的等值规则匹配关系，包括列的排序规则。同一行匹配多个父对象时，这些父对象在同一次关系加载中共享该行的实体实例。
 
 显式关系查询保留用户排序，尚未按目标主键排序时追加目标主键升序决胜条件；`hasOne` 多候选记录与 `belongsTo` 非唯一目标键由同一规则稳定选择，`first()` 仍只取第一行。预加载依次补齐目标关联键和目标主键，用户排序仍在前；与完整主键重叠的关联键不会重复追加排序。关系注解同类重复或混合声明均在首次进入关系功能时抛 `MetadataException`；普通 CRUD 不扫描关系注解。预加载约束只允许 WHERE/OR 和排序，拒绝全局分页、投影、JOIN、GROUP/HAVING、UNION、派生表、DISTINCT、表别名、行锁和闭包内再次 `with/load`。`with()` 只能用于实体 `get()` / `first()`，不能被 `rows()`、`value()`、`count()` 或条件 UPDATE/DELETE 静默忽略。普通 `Builder::first()` 不自动补主键排序。
 
@@ -772,7 +774,7 @@ $rows = Order::query()->select('uid')->from($top, 'ranked')
     ->whereOp('amount', '>', 5)->rows();
 ```
 
-标量和 IN 子查询必须显式只选择一列；EXISTS 无此限制。子查询、派生表与 UNION 不允许携带行锁；子查询必须与父查询来自同一个 `EntityGateway`，防止 SQL 和参数在错误连接上执行。
+标量和 IN 子查询必须显式且仅输出一列。每个 `withCount()` 投影都计入列数。EXISTS 可以输出多列。子查询、派生表与 UNION 不允许携带行锁；子查询必须与父查询来自同一个 `EntityGateway`，防止 SQL 和参数在错误连接上执行。
 
 ### 6.5 UNION / UNION ALL
 
@@ -861,9 +863,9 @@ Order::upsert($values, ['qty'], ['key']);  // 显式冲突键
 - PostgreSQL/SQLite：`ON CONFLICT (...) DO UPDATE/DO NOTHING`；
 - MySQL：`ON DUPLICATE KEY UPDATE`；
 - 默认冲突键为模型主键，冲突键必须包含在输入中；
-- 默认更新列不包含冲突键、生成列和 `created_at`；
-- 自动填充缺失的 int 型 `created_at/updated_at`；
-- 显式 `$updateColumns=['qty']` 仍自动附加 `updated_at`；显式提供的时间戳值会被尊重；
+- `$updateColumns` 为 `null`（默认）时，从 `$values` 提供的普通字段推导更新列，排除冲突键、生成列和自动时间字段。没有可更新字段时抛出 `InvalidArgumentException`。要忽略冲突请传 `[]`。
+- 插入时按模型声明的类型和存储格式填充缺失的自动时间字段。
+- `$updateColumns=['qty']` 等冲突更新也会维护已配置的 `updated_at`，并采用显式传入的时间值。传 `[]` 时保留现有行的时间戳。
 - 未提供的非空字段提前拒绝，不会自动猜测 PHP 属性默认值或数据库 `DEFAULT`，请显式传值；
 - 字段值复用模型 Caster；返回受影响行数，不承诺回填 ID，不触发实体钩子。
 
@@ -902,9 +904,11 @@ User::insertAll([$a, $b]);
 
 所有分块自动共享一个事务；调用方已有事务时嵌套为 SAVEPOINT。后续分块 SQL 失败会明确回滚本批已执行的前置分块，只有回滚成功才恢复实体和缓存；结果未知时保留异常并禁止复用连接。MySQL 的 DDL 隐式提交等结果未知场景不能当成回滚成功。
 
-`beforeSave()` / `beforeInsert()` 可以补齐必填字段，每个 Entity 只执行一次；SQL 全部成功后才回填生成键、标记 persisted、执行 `afterSave()` / `afterInsert()` 并发布缓存。预检失败不假装撤销已经运行的前置钩子、字段自动填值或外部副作用。数据库约束冲突、SQL/连接失败、生成键回填或后置钩子失败也只在数据库明确回滚成功时恢复内存；非字段业务属性及外部副作用仍由业务负责。
+`beforeSave()` 和 `beforeInsert()` 可以补齐必填字段，每个实体各执行一次。常规批次会在全部 INSERT 成功后回填生成键、执行 `afterSave()` / `afterInsert()` 并发布缓存。预检失败时，前置钩子作出的修改和已自动填充的字段可能保留。写入或后置钩子失败时，数据库成功回滚后才恢复跟踪的实体和缓存状态。模型字段以外的业务属性和外部副作用由调用方负责。
 
-带生成键的多行混批或纯 Entity 批次要求连接支持 `INSERT ... RETURNING`；MySQL 会在钩子及 SQL 前拒绝这类调用，请逐行 `save()`。纯数组行无需回填，仍可在 MySQL 批量插入。
+模型同时包含可写字段和生成键时，包含实体的多行批次要求连接支持 `INSERT ... RETURNING`。使用 MySQL 时，可在事务中逐行 `save()`。如果不需要回填 ID，也可传入纯数组批次。
+
+模型仅映射一个生成主键时，SQLite、MySQL 和 PostgreSQL 上的 `save()` 与 `insertAll()` 都可插入数据库默认值行。例如 `Ticket` 只映射生成主键时，`Ticket::insertAll([[], new Ticket()])` 会插入两行。整批共用一个事务，每行执行一条 INSERT。SQLite/PostgreSQL 使用 `DEFAULT VALUES`，MySQL 使用 `() VALUES ()`。实体行在对应 INSERT 成功后回填 ID 并调用后置钩子，数组行无需在内存回填。
 
 ## 9. 事务
 
@@ -1032,7 +1036,9 @@ $invoice->save(); // 等值 Money 新实例：无 UPDATE，也不递增版本
 | 不混用 | 一个模型不能同时有 generated 和 order |
 | 键值边界 | `0`、`""`、`false` 都是合法键值；`null` 不可作为主键 |
 | 身份完整 | 任何按主键操作缺少任意一列都会拒绝，不发 SQL |
-| 不可空 | 主键属性不能是可空类型（`?int`） |
+| 身份稳定 | 实体持久化后保持每个主键字段不变 |
+
+已持久化实体的任意主键字段被修改后，`save()`、`delete()`、`forceDelete()`、`restore()`、`refresh()` 和 `load()` 预加载都会因身份不一致抛出 `IdentityException`。前置钩子必须保留主键，写入才能继续。后置钩子在写入之后运行，钩子抛异常时 SQL 可能已经成功。需要写入和钩子一同成功或回滚时，请使用显式事务。
 
 ## 14. 独立模型生成器
 
@@ -1064,7 +1070,7 @@ vendor/bin/pixiaoka-orm generate \
 - `CURRENT_TIMESTAMP` 等数据库动态表达式、`NULL` 和对象类型默认值不会生成非法 PHP 属性初始化代码；由插入流程或数据库负责赋值。
 - 无默认值的非空标量使用合法零值，可空属性保留未初始化以区分未赋值和显式 `null`。
 - 默认值按方言处理：MySQL 元数据为已解码文本，SQLite/PostgreSQL 为 SQL 字面量；PostgreSQL `E'...'` 单独解析转义，不折叠普通字符串反斜杠。
-- 仅 SQLite 无精度 `datetime/timestamp` 和 PostgreSQL 无精度 `timestamp without time zone` 映射 `DateTimeImmutable + #[Temporal]`；`DATE`、`TIME`、时区、小数秒及 MySQL `datetime/timestamp` 保守使用 `string`。
+- SQLite 的 `datetime`/`timestamp` 和 PostgreSQL 的 `timestamp without time zone` 在类型无精度后缀时生成 `DateTimeImmutable` 与 `#[Temporal]`。PostgreSQL 的 `timestamp(p) without time zone` 在 `p` 为 0 至 6 时生成 `DateTimeImmutable` 与 `#[Temporal(Temporal::TEXT_US)]`。`DATE`、`TIME`、带时区的时间戳以及 MySQL 的 `datetime`/`timestamp` 生成 `string`。
 - 表和列名采用受限标识符策略，防止数据库标识符或生成代码被注入；不支持的名称应显式检查、改名，不能通过拼接 SQL 绕过。
 - 生成目录必须位于明确的业务目录中，不能把根目录或当前工作目录作为输出位置。
 
@@ -1215,7 +1221,11 @@ $differ = new SchemaDiffer([
 ]);
 ```
 
-SQLite 修改字段类型或可空性需人工重建表，报告将对应项标为不可执行；只要存在不支持项，`previewSql()` 就抛出异常，不返回看似完整但实际残缺的迁移计划。字段删除、索引重建、约束、数据和权限必须由应用迁移流程审核。**Differ 只生成报告和预览 SQL，绝不自动执行 DDL，不替代正式迁移系统。**
+类型对比包括已声明的 `DECIMAL`/`NUMERIC` 精度与小数位数、定长和变长字符列的长度，以及 PostgreSQL 时间戳的精度与时区语义。模型索引无法表达部分索引的谓词，因此遇到 SQLite 或 PostgreSQL 的部分索引时会拒绝比较。
+
+可用 `new SchemaDiffer(columnDefaults: ['users' => ['status' => 'active']])` 按表名和列名声明新增列的数据库默认值。支持与模型字段类型一致的 `int`、`bool` 和不含 NUL 字节的 UTF-8 `string`。PHP 属性初始值不声明数据库默认值。新增必填列缺少受支持的默认值时，需要手工制定数据回填方案。此选项只作用于新增列。
+
+主键变更和收紧 `NOT NULL` 需要手工审核并迁移。SQLite 修改类型或可空性也需要重建表。只要存在标记为不可执行的变更，`previewSql()` 就会抛出异常。删列、索引重建、约束、数据与权限应在应用迁移流程中审核。**Differ 只生成报告和预览 SQL。**
 
 ## 17. 可观测性
 
@@ -1251,12 +1261,12 @@ $unsubscribe = $gateway->subscribe(function (Event $event): void {
 ## 18. 测试与真实数据库验收
 
 ```bash
-# 当前已验证基线：395 tests / 11109 assertions（4 项显式 DSN 实连测试默认跳过）
-vendor/bin/phpunit
-
-# SQLite / MySQL / PostgreSQL 实连；进程环境变量覆盖 .env
-php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql tests/orm_live_verify.php
+composer install
+composer test
+composer analyse
 ```
+
+默认 PHPUnit 测试使用 SQLite，跳过要求显式配置 MySQL 或 PostgreSQL 连接的用例。运行完整矩阵前，请先在 PHP CLI 启用 `pdo_sqlite`、`pdo_mysql` 和 `pdo_pgsql`。
 
 MySQL/PostgreSQL 推荐使用独立 Docker 测试实例。请使用临时数据库，不要指向生产库；以下端口是本机示例，可按实际映射修改：
 
@@ -1274,26 +1284,29 @@ DB_PGSQL_HOST=127.0.0.1 DB_PGSQL_PORT=32770 \
 DB_PGSQL_NAME=orm_test DB_PGSQL_USER=postgres DB_PGSQL_PASSWORD=local-only-password \
 DB_MYSQL_HOST=127.0.0.1 DB_MYSQL_PORT=32768 \
 DB_MYSQL_NAME=orm_test DB_MYSQL_USER=root DB_MYSQL_PASSWORD=local-only-password \
-php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql tests/orm_live_verify.php
+php tests/orm_live_verify.php
 ```
 
 `DB_MYSQL_HOST/PORT/NAME/USER/PASSWORD`、`DB_PGSQL_HOST/PORT/NAME/USER/PASSWORD` 分别配置两个数据库；两个真实库均不可达时脚本使用 SQLite 兜底。`orm_live_verify.php` 使用随机表名，按 PDO 登记并只清理本次创建的表；SQLite 兜底通过不能算真实 MySQL/PostgreSQL 通过。完成后应停止并删除上述专用容器，不要复用其他业务容器。
 
-### 模型生成器实连测试
+### PHPUnit 实连测试
 
-生成器另有 `tests/SchemaLiveTest.php`，只有显式设置 `PIXIAOKA_ORM_LIVE_MYSQL_DSN`、`PIXIAOKA_ORM_LIVE_PGSQL_DSN` 及对应 `_USER`、`_PASSWORD` 才连接外部数据库；默认跳过，不隐式读取本机服务或 `.env`。
+模型生成和其他实连测试读取 `PIXIAOKA_ORM_LIVE_*`。部分事务测试还需要 `ORM_TEST_*`。数据库就绪后，在测试终端设置两组变量：
 
 ```bash
-PIXIAOKA_ORM_LIVE_MYSQL_DSN='mysql:host=127.0.0.1;port=32768;dbname=orm_test;charset=utf8mb4' \
-PIXIAOKA_ORM_LIVE_MYSQL_USER=root PIXIAOKA_ORM_LIVE_MYSQL_PASSWORD=local-only-password \
-PIXIAOKA_ORM_LIVE_PGSQL_DSN='pgsql:host=127.0.0.1;port=32770;dbname=orm_test' \
-PIXIAOKA_ORM_LIVE_PGSQL_USER=postgres PIXIAOKA_ORM_LIVE_PGSQL_PASSWORD=local-only-password \
-php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql vendor/bin/phpunit
+export PIXIAOKA_ORM_LIVE_MYSQL_DSN='mysql:host=127.0.0.1;port=32768;dbname=orm_test;charset=utf8mb4'
+export PIXIAOKA_ORM_LIVE_MYSQL_USER=root PIXIAOKA_ORM_LIVE_MYSQL_PASSWORD=local-only-password
+export PIXIAOKA_ORM_LIVE_PGSQL_DSN='pgsql:host=127.0.0.1;port=32770;dbname=orm_test'
+export PIXIAOKA_ORM_LIVE_PGSQL_USER=postgres PIXIAOKA_ORM_LIVE_PGSQL_PASSWORD=local-only-password
+export PIXIAOKA_ORM_LIVE_SQLITE_DSN='sqlite::memory:'
+export ORM_TEST_MYSQL_DSN="$PIXIAOKA_ORM_LIVE_MYSQL_DSN"
+export ORM_TEST_MYSQL_USER="$PIXIAOKA_ORM_LIVE_MYSQL_USER" ORM_TEST_MYSQL_PASSWORD="$PIXIAOKA_ORM_LIVE_MYSQL_PASSWORD"
+export ORM_TEST_PGSQL_DSN="$PIXIAOKA_ORM_LIVE_PGSQL_DSN"
+export ORM_TEST_PGSQL_USER="$PIXIAOKA_ORM_LIVE_PGSQL_USER" ORM_TEST_PGSQL_PASSWORD="$PIXIAOKA_ORM_LIVE_PGSQL_PASSWORD"
+php vendor/bin/phpunit --display-skipped --fail-on-skipped
 ```
 
-该测试关闭 PDO 预处理模拟，验证自增/复合主键、静态与动态默认值、时间类型、生成文件 `php -l` 和 ORM 元数据；只创建并清理随机测试表。
-
-当前已验证的 Docker PHP 8.3 默认 SQLite 完整套件为 **395 tests / 11109 assertions / 4 skipped**，PHPStan 生产代码检查零错误。4 个跳过项均为未配置显式外部 DSN 的既有 MySQL/PostgreSQL 实连测试；本轮不以 SQLite 结果冒充真实双库通过。历史实连结果只作为既有验证记录，不表述为本次文档维护重新执行的结果。CI 继续核验多版本、Composer、lint 和双库服务测试；Swoole/Swow 真实扩展验收未执行。
+提交 `5cbe063` 已在 SQLite 3.53.4、MySQL 8.4.13 和 PostgreSQL 16.16 上完成本地验证。PHP 8.3.37、8.4.28、8.5.13 各通过 **732 项测试、14,779 条断言，零跳过**。GitHub CI 在 PHP 8.3–8.5 上运行 SQLite 测试，并在 PHP 8.3 上运行 MySQL/PostgreSQL 实连任务。
 
 ## 19. 项目集成示例
 

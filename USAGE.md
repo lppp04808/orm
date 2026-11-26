@@ -286,9 +286,9 @@ public DateTimeImmutable $published_at;
 | `Temporal::UNIX` | Unix integer seconds | UTC `DateTimeImmutable` |
 | `Temporal::UNIX_MS` | Unix integer milliseconds | UTC time with milliseconds |
 
-Use six-digit-capable columns for `TEXT_US`: `DATETIME(6)` on MySQL, `TIMESTAMP(6)` on PostgreSQL, and `TEXT` on SQLite. Use `DATE` on MySQL/PostgreSQL and `TEXT` on SQLite for `DATE`; both Unix modes use `BIGINT` on MySQL/PostgreSQL and `INTEGER` on SQLite. SchemaDiffer distinguishes dates from date-times and checks fractional-second precision on MySQL/PostgreSQL. Before changing an existing second-precision field to `TEXT_US` or `UNIX_MS`, migrate the stored values rather than changing only the attribute.
+Use six-digit-capable columns for `TEXT_US`: `DATETIME(6)` on MySQL, `TIMESTAMP(6) WITHOUT TIME ZONE` on PostgreSQL, and `TEXT` on SQLite. Use `DATE` on MySQL/PostgreSQL and `TEXT` on SQLite for `DATE`; both Unix modes use `BIGINT` on MySQL/PostgreSQL and `INTEGER` on SQLite. SchemaDiffer distinguishes dates from date-times and checks fractional-second precision on MySQL/PostgreSQL. Before changing an existing second-precision field to `TEXT_US` or `UNIX_MS`, migrate the stored values rather than changing only the attribute.
 
-All times are normalized to UTC before writing. `DATE` truncates to the **UTC calendar date**, not the original timezone's local date. Convert a business-local date to midnight UTC in application code first, or use a plain string field when the instant-based rule is not appropriate. Milliseconds use integer arithmetic, including negative timestamps. Invalid dates, more than six fractional digits, storage text containing a timezone, and non-integer Unix values throw `CastException` instead of being silently corrected.
+All times are normalized to UTC before writing. `DATE` truncates to the **UTC calendar date**, not the original timezone's local date. Convert a business-local date to midnight UTC in application code first, or use a plain string field when the instant-based rule is not appropriate. Milliseconds use integer arithmetic and support negative timestamps. Invalid dates, storage text with a timezone or more than six fractional digits, and non-integer Unix values throw `CastException`. Unix inputs must fit the PHP integer range, and `UNIX_MS` also checks this range when converting a date-time for storage.
 
 `displayFormat` uses PHP date formatting. `displayTimezone` defaults to UTC and cannot be specified without a format. Display configuration does not affect INSERT/UPDATE/UPSERT, WHERE bindings, relation keys, dirty tracking, primary-key caching, or `refresh()`; it changes only the corresponding `toArray()` value. Without a display format, `toArray()` retains the stored representation.
 
@@ -444,7 +444,9 @@ if ($customer->relationLoaded('orders')) {
 }
 ```
 
-For `hasMany()`, `get()` returns an entity list; for `hasOne()` and `belongsTo()`, it returns an entity or `null`. All three `first()` methods return an entity or `null`. `loadedRelation()` throws when the relation has not been loaded rather than executing SQL implicitly. An uninitialized relation key rejects the query. If any relation key is `null`, the result is `null` or an empty array without relation SQL. An empty main result also skips eager loading. Composite keys use parameterized OR-of-AND tuple conditions in batches of at most 1000 relation parameters, preventing incorrect combinations across parent records.
+For `hasMany()`, `get()` returns an entity list. For `hasOne()` and `belongsTo()`, it returns an entity or `null`. All three `first()` methods return an entity or `null`. `loadedRelation()` throws when the relation has not been loaded. An uninitialized source key rejects the query. A source tuple containing `null` gets an empty result and contributes no SQL predicate. An empty main result skips eager loading.
+
+Eager loading batches complete, parameterized key tuples to avoid mixing columns from different parents. The database applies the target columns' equality rules, including their collation, when matching each row to its parents. If one row matches several parents, each receives the same entity instance within that relation graph.
 
 Explicit relation queries preserve user ordering and append an ascending target-primary-key tiebreaker when the full target key is not already ordered. The same rule makes `hasOne` with multiple candidates and `belongsTo` with a non-unique target key deterministic; `first()` still returns only the first row. Eager loading appends target relation keys followed by the target primary key, retaining user ordering first; relation keys overlapping the full primary key are not repeated. Duplicate or mixed relation attributes on one method throw `MetadataException` when relation functionality is first used; ordinary CRUD does not scan relation attributes. Eager-load constraints allow only WHERE/OR and ordering. Global pagination, projections, JOIN, GROUP/HAVING, UNION, derived tables, DISTINCT, table aliases, row locks, and nested `with/load` inside a constraint are rejected. `with()` applies only to entity `get()` / `first()` and is never silently ignored by `rows()`, `value()`, `count()`, or conditional UPDATE/DELETE. Ordinary `Builder::first()` does not add primary-key ordering.
 
@@ -772,7 +774,7 @@ $rows = Order::query()->select('uid')->from($top, 'ranked')
     ->whereOp('amount', '>', 5)->rows();
 ```
 
-Scalar and IN subqueries must explicitly select exactly one column; EXISTS has no such restriction. Subqueries, derived tables, and UNION cannot carry row locks. A subquery must use the same `EntityGateway` as its parent, preventing SQL and parameters from executing on the wrong connection.
+Scalar and IN subqueries must explicitly produce exactly one column. Every `withCount()` projection counts toward this limit. EXISTS accepts multiple output columns. Subqueries, derived tables, and UNION cannot carry row locks. A subquery must use the same `EntityGateway` as its parent, preventing SQL and parameters from executing on the wrong connection.
 
 ### 6.5 UNION / UNION ALL
 
@@ -861,9 +863,9 @@ Order::upsert($values, ['qty'], ['key']);  // Explicit conflict key
 - PostgreSQL/SQLite: `ON CONFLICT (...) DO UPDATE/DO NOTHING`;
 - MySQL: `ON DUPLICATE KEY UPDATE`;
 - The conflict key defaults to the model primary key and must be present in the input;
-- Default update columns exclude conflict keys, generated columns, and `created_at`;
-- Missing int `created_at/updated_at` values are populated automatically;
-- Explicit `$updateColumns=['qty']` still adds `updated_at`; explicit timestamp values are respected;
+- With `null` (the default), updates are derived from ordinary fields supplied in `$values`, excluding conflict keys, generated columns, and automatic timestamp fields. If no update field remains, the call throws `InvalidArgumentException`. Use `[]` to ignore conflicts.
+- Missing automatic timestamps are populated on insert using the model's declared type and storage format.
+- A conflict update such as `$updateColumns=['qty']` also maintains `updated_at` when configured. An explicitly supplied timestamp value is used, and `[]` leaves existing timestamps untouched.
 - Missing non-nullable fields are rejected early. PHP property defaults and database `DEFAULT` are not guessed; provide values explicitly;
 - Values use the model Caster. The return value is affected rows; generated IDs are not guaranteed to be populated, and entity hooks are not invoked.
 
@@ -902,9 +904,11 @@ Arrays and entities may be mixed. SQL preserves input row order, with at most 50
 
 All chunks automatically share one transaction, or a SAVEPOINT when the caller already has a transaction. If a later chunk fails, earlier chunks are rolled back explicitly; entity and cache state is restored only when rollback succeeds. An unknown outcome preserves the original exception and makes the connection unusable, including MySQL implicit DDL commits, which must not be mistaken for rollback success.
 
-`beforeSave()` / `beforeInsert()` may populate required fields and run once per Entity. Only after all SQL succeeds are generated keys populated, entities marked persisted, `afterSave()` / `afterInsert()` invoked, and cache published. Prevalidation failure does not pretend to undo before-hooks, automatic field values, or external side effects. For constraint violations, SQL/connection failures, generated-key population failures, and after-hook failures, memory is restored only when database rollback succeeds. Non-column business state and external side effects remain the application's responsibility.
+`beforeSave()` and `beforeInsert()` may populate required fields and run once per entity. For normal batches, generated-key population, `afterSave()` / `afterInsert()`, and cache publication follow successful execution of all INSERT statements. Prevalidation can leave changes made by before-hooks or automatic field population. On a write or after-hook failure, successful database rollback restores tracked entity and cache state. Application fields outside the model and external side effects remain the caller's responsibility.
 
-Multi-row mixed or Entity-only batches with generated keys require `INSERT ... RETURNING`. MySQL rejects these calls before hooks or SQL; call `save()` row by row. Pure array rows need no generated-key population and can still be batch-inserted on MySQL.
+For models with writable fields and a generated key, multi-row batches containing entities require `INSERT ... RETURNING`. On MySQL, use individual `save()` calls inside a transaction or provide only array rows if you do not need generated IDs.
+
+For a model whose only mapped field is a generated primary key, `save()` and `insertAll()` can insert database-default rows on SQLite, MySQL, and PostgreSQL. For example, `Ticket::insertAll([[], new Ticket()])` inserts two rows if `Ticket` maps only that key. The batch runs one INSERT per row in one transaction, using `DEFAULT VALUES` on SQLite/PostgreSQL and `() VALUES ()` on MySQL. Entity rows receive their generated IDs and run after-hooks as each INSERT succeeds. Array rows have no IDs to populate in memory.
 
 ## 9. Transactions
 
@@ -1033,6 +1037,9 @@ Automatic `updated_at` handling and relation eager-load refreshes use the same s
 | Value boundaries | `0`, `""`, and `false` are valid key values; `null` is not |
 | Complete identity | Any key-based operation missing a column is rejected before SQL |
 | Non-nullable | A primary-key property cannot have nullable type such as `?int` |
+| Stable identity | Keep every primary-key field unchanged once the entity is persisted |
+
+Changing one or more key fields on a persisted entity causes `save()`, `delete()`, `forceDelete()`, `restore()`, `refresh()`, and eager loading via `load()` to reject the changed identity with `IdentityException`. Before-hooks must preserve the key for the write to proceed. An after-hook runs after the write, so an exception from that hook can follow a successful SQL statement. Use an explicit transaction when the write and its hooks must succeed or roll back together.
 
 ## 14. Standalone Model Generator
 
@@ -1064,7 +1071,7 @@ vendor/bin/pixiaoka-orm generate \
 - Dynamic database expressions such as `CURRENT_TIMESTAMP`, `NULL`, and object defaults never produce invalid PHP property initializers; insertion or the database supplies those values.
 - Non-nullable scalars without defaults receive valid zero values, while nullable properties remain uninitialized to distinguish unassigned values from explicit `null`.
 - Defaults are dialect-aware: MySQL metadata is decoded text, while SQLite/PostgreSQL contain SQL literals. PostgreSQL `E'...'` escapes are parsed separately without collapsing ordinary string backslashes.
-- Only SQLite precision-free `datetime/timestamp` and PostgreSQL precision-free `timestamp without time zone` map to `DateTimeImmutable + #[Temporal]`. `DATE`, `TIME`, time zones, fractional seconds, and MySQL `datetime/timestamp` conservatively map to `string`.
+- SQLite `datetime`/`timestamp` and PostgreSQL `timestamp without time zone` without a precision suffix map to `DateTimeImmutable` with `#[Temporal]`. PostgreSQL `timestamp(p) without time zone` with `p` from 0 through 6 maps to `DateTimeImmutable` with `#[Temporal(Temporal::TEXT_US)]`. `DATE`, `TIME`, timezone-aware timestamps, and MySQL `datetime`/`timestamp` are generated as `string`.
 - Table and column names use a restricted identifier policy to prevent injection through database identifiers or generated code. Explicitly inspect or rename unsupported names; never bypass this with concatenated SQL.
 - The output directory must be an explicit application directory, not the filesystem root or current working directory.
 
@@ -1215,7 +1222,11 @@ $differ = new SchemaDiffer([
 ]);
 ```
 
-Changing a field type or nullability on SQLite requires manual table rebuilding, and the report marks those entries non-executable. If any unsupported entry exists, `previewSql()` throws rather than returning a seemingly complete but incomplete migration plan. Field removal, index rebuilding, constraints, data, and privileges must be reviewed by the application's migration process. **The Differ only generates reports and preview SQL. It never executes DDL and is not a replacement for a formal migration system.**
+Type comparison includes declared `DECIMAL`/`NUMERIC` precision and scale, fixed and varying character lengths, and PostgreSQL timestamp precision and timezone semantics. SQLite and PostgreSQL partial indexes are rejected because model indexes cannot express their predicates.
+
+For a new column, pass an explicit database default to `new SchemaDiffer(columnDefaults: ['users' => ['status' => 'active']])`, keyed by table and column name. Supported values are `int`, `bool`, and UTF-8 `string` without NUL bytes, matching the model field type. PHP property initializers do not declare database defaults. A new required column without a supported default needs a manual backfill plan. This option only applies to added columns.
+
+Primary key changes and tightening `NOT NULL` require manual review and migration. SQLite also requires a table rebuild for type or nullability changes. `previewSql()` throws if any entry is marked non-executable. Review drops, index rebuilds, constraints, data, and privileges in the application's migration process. **The Differ generates reports and SQL previews only.**
 
 ## 17. Observability
 
@@ -1251,12 +1262,12 @@ A completely independent Gateway/Connection may write directly to an observabili
 ## 18. Testing and Real-database Verification
 
 ```bash
-# Previously verified baseline: 395 tests / 11109 assertions (4 explicit-DSN live tests skipped by default)
-vendor/bin/phpunit
-
-# SQLite / MySQL / PostgreSQL live verification; process environment overrides .env
-php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql tests/orm_live_verify.php
+composer install
+composer test
+composer analyse
 ```
+
+The default PHPUnit run uses SQLite and skips tests that require explicitly configured MySQL or PostgreSQL connections. For the full matrix, enable `pdo_sqlite`, `pdo_mysql`, and `pdo_pgsql` in the PHP CLI first.
 
 Use disposable Docker instances for MySQL/PostgreSQL. Never point these tests at production. The following ports are local examples; adjust them to your mappings:
 
@@ -1274,26 +1285,29 @@ DB_PGSQL_HOST=127.0.0.1 DB_PGSQL_PORT=32770 \
 DB_PGSQL_NAME=orm_test DB_PGSQL_USER=postgres DB_PGSQL_PASSWORD=local-only-password \
 DB_MYSQL_HOST=127.0.0.1 DB_MYSQL_PORT=32768 \
 DB_MYSQL_NAME=orm_test DB_MYSQL_USER=root DB_MYSQL_PASSWORD=local-only-password \
-php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql tests/orm_live_verify.php
+php tests/orm_live_verify.php
 ```
 
 `DB_MYSQL_HOST/PORT/NAME/USER/PASSWORD` and `DB_PGSQL_HOST/PORT/NAME/USER/PASSWORD` configure the two databases. If neither real database is reachable, the script falls back to SQLite. `orm_live_verify.php` uses random table names, tracks them by PDO, and removes only tables created by that run. SQLite fallback success is not a real MySQL/PostgreSQL pass. Afterwards, stop and remove these dedicated containers; do not reuse other application containers.
 
-### Live model-generator tests
+### PHPUnit with real databases
 
-`tests/SchemaLiveTest.php` connects to external databases only when `PIXIAOKA_ORM_LIVE_MYSQL_DSN`, `PIXIAOKA_ORM_LIVE_PGSQL_DSN`, and their corresponding `_USER` and `_PASSWORD` variables are explicitly set. Otherwise it skips and never implicitly reads local services or `.env`.
+PHPUnit reads `PIXIAOKA_ORM_LIVE_*` for schema generation and other live tests. Some transaction tests also require `ORM_TEST_*`. Set both sets of variables in a test shell after the databases are ready:
 
 ```bash
-PIXIAOKA_ORM_LIVE_MYSQL_DSN='mysql:host=127.0.0.1;port=32768;dbname=orm_test;charset=utf8mb4' \
-PIXIAOKA_ORM_LIVE_MYSQL_USER=root PIXIAOKA_ORM_LIVE_MYSQL_PASSWORD=local-only-password \
-PIXIAOKA_ORM_LIVE_PGSQL_DSN='pgsql:host=127.0.0.1;port=32770;dbname=orm_test' \
-PIXIAOKA_ORM_LIVE_PGSQL_USER=postgres PIXIAOKA_ORM_LIVE_PGSQL_PASSWORD=local-only-password \
-php -d extension=pdo_sqlite -d extension=pdo_mysql -d extension=pdo_pgsql vendor/bin/phpunit
+export PIXIAOKA_ORM_LIVE_MYSQL_DSN='mysql:host=127.0.0.1;port=32768;dbname=orm_test;charset=utf8mb4'
+export PIXIAOKA_ORM_LIVE_MYSQL_USER=root PIXIAOKA_ORM_LIVE_MYSQL_PASSWORD=local-only-password
+export PIXIAOKA_ORM_LIVE_PGSQL_DSN='pgsql:host=127.0.0.1;port=32770;dbname=orm_test'
+export PIXIAOKA_ORM_LIVE_PGSQL_USER=postgres PIXIAOKA_ORM_LIVE_PGSQL_PASSWORD=local-only-password
+export PIXIAOKA_ORM_LIVE_SQLITE_DSN='sqlite::memory:'
+export ORM_TEST_MYSQL_DSN="$PIXIAOKA_ORM_LIVE_MYSQL_DSN"
+export ORM_TEST_MYSQL_USER="$PIXIAOKA_ORM_LIVE_MYSQL_USER" ORM_TEST_MYSQL_PASSWORD="$PIXIAOKA_ORM_LIVE_MYSQL_PASSWORD"
+export ORM_TEST_PGSQL_DSN="$PIXIAOKA_ORM_LIVE_PGSQL_DSN"
+export ORM_TEST_PGSQL_USER="$PIXIAOKA_ORM_LIVE_PGSQL_USER" ORM_TEST_PGSQL_PASSWORD="$PIXIAOKA_ORM_LIVE_PGSQL_PASSWORD"
+php vendor/bin/phpunit --display-skipped --fail-on-skipped
 ```
 
-The test disables PDO emulated prepares and verifies auto-increment/composite keys, static and dynamic defaults, temporal types, generated-file `php -l`, and ORM metadata. It creates and cleans only random test tables.
-
-The previously verified complete default SQLite suite in Docker PHP 8.3 was **395 tests / 11109 assertions / 4 skipped**, with zero PHPStan production-code errors. All four skips were existing MySQL/PostgreSQL live tests without explicit external DSNs; SQLite results are not presented as a real dual-database pass. Historical live results are retained as prior verification records, not represented as having been rerun for this documentation maintenance. CI continues to check multiple PHP versions, Composer, lint, and both database services. Real Swoole/Swow extension verification has not been performed.
+The three-backend verification of commit `5cbe063` ran on SQLite 3.53.4, MySQL 8.4.13, and PostgreSQL 16.16. PHP 8.3.37, 8.4.28, and 8.5.13 each passed **732 tests with 14,779 assertions and zero skips**. GitHub CI runs SQLite on PHP 8.3–8.5 and the MySQL/PostgreSQL service job on PHP 8.3.
 
 ## 19. Project Integration Example
 

@@ -42,15 +42,19 @@ It exposes the `Pixiaoka\Orm\` namespace and the `pixiaoka-orm` model-generator 
 ## 30-second Quick Start
 
 The following example uses an in-memory SQLite database; create your own schema in real applications.
-The model and the complete `Session::scope()` example are intentionally compact.
+After installing the package, save this example as `quick-start.php` in your Composer project root and run `php quick-start.php`.
 
 ```php
+<?php
+
 use Pixiaoka\Orm\Annotation\Column;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
 use Pixiaoka\Orm\Entity;
 use Pixiaoka\Orm\Gateway\EntityGateway;
 use Pixiaoka\Orm\Gateway\PdoConnection;
 use Pixiaoka\Orm\Session;
+
+require __DIR__ . '/vendor/autoload.php';
 
 final class User extends Entity
 {
@@ -98,7 +102,9 @@ Start with the topics you need; every link opens a section of the complete Engli
 | Conditions, ordering, pagination, and query cloning | [Query Builder](./USAGE.md#5-query-builder) |
 | Joins, aggregates, subqueries, UNION, and raw SQL | [Advanced queries](./USAGE.md#6-advanced-queries) |
 | Conditional writes, UPSERT, and row locks | [Conditional writes](./USAGE.md#7-conditional-update--delete-upsert-and-row-locks) |
+| Batch inserts and models with only a generated key | [Batch insert](./USAGE.md#8-batch-insert) |
 | Nested transactions and rollback guarantees | [Transactions](./USAGE.md#9-transactions) |
+| Persisted identity and composite keys | [Primary-key rules](./USAGE.md#13-primary-key-rules) |
 | Database inspection and model generation | [Model generator](./USAGE.md#14-standalone-model-generator) |
 | Index declarations and non-executing schema diffs | [Schema diffs](./USAGE.md#16-index-declarations-and-schema-diffs) |
 | SQL, transaction, and session events | [Observability](./USAGE.md#17-observability) |
@@ -119,7 +125,7 @@ Native PDO and full ORM paths with statement cache 64:
 | 500 PK reads | 1.880 / 6.334 | 75.368 / 47.457 | 101.454 / 51.947 |
 | 200 atomic increments | 0.591 / 1.866 | 37.193 / 22.720 | 46.725 / 20.439 |
 
-The PDO PK path fetches arrays; `Entity::find()` bypasses the row cache and hydrates an entity. ORM increments use `Builder::increment()`, while the PDO reference executes equivalent parameterized SQL. Absolute times across different database backends are not comparable as ORM overhead.
+The PDO PK path fetches arrays. The ORM benchmark clears the row cache before each `Entity::find()` to measure cache misses and entity hydration. ORM increments use `Builder::increment()`, while the PDO reference executes equivalent parameterized SQL. Absolute times across different database backends are not comparable as ORM overhead.
 
 The same low-level SQL, with a new connection wrapper per round:
 

@@ -134,6 +134,88 @@ final class NumericAndSqlDialectBoundaryTest extends TestCase
         }
     }
 
+    #[DataProvider('nativeFloatDrivers')]
+    public function testNativePdoFloatBindingsRoundTripWithoutRuntimePrecisionSettings(string $driver, string $type): void
+    {
+        $pdo = $this->nativeFloatPdo($driver);
+        $pdo->exec("CREATE TEMPORARY TABLE float_measurement (id INTEGER PRIMARY KEY, measurement_value $type NOT NULL)");
+        $connection = new PdoConnection($pdo);
+        $previousPrecision = ini_get('precision');
+        $previousSerializePrecision = ini_get('serialize_precision');
+        $previousLocale = setlocale(LC_NUMERIC, '0');
+        try {
+            // 系统安装了任一逗号小数点 locale 时，也在该设置下覆盖绑定路径。
+            setlocale(LC_NUMERIC, ['de_DE.UTF-8', 'fr_FR.UTF-8', 'German_Germany.1252', 'French_France.1252']);
+            foreach (['5', '14', '25'] as $index => $precision) {
+                ini_set('precision', $precision);
+                ini_set('serialize_precision', '4');
+                // 这里覆盖普通度量范围，包括超过 14 位有效数字的值和科学计数法。
+                $values = [0.12345678901234567, -1234567890123.4567, 1.2345678901234567e-24, 0.1];
+                foreach ($values as $offset => $value) {
+                    $id = $index * count($values) + $offset;
+                    self::assertSame(1, $connection->execute(
+                        'INSERT INTO float_measurement (id, measurement_value) VALUES (:id, :measurement)',
+                        ['id' => $id, 'measurement' => $value],
+                    ));
+                    $row = $connection->queryOne(
+                        'SELECT measurement_value FROM float_measurement WHERE id = :id AND measurement_value = :measurement',
+                        ['id' => $id, 'measurement' => $value],
+                    );
+                    self::assertNotNull($row);
+                    self::assertSame($value, (float) $row['measurement_value']);
+                }
+                if ($driver === 'sqlite') {
+                    // PDO 无专用浮点绑定类型。无列亲和性时保留 TEXT，写入 REAL 列则存为 REAL。
+                    self::assertSame(
+                        ['parameter_value' => '0.1', 'parameter_type' => 'text', 'stored_type' => 'real'],
+                        $connection->queryOne(
+                            'SELECT :value AS parameter_value, typeof(:value) AS parameter_type, typeof(measurement_value) AS stored_type '
+                            . 'FROM float_measurement WHERE id = :id',
+                            ['value' => 0.1, 'id' => $index * count($values)],
+                        ),
+                    );
+                }
+            }
+        } finally {
+            ini_set('precision', (string) $previousPrecision);
+            ini_set('serialize_precision', (string) $previousSerializePrecision);
+            if ($previousLocale !== false) {
+                setlocale(LC_NUMERIC, $previousLocale);
+            }
+        }
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function nativeFloatDrivers(): array
+    {
+        return [
+            'sqlite' => ['sqlite', 'REAL'],
+            'mysql' => ['mysql', 'DOUBLE'],
+            'pgsql' => ['pgsql', 'DOUBLE PRECISION'],
+        ];
+    }
+
+    private function nativeFloatPdo(string $driver): PDO
+    {
+        if ($driver === 'sqlite') {
+            return new PDO('sqlite::memory:');
+        }
+
+        $prefix = 'PIXIAOKA_ORM_LIVE_' . strtoupper($driver);
+        $dsn = getenv($prefix . '_DSN');
+        if ($dsn === false || $dsn === '') {
+            self::markTestSkipped('未配置 ' . $prefix . '_DSN');
+        }
+        $user = getenv($prefix . '_USER');
+        $password = getenv($prefix . '_PASSWORD');
+
+        return new PDO($dsn, $user === false ? null : $user, $password === false ? null : $password, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_EMULATE_PREPARES => false,
+            PDO::ATTR_STRINGIFY_FETCHES => false,
+        ]);
+    }
+
     #[DataProvider('nonFiniteOutput')]
     public function testRawFloatBindingsRejectNonFiniteValues(float $value): void
     {

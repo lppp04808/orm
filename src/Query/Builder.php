@@ -221,7 +221,7 @@ final class Builder
         }
         Operator::assertAllowed($operator);
         if ($operator === 'BETWEEN') {
-            if (!is_array($value) || count($value) !== 2) {
+            if (!is_array($value) || !array_is_list($value) || count($value) !== 2) {
                 throw new InvalidArgumentException('BETWEEN requires an array of exactly two values [min, max]');
             }
         }

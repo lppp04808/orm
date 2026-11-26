@@ -67,7 +67,13 @@ final class SchemaInspector
             'pgsql' => $this->pgsqlIndexes($table),
         };
 
-        return new TableSchema($table, $columns, $indexes);
+        [$columnDependencies, $indexDependencies] = match ($this->driver) {
+            'sqlite' => $this->sqliteDependencies($table, $columns, $indexes),
+            'mysql' => $this->mysqlDependencies($table, $indexes),
+            'pgsql' => $this->pgsqlDependencies($table),
+        };
+
+        return new TableSchema($table, $columns, $indexes, $columnDependencies, $indexDependencies);
     }
 
     private function assertIdentifier(string $identifier): void
@@ -297,7 +303,7 @@ final class SchemaInspector
             'CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinal_position) ' .
             'LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum ' .
             'WHERE n.nspname = current_schema() AND t.relname = :table AND NOT ix.indisprimary ' .
-            'AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conindid = i.oid) ' .
+            'AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conindid = i.oid AND c.conrelid = t.oid AND c.contype IN (\'p\', \'u\', \'x\')) ' .
             'ORDER BY i.relname, k.ordinal_position',
         );
         $statement->execute(['table' => $table]);
@@ -323,6 +329,131 @@ final class SchemaInspector
         }
 
         return $indexes;
+    }
+
+    /**
+     * @param list<ColumnSchema> $columns
+     * @param list<IndexSchema> $indexes
+     * @return array{array<string, string>, array<string, string>}
+     */
+    private function sqliteDependencies(string $table, array $columns, array $indexes): array
+    {
+        $lookup = $this->pdo->prepare(
+            'SELECT f."from" AS column_name FROM pragma_foreign_key_list(:source_table, \'main\') f '
+            . 'UNION SELECT f."to" FROM sqlite_master t JOIN pragma_foreign_key_list(t.name, \'main\') f '
+            . 'WHERE t.type = \'table\' AND f."table" = :target_table COLLATE NOCASE',
+        );
+        $lookup->execute(['source_table' => $table, 'target_table' => $table]);
+        $foreign = [];
+        foreach ($lookup->fetchAll(PDO::FETCH_COLUMN) as $name) {
+            if ($name !== null) {
+                $foreign[strtolower((string) $name)] = true;
+            }
+        }
+        $lookup = $this->pdo->prepare(
+            'SELECT c.name FROM pragma_index_list(:table_name, \'main\') i '
+            . 'JOIN pragma_index_info(i.name, \'main\') c WHERE i.origin = \'u\'',
+        );
+        $lookup->execute(['table_name' => $table]);
+        $unique = array_map('strtolower', $lookup->fetchAll(PDO::FETCH_COLUMN));
+        $lookup = $this->pdo->prepare('SELECT sql FROM sqlite_master WHERE type = \'table\' AND name = :name COLLATE NOCASE');
+        $lookup->execute(['name' => $table]);
+        // SQLite 不公开 CHECK 或生成表达式的依赖。有这些定义时保守地禁止自动删列。
+        $hasComplexConstraints = preg_match('/\b(?:check|generated|as)\s*(?:\(|always\b)/i', (string) $lookup->fetchColumn()) === 1;
+        $dependencies = [];
+        foreach ($columns as $column) {
+            $name = strtolower($column->name);
+            if (isset($foreign[$name])) {
+                $dependencies[$column->name] = 'Remove or migrate the foreign key before changing this column';
+            } elseif (in_array($name, $unique, true) || $hasComplexConstraints) {
+                $dependencies[$column->name] = 'Review or rebuild SQLite table constraints before changing this column';
+            }
+        }
+        $indexDependencies = [];
+        foreach ($indexes as $index) {
+            if ($index->unique && isset($foreign[strtolower($index->columns[0])])) {
+                $indexDependencies[$index->name] = 'This unique index may support a foreign key; migrate the constraint before dropping the index';
+            }
+        }
+
+        return [$dependencies, $indexDependencies];
+    }
+
+    /** @param list<IndexSchema> $indexes @return array{array<string, string>, array<string, string>} */
+    private function mysqlDependencies(string $table, array $indexes): array
+    {
+        $statement = $this->pdo->prepare(
+            'SELECT COLUMN_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME IS NOT NULL AS is_foreign '
+            . 'FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :local_table '
+            . 'UNION ALL SELECT REFERENCED_COLUMN_NAME, CONSTRAINT_NAME, 1 FROM information_schema.KEY_COLUMN_USAGE '
+            . 'WHERE REFERENCED_TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME = :referenced_table',
+        );
+        $statement->execute(['local_table' => $table, 'referenced_table' => $table]);
+        $columns = [];
+        $foreign = [];
+        foreach ($statement->fetchAll(PDO::FETCH_NUM) as [$name, $constraint, $isForeign]) {
+            if ($constraint !== 'PRIMARY') {
+                $columns[(string) $name] = 'Remove or migrate the dependent constraint before changing this column';
+            }
+            if ((int) $isForeign === 1) {
+                $foreign[(string) $name] = true;
+            }
+        }
+        $statement = $this->pdo->prepare(
+            "SELECT 1 FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table_name AND CONSTRAINT_TYPE = 'CHECK' LIMIT 1",
+        );
+        $statement->execute(['table_name' => $table]);
+        // Older MySQL versions have no CHECK_CONSTRAINTS catalog.
+        if ($statement->fetchColumn() !== false) {
+            $statement = $this->pdo->prepare(
+                'SELECT cc.CHECK_CLAUSE FROM information_schema.TABLE_CONSTRAINTS tc '
+                . 'JOIN information_schema.CHECK_CONSTRAINTS cc ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA '
+                . 'AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME WHERE tc.TABLE_SCHEMA = DATABASE() AND tc.TABLE_NAME = :table_name',
+            );
+            $statement->execute(['table_name' => $table]);
+            foreach ($statement->fetchAll(PDO::FETCH_COLUMN) as $check) {
+                preg_match_all('/`([A-Za-z_][A-Za-z0-9_]*)`/', (string) $check, $names);
+                foreach ($names[1] as $name) {
+                    $columns[$name] = 'Remove or migrate the CHECK constraint before changing this column';
+                }
+            }
+        }
+        $indexDependencies = [];
+        foreach ($indexes as $index) {
+            // MySQL 的外键目录不提供子表使用的索引名，保守保护匹配首列的索引。
+            if (isset($foreign[$index->columns[0]])) {
+                $indexDependencies[$index->name] = 'This index may support a foreign key; migrate the constraint before dropping the index';
+            }
+        }
+
+        return [$columns, $indexDependencies];
+    }
+
+    /** @return array{array<string, string>, array<string, string>} */
+    private function pgsqlDependencies(string $table): array
+    {
+        $statement = $this->pdo->prepare(
+            'WITH target AS (SELECT c.oid FROM pg_catalog.pg_class c '
+            . 'JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relname = :name) '
+            . 'SELECT a.attname AS name, 0 AS is_index FROM target t JOIN pg_catalog.pg_constraint c ON c.conrelid = t.oid '
+            . 'JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey) WHERE c.contype <> \'p\' '
+            . 'UNION SELECT a.attname, 0 FROM target t JOIN pg_catalog.pg_constraint c ON c.confrelid = t.oid '
+            . 'JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.confkey) WHERE c.contype = \'f\' '
+            . 'UNION SELECT i.relname, 1 FROM target t JOIN pg_catalog.pg_constraint c ON c.confrelid = t.oid '
+            . 'JOIN pg_catalog.pg_class i ON i.oid = c.conindid WHERE c.contype = \'f\'',
+        );
+        $statement->execute(['name' => $table]);
+        $columns = [];
+        $indexes = [];
+        foreach ($statement->fetchAll(PDO::FETCH_NUM) as [$name, $isIndex]) {
+            if ((int) $isIndex === 1) {
+                $indexes[(string) $name] = 'Remove or migrate the dependent foreign key before dropping this index';
+            } else {
+                $columns[(string) $name] = 'Remove or migrate the dependent constraint before changing this column';
+            }
+        }
+
+        return [$columns, $indexes];
     }
 
     private function quote(string $identifier, string $quote): string

@@ -14,7 +14,7 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
     /** 当前 PDO 物理连接上的事务深度；SAVEPOINT 名称只由这个受控整数生成。 */
     private int $transactionDepth = 0;
 
-    /** @var array<string, PDOStatement> 原始 SQL 到服务端预备语句的 LRU 映射。 */
+    /** @var array<string, array{statement: PDOStatement, parameterKeys: array<int|string, true>}> 预备语句及其绑定键的 LRU 映射。 */
     private array $statementCache = [];
 
     private readonly int $statementCacheSize;
@@ -85,17 +85,24 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
     private function prepare(string $sql, array $params, bool $cacheable = true): PDOStatement
     {
         $cacheable = $cacheable && $this->statementCacheSize > 0 && strlen($sql) <= 4096;
-        $statement = $cacheable ? ($this->statementCache[$sql] ?? null) : null;
-        if ($statement !== null) {
+        $bindings = [];
+        foreach ($params as $name => $value) {
+            $parameter = is_int($name) ? $name + 1 : ':' . ltrim($name, ':');
+            $bindings[$parameter] = $value;
+        }
+        $entry = $cacheable ? ($this->statementCache[$sql] ?? null) : null;
+        if ($entry !== null) {
             unset($this->statementCache[$sql]);
-            $this->statementCache[$sql] = $statement;
+        }
+        // PDO 语句保留先前的绑定。省略既有参数时须由新语句恢复驱动的默认行为。
+        if ($entry !== null && array_diff_key($entry['parameterKeys'], $bindings) === []) {
+            $statement = $entry['statement'];
         } else {
             $preparedSql = $this->driver === 'pgsql' ? $this->normalizePgDollarQuotes($sql) : $sql;
             $statement = $this->pdo->prepare($preparedSql);
         }
         try {
-            foreach ($params as $name => $value) {
-                $parameter = is_int($name) ? $name + 1 : ':' . ltrim($name, ':');
+            foreach ($bindings as $parameter => $value) {
                 $type = match (true) {
                     is_int($value) => PDO::PARAM_INT,
                     is_bool($value) => PDO::PARAM_BOOL,
@@ -103,6 +110,11 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
                     // PDO 没有通用的浮点绑定类型；字符串绑定保留十进制文本。
                     default => PDO::PARAM_STR,
                 };
+                if (is_float($value) && is_finite($value)) {
+                    // %H 不受区域设置影响，精度固定。常见短小数不必扩展到 17 位。
+                    $text = sprintf('%.14H', $value);
+                    $value = (float) $text === $value ? $text : sprintf('%.17H', $value);
+                }
                 $statement->bindValue($parameter, $value, $type);
             }
             $statement->execute();
@@ -112,8 +124,11 @@ final class PdoConnection implements ManagedConnection, DriverAwareConnection
             }
             throw $exception;
         }
-        if ($cacheable && !isset($this->statementCache[$sql])) {
-            $this->statementCache[$sql] = $statement;
+        if ($cacheable) {
+            $this->statementCache[$sql] = [
+                'statement' => $statement,
+                'parameterKeys' => array_fill_keys(array_keys($bindings), true),
+            ];
             while (count($this->statementCache) > $this->statementCacheSize) {
                 $oldest = array_key_first($this->statementCache);
                 if ($oldest === null) {

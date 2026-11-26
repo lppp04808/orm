@@ -715,6 +715,100 @@ final class TransactionFailureMatrixTest extends TestCase
         self::assertSame(['committed', 'after discard'], array_column($this->rows($connection), 0));
     }
 
+    public function testBusinessExceptionAfterConfirmedDiscardIsTransparent(): void
+    {
+        $connection = new MatrixConnection();
+        $gateway = $this->bind($connection);
+        $record = $this->persistedRecord($gateway);
+        $business = new \RuntimeException('business failure after confirmed discard');
+
+        try {
+            $gateway->transaction(static function () use ($record, $business): void {
+                $record->body = 'discarded write';
+                $record->save();
+                Session::discard();
+                throw $business;
+            });
+            self::fail('成功回滚后的业务异常必须原样传播');
+        } catch (\RuntimeException $e) {
+            self::assertSame($business, $e);
+        }
+
+        self::assertSame(['begin', 'forceRollback'], $connection->transactionCalls);
+        self::assertSame([['committed', 1]], $this->rows($connection));
+        self::assertSame('committed', $record->body);
+        self::assertSame('committed', $record->takeOriginal()['body']);
+        Session::use($gateway);
+        self::assertSame('committed', MatrixRecord::find(['id' => $record->id])?->body);
+    }
+
+    public function testCaughtDiscardFailureRetainsFirstRollbackFailureAtTransactionBoundary(): void
+    {
+        $connection = new MatrixConnection();
+        $gateway = $this->bind($connection);
+        $discardFailure = null;
+
+        try {
+            $gateway->transaction(static function () use ($connection, &$discardFailure): void {
+                $connection->pdo->rollBack();
+                try {
+                    Session::discard();
+                    self::fail('事务物理状态已消失，discard 必须报告回滚结果未知');
+                } catch (TransactionException $e) {
+                    $discardFailure = $e;
+                    self::assertInstanceOf(\LogicException::class, $e->getPrevious());
+                    self::assertStringContainsString('forceRollback', $e->getPrevious()->getMessage());
+                }
+            });
+            self::fail('外层事务边界必须保留首次回滚失败');
+        } catch (TransactionException $e) {
+            self::assertSame($discardFailure, $e);
+        }
+
+        self::assertSame(['begin', 'forceRollback'], $connection->transactionCalls);
+        try {
+            $gateway->find(MatrixRecord::class, ['id' => 1]);
+            self::fail('结果未知的网关必须拒绝查询');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('do not reuse this connection', $e->getMessage());
+        }
+    }
+
+    public function testDiscardDoesNotConfirmRollbackForUnboundGateway(): void
+    {
+        $outerConnection = new MatrixConnection();
+        $outer = new EntityGateway($outerConnection);
+        $discardedConnection = new MatrixConnection();
+        $discarded = $this->bind($discardedConnection);
+        $innerFailure = new \RuntimeException('discarded transaction business failure');
+        $outerFailure = new \RuntimeException('independent transaction business failure');
+
+        try {
+            $outer->transaction(static function () use ($outer, $discarded, $innerFailure, $outerFailure): void {
+                $outer->executeRaw("INSERT INTO matrix_record (body, revision) VALUES ('outer', 1)");
+                try {
+                    $discarded->transaction(static function () use ($innerFailure): void {
+                        Session::discard();
+                        throw $innerFailure;
+                    });
+                    self::fail('被丢弃事务必须传播其业务异常');
+                } catch (\RuntimeException $e) {
+                    self::assertSame($innerFailure, $e);
+                }
+                throw $outerFailure;
+            });
+            self::fail('独立事务必须回滚并传播其业务异常');
+        } catch (\RuntimeException $e) {
+            self::assertSame($outerFailure, $e);
+        }
+
+        self::assertSame(['begin', 'forceRollback'], $discardedConnection->transactionCalls);
+        self::assertSame(['begin', 'rollback'], $outerConnection->transactionCalls);
+        self::assertFalse($outerConnection->pdo->inTransaction());
+        self::assertSame([], $this->rows($outerConnection));
+        self::assertSame([['value' => 1]], $outer->selectRaw('SELECT 1 AS value'));
+    }
+
     #[\PHPUnit\Framework\Attributes\RunInSeparateProcess]
     public function testLegacyDecoratorRollsBackNestedBusinessFailureOnlyOnce(): void
     {
