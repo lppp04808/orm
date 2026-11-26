@@ -14,7 +14,7 @@ final readonly class BcDecimal implements Decimal
     public function __construct(string|int $value)
     {
         $text = (string) $value;
-        if (preg_match('/^-?\d+(\.\d+)?$/', $text) !== 1) {
+        if (preg_match('/^-?\d+(\.\d+)?$/D', $text) !== 1) {
             throw new \InvalidArgumentException('Invalid decimal number: ' . $text);
         }
         $this->value = $text;

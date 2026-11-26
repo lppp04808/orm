@@ -89,8 +89,7 @@ final class Caster
                 Temporal::DATE => $utc->format('Y-m-d'),
                 Temporal::TEXT_US => $utc->format('Y-m-d H:i:s.u'),
                 Temporal::UNIX => $utc->getTimestamp(),
-                Temporal::UNIX_MS => $utc->getTimestamp() * 1000
-                    + intdiv((int) $utc->format('u'), 1000),
+                Temporal::UNIX_MS => $this->unixMilliseconds($model, $field, $utc),
                 default => $utc->format(self::TIME_FORMAT),
             };
         }
@@ -274,7 +273,7 @@ final class Caster
         if ($value instanceof $name) {
             return $value;
         }
-        if (!is_int($value) && !(is_string($value) && preg_match('/^-?\d+(\.\d+)?$/', $value) === 1)) {
+        if (!is_int($value) && !(is_string($value) && preg_match('/^-?\d+(\.\d+)?$/D', $value) === 1)) {
             throw $this->fail($model, $field, 'Cannot parse value as a decimal number');
         }
         try {
@@ -341,26 +340,25 @@ final class Caster
             if (!is_int($value) && !(is_string($value) && preg_match('/^-?\d+$/D', $value) === 1)) {
                 throw $this->fail($model, $field, 'Cannot parse value as a Unix timestamp');
             }
+            $timestamp = $this->toInt($model, $field, $value);
             if ($field->temporal === Temporal::UNIX) {
-                return (new DateTimeImmutable('@' . (int) $value))->setTimezone(new DateTimeZone('UTC'));
+                return (new DateTimeImmutable('@' . $timestamp))->setTimezone(new DateTimeZone('UTC'));
             }
-            $milliseconds = (int) $value;
+            $milliseconds = $timestamp;
             $seconds = intdiv($milliseconds, 1000);
             $microseconds = ($milliseconds - $seconds * 1000) * 1000;
             if ($microseconds < 0) {
                 $seconds--;
                 $microseconds += 1_000_000;
             }
-            $parsed = DateTimeImmutable::createFromFormat(
-                '!U.u',
-                $seconds . '.' . sprintf('%06d', $microseconds),
-                new DateTimeZone('UTC'),
-            );
-            if ($parsed === false) {
-                throw $this->fail($model, $field, 'Cannot parse value as a Unix millisecond timestamp');
+            // U.u 的小数部分在 PHP 8.3 会走浮点，极小负时间可能向 -∞ 进一秒。
+            // 先构造整数秒，再以整数微秒偏移恢复，保证毫秒输入精确往返。
+            $base = (new DateTimeImmutable('@' . $seconds))->setTimezone(new DateTimeZone('UTC'));
+            if ($microseconds === 0) {
+                return $base;
             }
 
-            return $parsed->setTimezone(new DateTimeZone('UTC'));
+            return $base->modify('+' . $microseconds . ' microseconds');
         }
         if (!is_string($value)) {
             throw $this->fail($model, $field, 'Temporal database value must be a string');
@@ -380,6 +378,26 @@ final class Caster
         }
 
         return $parsed;
+    }
+
+    private function unixMilliseconds(string $model, FieldMeta $field, DateTimeImmutable $value): int
+    {
+        $seconds = $value->getTimestamp();
+        $milliseconds = intdiv((int) $value->format('u'), 1000);
+        $maximumSeconds = intdiv(PHP_INT_MAX, 1000);
+        if ($seconds > $maximumSeconds || ($seconds === $maximumSeconds && $milliseconds > PHP_INT_MAX % 1000)) {
+            throw $this->fail($model, $field, 'Unix millisecond timestamp exceeds PHP integer range');
+        }
+        $minimumSeconds = intdiv(PHP_INT_MIN, 1000);
+        if ($seconds < $minimumSeconds) {
+            $minimumMilliseconds = 1000 + PHP_INT_MIN % 1000;
+            if ($seconds === $minimumSeconds - 1 && $milliseconds >= $minimumMilliseconds) {
+                return PHP_INT_MIN + ($milliseconds - $minimumMilliseconds);
+            }
+            throw $this->fail($model, $field, 'Unix millisecond timestamp exceeds PHP integer range');
+        }
+
+        return $seconds * 1000 + $milliseconds;
     }
 
     private function microsecondText(string $value): string

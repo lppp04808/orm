@@ -552,6 +552,23 @@ final class OrmRelationQueryTest extends TestCase
         self::assertSame('alice', $this->pdo->query('SELECT name FROM relq_customer WHERE id = 1')->fetchColumn());
     }
 
+    public function testRelationCountMakesAnExplicitSingleColumnSubqueryInvalid(): void
+    {
+        $subquery = RelQueryCustomer::query()->select('id')->withCount('orders');
+        foreach ([
+            RelQueryOrder::query()->whereIn('id', $subquery),
+            RelQueryOrder::query()->where('id', $subquery),
+        ] as $query) {
+            try {
+                $query->build();
+                self::fail('Subqueries used as scalar values must reject an extra count column');
+            } catch (\InvalidArgumentException $e) {
+                self::assertStringContainsString('must return exactly one column', $e->getMessage());
+            }
+        }
+        self::assertSame(0, $this->selects);
+    }
+
     public function testComplexParentsAndInvalidConstraintShapesAreRejectedBeforeSql(): void
     {
         $parents = [

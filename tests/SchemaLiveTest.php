@@ -159,6 +159,23 @@ final class SchemaLiveTest extends TestCase
                 indexes: [new IndexSchema('idx_live_differ_label', ['label'])],
             );
             $differ = new SchemaDiffer();
+            if ($driver === 'mysql') {
+                $report = $differ->compare($model, $schema, $driver);
+                self::assertTrue($report['hasUnsupported']);
+                $index = array_values(array_filter($report['changes'], static fn (array $change): bool => $change['kind'] === 'add_index'));
+                self::assertCount(1, $index);
+                self::assertFalse($index[0]['executable']);
+                self::assertStringContainsString('prefix length', (string) $index[0]['note']);
+                try {
+                    $differ->previewSql($model, $schema, $driver);
+                    self::fail('MySQL TEXT indexes must not be emitted without a prefix length');
+                } catch (\InvalidArgumentException $e) {
+                    self::assertStringContainsString('cannot be executed safely', $e->getMessage());
+                }
+                $model = new \Pixiaoka\Orm\Metadata\ModelMeta(
+                    $meta->class, $table, $meta->fields, $meta->primaryKey, $meta->identityKind, $meta->timestamps,
+                );
+            }
             foreach ($differ->previewSql($model, $schema, $driver) as $sql) {
                 try {
                     $pdo->exec($sql);
@@ -170,14 +187,42 @@ final class SchemaLiveTest extends TestCase
             self::assertSame([], $differ->compare($model, $actual, $driver)['changes']);
 
             $expression = 'expr_' . $table;
-            $pdo->exec($driver === 'mysql'
-                ? "CREATE INDEX $q$expression$q ON $q$table$q ((LOWER(label)))"
-                : "CREATE INDEX $q$expression$q ON $q$table$q (LOWER(label))");
-            $this->expectException(\RuntimeException::class);
-            $this->expectExceptionMessage('expression');
-            $inspector->table($table);
+            if ($driver === 'pgsql') {
+                $replacement = new \Pixiaoka\Orm\Metadata\ModelMeta(
+                    $meta->class, $table, $meta->fields, $meta->primaryKey, $meta->identityKind, $meta->timestamps,
+                    indexes: [new IndexSchema('idx_live_differ_label', ['note'])],
+                );
+                foreach ($differ->previewSql($replacement, $actual, $driver) as $sql) {
+                    $pdo->exec($sql);
+                }
+                self::assertSame([], $differ->compare($replacement, $inspector->table($table), $driver)['changes']);
+
+                $pdo->exec("CREATE INDEX $q$expression$q ON $q$table$q (LOWER(label))");
+                $this->expectException(\RuntimeException::class);
+                $this->expectExceptionMessage('expression');
+                $inspector->table($table);
+            } else {
+                self::assertTrue(true, 'MySQL TEXT 列的 LOWER() 索引由数据库拒绝，前缀索引限制已在上方验证');
+            }
         } finally {
             $pdo->exec("DROP TABLE IF EXISTS $q$table$q");
+        }
+    }
+
+    public function testPostgresInspectorRejectsPartialIndexes(): void
+    {
+        $pdo = $this->connection('pgsql');
+        $table = 'schema_partial_' . bin2hex(random_bytes(5));
+        $index = $table . '_email';
+        try {
+            $pdo->exec("CREATE TABLE $table (id BIGINT PRIMARY KEY, email TEXT, enabled BOOLEAN NOT NULL)");
+            $pdo->exec("CREATE UNIQUE INDEX $index ON $table (email) WHERE enabled");
+
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage("$index is partial");
+            (new SchemaInspector($pdo))->table($table);
+        } finally {
+            $pdo->exec("DROP TABLE IF EXISTS $table");
         }
     }
 

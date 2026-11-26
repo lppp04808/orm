@@ -1145,7 +1145,11 @@ function runComplexScenarios(string $driver, PDO $pdo, RecordingConnection $rec,
             'happened_at' => '2026-02-11 00:00:00',
         ], []);
         $ignored = VerifyItem::query()->where('id', $targetId)->row();
-        $check->assert($ignored['sku'] === 'CQ-A2' && (int) $ignored['qty'] === 99, 'o3. UPSERT 忽略模式原行不变', json_encode($ignored, JSON_UNESCAPED_UNICODE));
+        $check->assert(
+            $ignored == $after,
+            'o3. UPSERT 忽略模式原行（含 updated_at）完全不变',
+            json_encode(['before' => $after, 'after' => $ignored], JSON_UNESCAPED_UNICODE),
+        );
 
         // o4. 复合自然键 UPSERT（tag 表）
         VerifyTag::upsert(['item_id' => $targetId, 'label' => 'paid'], []);

@@ -6,15 +6,19 @@ namespace Tests\Pixiaoka\Orm;
 
 use DateTimeImmutable;
 use PDO;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Pixiaoka\Orm\Annotation\BelongsTo as BelongsToAttribute;
 use Pixiaoka\Orm\Annotation\Column;
 use Pixiaoka\Orm\Annotation\HasMany as HasManyAttribute;
 use Pixiaoka\Orm\Annotation\HasOne as HasOneAttribute;
 use Pixiaoka\Orm\Annotation\PrimaryKey;
+use Pixiaoka\Orm\Annotation\Version;
 use Pixiaoka\Orm\Cast\BcDecimal;
 use Pixiaoka\Orm\Entity;
+use Pixiaoka\Orm\Exception\IdentityException;
 use Pixiaoka\Orm\Exception\MetadataException;
+use Pixiaoka\Orm\Exception\OptimisticLockException;
 use Pixiaoka\Orm\Exception\RelationException;
 use Pixiaoka\Orm\Gateway\EntityGateway;
 use Pixiaoka\Orm\Gateway\PdoConnection;
@@ -40,6 +44,9 @@ final class RelationCustomer extends Entity
 
     #[HasManyAttribute(target: RelationOrder::class, foreignKey: ['customer_id'])]
     public function orders(): HasMany { return $this->makeRelation(); }
+
+    #[HasOneAttribute(target: RelationVersionedProfile::class, foreignKey: ['customer_id'])]
+    public function versionedProfile(): HasOne { return $this->makeRelation(); }
 }
 
 final class RelationProfile extends Entity
@@ -167,6 +174,49 @@ final class RelationValueObjectChild extends Entity
     public static function table(): string { return 'relation_value_child'; }
 }
 
+final class RelationVersionedProfile extends Entity
+{
+    #[Column, PrimaryKey]
+    public int $id;
+    #[Column]
+    public int $customer_id;
+    #[Column]
+    public string $bio;
+    #[Column, Version]
+    public int $version;
+
+    public static function table(): string { return 'relation_versioned_profile'; }
+}
+
+final class RelationCollationParent extends Entity
+{
+    #[Column, PrimaryKey]
+    public int $id;
+    #[Column]
+    public int $tenant_id;
+    #[Column]
+    public ?string $code;
+
+    public static function table(): string { return 'relation_collation_parent'; }
+
+    #[HasManyAttribute(target: RelationCollationChild::class, localKey: ['tenant_id', 'code'], foreignKey: ['tenant_id', 'code'])]
+    public function children(): HasMany { return $this->makeRelation(); }
+}
+
+final class RelationCollationChild extends Entity
+{
+    #[Column, PrimaryKey]
+    public int $id;
+    #[Column]
+    public int $tenant_id;
+    #[Column]
+    public string $code;
+    #[Column]
+    public string $_orm_match_0;
+
+    public static function table(): string { return 'relation_collation_child'; }
+}
+
 final class OrmRelationTest extends TestCase
 {
     private EntityGateway $gateway;
@@ -271,6 +321,49 @@ final class OrmRelationTest extends TestCase
         self::assertSame(3, $this->selects);
     }
 
+    public function testRepeatedPathWithoutConstraintKeepsExistingConstraint(): void
+    {
+        $customer = RelationCustomer::query()->where('id', 1)->with(
+            ['orders' => static fn (Builder $q) => $q->where('status', 'paid')],
+            'orders',
+        )->first();
+
+        self::assertSame([1, 3], array_column($customer?->loadedRelation('orders'), 'id'));
+    }
+
+    public function testNestedSingleRelationOnlyLoadsAndPublishesSelectedTarget(): void
+    {
+        $other = RelationProfile::find(['id' => 2]);
+        $this->pdo->exec("UPDATE relation_profile SET bio = 'changed' WHERE id = 2");
+        $customer = RelationCustomer::query()->with('profile.customer')->where('id', 1)->first();
+
+        $selected = $customer?->loadedRelation('profile');
+        self::assertSame(1, $selected?->id);
+        self::assertSame($customer, $selected?->loadedRelation('customer'));
+        self::assertFalse($other->relationLoaded('customer'));
+        self::assertSame('second', $other->bio);
+    }
+
+    public function testEagerLoadingDoesNotRebaseDirtyVersionedTarget(): void
+    {
+        $this->pdo->exec('CREATE TABLE relation_versioned_profile (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, bio TEXT NOT NULL, version INTEGER NOT NULL)');
+        $this->pdo->exec("INSERT INTO relation_versioned_profile VALUES (1, 1, 'original', 1)");
+        $dirty = RelationVersionedProfile::find(['id' => 1]);
+        $dirty->bio = 'local edit';
+        $this->pdo->exec("UPDATE relation_versioned_profile SET bio = 'other writer', version = 2 WHERE id = 1");
+
+        $customer = RelationCustomer::query()->with('versionedProfile')->where('id', 1)->first();
+        self::assertSame($dirty, $customer?->loadedRelation('versionedProfile'));
+        self::assertSame('local edit', $dirty->bio);
+        try {
+            $dirty->save();
+            self::fail('A relation load must not silently rebase a pending edit onto a newer version');
+        } catch (OptimisticLockException) {
+            self::assertSame(1, $dirty->version);
+            self::assertSame(['other writer', 2], $this->pdo->query('SELECT bio, version FROM relation_versioned_profile')->fetch(PDO::FETCH_NUM));
+        }
+    }
+
     public function testCompositeKeysDoNotCrossTenants(): void
     {
         $tenants = RelationTenant::query()->with('entries.owner')->orderBy('tenant_id')->orderBy('id')->get();
@@ -279,6 +372,47 @@ final class OrmRelationTest extends TestCase
         self::assertSame([], $tenants[2]->loadedRelation('entries'));
         self::assertSame('B', $tenants[1]->loadedRelation('entries')[0]->loadedRelation('owner')->name);
         self::assertSame(3, $this->selects);
+    }
+
+    public function testUnsavedSourceCannotReplacePersistedIdentityDuringReverseLoad(): void
+    {
+        $identity = ['tenant_id' => 1, 'id' => 7];
+        $stored = RelationTenant::find($identity);
+        $draft = new RelationTenant();
+        $draft->tenant_id = 1;
+        $draft->id = 7;
+        $draft->name = 'draft';
+
+        $draft->load('entries.owner');
+        self::assertTrue($draft->isNew());
+        self::assertSame('draft', $draft->name);
+        $entries = $draft->loadedRelation('entries');
+        self::assertCount(2, $entries);
+        foreach ($entries as $entry) {
+            self::assertSame($stored, $entry->loadedRelation('owner'));
+        }
+        self::assertSame($stored, RelationTenant::find($identity));
+        self::assertSame('A', $stored->name);
+    }
+
+    public function testEagerLoadRejectsChangedPersistedSourceKeyBeforeQuery(): void
+    {
+        $customer = RelationCustomer::find(['id' => 1]);
+        self::assertNotNull($customer);
+        $customer->load('orders');
+        $orders = $customer->loadedRelation('orders');
+        $customer->id = 2;
+        $this->selects = 0;
+
+        try {
+            $customer->load('orders');
+            self::fail('A persisted source with a changed primary key must not load another row\'s relations');
+        } catch (IdentityException) {
+            self::assertSame(0, $this->selects);
+            self::assertSame($orders, $customer->loadedRelation('orders'));
+        }
+        $customer->id = 1;
+        self::assertSame([1, 2, 3], array_column($customer->load('orders')->loadedRelation('orders'), 'id'));
     }
 
     public function testEmptyAndFreshLoad(): void
@@ -620,6 +754,67 @@ final class OrmRelationTest extends TestCase
         self::assertSame($profile, $customer->loadedRelation('profile'));
     }
 
+    /** @return array<string, array{string}> */
+    public static function collationDrivers(): array
+    {
+        return ['sqlite' => ['sqlite'], 'mysql' => ['mysql'], 'pgsql' => ['pgsql']];
+    }
+
+    #[DataProvider('collationDrivers')]
+    public function testEagerLoadingUsesDatabaseCollationForEveryMatchingParent(string $driver): void
+    {
+        $pdo = $this->pdo;
+        if ($driver !== 'sqlite') {
+            $prefix = 'PIXIAOKA_ORM_LIVE_' . strtoupper($driver);
+            $dsn = getenv($prefix . '_DSN');
+            if ($dsn === false || $dsn === '') {
+                self::markTestSkipped('未配置 ' . $prefix . '_DSN');
+            }
+            $pdo = new PDO($dsn, getenv($prefix . '_USER') ?: null, getenv($prefix . '_PASSWORD') ?: null, [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_EMULATE_PREPARES => false,
+            ]);
+        }
+        $pdo->exec('CREATE TEMPORARY TABLE relation_collation_parent (id INTEGER PRIMARY KEY, tenant_id INTEGER NOT NULL, code VARCHAR(20) NULL)');
+        if ($driver === 'pgsql') {
+            $pdo->exec("CREATE COLLATION pg_temp.orm_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)");
+        }
+        $codeType = match ($driver) {
+            'mysql' => 'VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci',
+            'pgsql' => 'VARCHAR(20) COLLATE pg_temp.orm_ci',
+            default => 'TEXT COLLATE NOCASE',
+        };
+        $pdo->exec("CREATE TEMPORARY TABLE relation_collation_child (id INTEGER PRIMARY KEY, tenant_id INTEGER NOT NULL, code $codeType NOT NULL, _orm_match_0 VARCHAR(20) NOT NULL)");
+        $pdo->exec("INSERT INTO relation_collation_parent VALUES (1, 1, 'ABC'), (2, 1, 'abc'), (3, 2, 'ABC'), (4, 1, NULL), (5, 1, 'ABC')");
+        $pdo->exec("INSERT INTO relation_collation_child VALUES (5, 1, 'ABC', 'kept'), (6, 1, 'abc', 'kept'), (7, 2, 'abc', 'kept'), (8, 1, 'other', 'kept')");
+
+        $gateway = new EntityGateway(new PdoConnection($pdo));
+        Session::use($gateway);
+        $selects = 0;
+        $gateway->subscribe(static function (Event $event) use (&$selects): void {
+            if ($event instanceof SqlEvent && $event->operation === 'SELECT') {
+                $selects++;
+            }
+        });
+        $parents = (new Builder(RelationCollationParent::class, $gateway))->with([
+            'children' => static fn (Builder $query): Builder => $query->whereOp('id', '>', 0)->orderBy('id', 'DESC'),
+        ])->orderBy('id')->get();
+        self::assertSame(2, $selects);
+        self::assertSame([[6, 5], [6, 5], [7], [], [6, 5]], array_map(
+            static fn (RelationCollationParent $parent): array => array_column($parent->loadedRelation('children'), 'id'),
+            $parents,
+        ));
+        self::assertSame($parents[0]->loadedRelation('children')[0], $parents[1]->loadedRelation('children')[0]);
+        self::assertSame($parents[0]->loadedRelation('children'), $parents[4]->loadedRelation('children'));
+        self::assertSame('kept', $parents[0]->loadedRelation('children')[0]->_orm_match_0);
+        foreach ($parents as $parent) {
+            self::assertSame(
+                array_column($parent->children()->query((new Builder(RelationCollationChild::class, $gateway))->orderBy('id', 'DESC'))->get(), 'id'),
+                array_column($parent->loadedRelation('children'), 'id'),
+            );
+        }
+    }
+
     public function testCompositeKeysAreChunkedWithoutParameterLimitOrCrossJoin(): void
     {
         $tenants = [];
@@ -650,6 +845,56 @@ final class OrmRelationTest extends TestCase
             self::assertSame(3, $entry->loadedRelation('owner')?->tenant_id);
             self::assertSame(20 + $index, $entry->loadedRelation('owner')?->id);
         }
+    }
+
+    #[DataProvider('invalidEagerConfigurations')]
+    public function testInvalidEagerConfigurationPreservesLoadedRelations(array $relations, string $message): void
+    {
+        $customer = RelationCustomer::find(['id' => 1])->load('profile');
+        $profile = $customer->loadedRelation('profile');
+        $this->selects = 0;
+
+        try {
+            $customer->load($relations);
+            self::fail('Invalid eager config must be rejected');
+        } catch (RelationException $e) {
+            self::assertStringContainsString($message, $e->getMessage());
+        }
+        self::assertSame(0, $this->selects);
+        self::assertSame($profile, $customer->loadedRelation('profile'));
+        self::assertFalse($customer->relationLoaded('orders'));
+        self::assertSame([1, 2, 3], array_column($customer->load('orders')->loadedRelation('orders'), 'id'));
+    }
+
+    public static function invalidEagerConfigurations(): array
+    {
+        return [
+            'empty segment' => [['orders..customer'], 'paths cannot contain empty names'],
+            'positional scalar' => [[42], 'Positional relation items must be path strings'],
+            'named scalar' => [['orders' => false], 'Relation constraints must be callable'],
+            'replacement builder' => [
+                ['orders' => static fn (Builder $query): Builder => clone $query],
+                'must modify the provided Builder or return the same Builder',
+            ],
+        ];
+    }
+
+    public function testUninitializedRelationKeyIsRejectedWithoutQueryAndCanRetry(): void
+    {
+        $draft = new RelationCustomer();
+        $this->selects = 0;
+        try {
+            $draft->load('orders');
+            self::fail('An uninitialized local key must not be treated as NULL');
+        } catch (RelationException $e) {
+            self::assertStringContainsString('orders is missing relation key id', $e->getMessage());
+        }
+        self::assertSame(0, $this->selects);
+        self::assertFalse($draft->relationLoaded('orders'));
+        $draft->id = 1;
+        self::assertSame([1, 2, 3], array_column($draft->load('orders')->loadedRelation('orders'), 'id'));
+        self::assertSame(1, $this->selects);
+        self::assertTrue($draft->isNew());
     }
 
     public function testInvalidRelationConfigurationsAndTerminalsAreRejectedBeforeWrites(): void

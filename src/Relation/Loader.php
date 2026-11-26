@@ -63,8 +63,8 @@ final class Loader
         $this->publish = [];
         $this->sources = $entities;
         $this->cacheSnapshot = null;
-        $this->registerTargets($entities);
         try {
+            $this->registerTargets($entities);
             // 先规范化整个配置，避免主查询后才发现无效路径。
             $tree = $this->normalize($relations);
             $this->cacheSnapshot = $this->gateway->relationCacheSnapshot();
@@ -103,6 +103,10 @@ final class Loader
     private function registerTargets(array $entities): void
     {
         foreach ($entities as $entity) {
+            if ($entity->isNew()) {
+                continue;
+            }
+            $this->gateway->assertPersistedIdentity($entity);
             $identity = $this->gateway->relationIdentity($entity::class, $this->identityValues($entity));
             $this->identities[RowCache::key($entity::class, $identity)] ??= $entity;
         }
@@ -128,6 +132,7 @@ final class Loader
         $original = $current['original'];
         $values = $current['values'];
         $changed = [];
+        $hasLocalChanges = false;
         foreach ($incoming['values'] as $property => $value) {
             $field = $meta->field($property);
             // 比较“当前值是否偏离本地原值”，不能比较数据库新值与原值：
@@ -137,6 +142,8 @@ final class Loader
                 || !$this->gateway->fieldValuesEqual($meta, $field, $values[$property], $original[$property]);
             if (!$dirty) {
                 $values[$property] = $value;
+            } elseif (!$field->primary) {
+                $hasLocalChanges = true;
             }
             $hadOriginal = array_key_exists($property, $original);
             $hasOriginal = array_key_exists($property, $incoming['original']);
@@ -147,6 +154,10 @@ final class Loader
                     $original[$property],
                     $incoming['original'][$property],
                 ));
+        }
+        // 脏实体的版本与字段快照必须保持一致，等待显式刷新或由写入报告版本冲突。
+        if ($hasLocalChanges && $meta->version !== null && ($changed[$meta->version] ?? false)) {
+            return;
         }
         $current['values'] = $values;
         $current['original'] = $incoming['original'];
@@ -241,25 +252,15 @@ final class Loader
                 } else {
                     $query = $this->applyConstraint($query, static fn (Builder $query): Builder => $query, $relation);
                 }
-                foreach ($query->withoutCache() as $target) {
-                    $values = $this->keyValues($target, $relation, false);
-                    // 每个元组条件已经排除 NULL，理论不可达；显式保护避免错误键串行。
-                    if ($values === null) {
-                        throw new RelationException('Relation keys for ' . $relation->target . ' cannot be NULL');
-                    }
-                    $identityValues = $this->identityValues($target);
+                foreach ($this->gateway->executeRelationBatch($query, $relation->targetKey, $chunk) as $row) {
+                    $target = $row['entity'];
                     $identity = RowCache::key(
                         $relation->target,
-                        $this->gateway->relationIdentity($relation->target, $identityValues),
+                        $this->gateway->relationIdentity($relation->target, $this->identityValues($target)),
                     );
-                    if (!isset($this->identities[$identity])) {
-                        $this->identities[$identity] = $this->gateway->relationTarget(
-                            $relation->target,
-                            $this->gateway->relationIdentity($relation->target, $identityValues),
-                        ) ?? $target;
+                    foreach ($row['matches'] as $index) {
+                        $groups[$this->key($chunk[$index])][$identity] ??= $target;
                     }
-                    $this->publish[$identity] ??= ['fresh' => $target];
-                    $groups[$this->key($values)][$identity] = $this->identities[$identity];
                 }
             }
         }
@@ -269,18 +270,24 @@ final class Loader
         $loaded = [];
         foreach ($entities as $source) {
             $values = $this->keyValues($source, $relation);
-            $children = $values === null ? [] : array_values($groups[$this->key($values)] ?? []);
-            $loaded[] = ['entity' => $source, 'value' => $relation->many() ? $children : ($children[0] ?? null)];
-            foreach ($children as $child) {
-                $identity = RowCache::key(
-                    $child::class,
-                    $this->gateway->relationIdentity($child::class, $this->identityValues($child)),
-                );
-                if (!isset($identities[$identity])) {
+            $matches = $values === null ? [] : ($groups[$this->key($values)] ?? []);
+            if (!$relation->many()) {
+                $matches = array_slice($matches, 0, 1, true);
+            }
+            $children = [];
+            foreach ($matches as $key => $fresh) {
+                $child = $this->identities[$key] ??= $this->gateway->relationTarget(
+                    $relation->target,
+                    $this->gateway->relationIdentity($relation->target, $this->identityValues($fresh)),
+                ) ?? $fresh;
+                $this->publish[$key] ??= ['fresh' => $fresh];
+                $children[] = $child;
+                if (!isset($identities[$key])) {
                     $related[] = $child;
-                    $identities[$identity] = true;
+                    $identities[$key] = true;
                 }
             }
+            $loaded[] = ['entity' => $source, 'value' => $relation->many() ? $children : ($children[0] ?? null)];
         }
 
         return ['related' => $related, 'loaded' => $loaded];
@@ -314,11 +321,10 @@ final class Loader
     }
 
     /** @return list<int|float|string|bool|null>|null */
-    private function keyValues(Entity $entity, RelationMeta $relation, bool $source = true): ?array
+    private function keyValues(Entity $entity, RelationMeta $relation): ?array
     {
         $values = [];
-        $fields = $source ? $relation->sourceKey : $relation->targetKey;
-        foreach ($fields as $field) {
+        foreach ($relation->sourceKey as $field) {
             if (!$entity->propSet($field->property)) {
                 throw new RelationException($entity::class . '::' . $relation->name . ' is missing relation key ' . $field->property);
             }
@@ -379,7 +385,10 @@ final class Loader
 
             return;
         }
-        if ($constraint !== null && $tree[$name]->constraint !== null) {
+        if ($constraint === null) {
+            return;
+        }
+        if ($tree[$name]->constraint !== null) {
             throw new RelationException('A relation path cannot declare multiple constraints: ' . $path);
         }
         $tree[$name]->constraint = $constraint;

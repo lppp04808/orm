@@ -825,7 +825,7 @@ final readonly class SqlCompiler
         if ($state->projection === []) {
             throw new InvalidArgumentException($context . ' must explicitly select() one column');
         }
-        $columns = 0;
+        $columns = count($state->relationCounts);
         foreach ($state->projection as $projection) {
             if ($projection['kind'] === 'raw') {
                 throw new InvalidArgumentException($context . ' using selectRaw() must return one column, or explicitly select() a single column');

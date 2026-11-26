@@ -124,8 +124,10 @@ final readonly class ModelGenerator
                     ? "    #[PrimaryKey(generated: true)]\n"
                     : "    #[PrimaryKey(order: {$column->primaryOrder})]\n";
             }
-            if ($this->types->phpType($column) === \DateTimeImmutable::class) {
-                $body .= "    #[Temporal]\n";
+            if ($this->types->temporal($column) !== null) {
+                $body .= $this->types->temporal($column) === \Pixiaoka\Orm\Annotation\Temporal::TEXT
+                    ? "    #[Temporal]\n"
+                    : "    #[Temporal(Temporal::TEXT_US)]\n";
             }
             if (!$column->primary() && !$column->nullable && $column->name === 'version' && $this->types->phpType($column) === 'int') {
                 $body .= "    #[Version]\n";

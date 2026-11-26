@@ -6,6 +6,7 @@ namespace Tests\Pixiaoka\Orm;
 
 use PDO;
 use PDOStatement;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Pixiaoka\Orm\Gateway\PdoConnection;
 
@@ -259,6 +260,70 @@ final class PdoConnectionStatementCacheTest extends TestCase
         $connection->queryOne($sql, []);
         self::assertTrue($connection->forceRollback(), 'Even an idle forced rollback releases statement handles');
         self::assertSame([], $this->cachedStatements($connection));
+    }
+
+    #[DataProvider('statementCacheSizes')]
+    public function testMissingParametersOnReusedStatementNeverReusePreviousValues(int $cacheSize): void
+    {
+        $connection = new PdoConnection($this->pdo, statementCacheSize: $cacheSize);
+        $sql = 'INSERT INTO statement_cache_item (id, value) VALUES (:id, :value)';
+        self::assertSame(1, $connection->execute($sql, ['id' => 3, 'value' => 'three']));
+
+        try {
+            $connection->execute($sql, ['id' => 3]);
+            self::fail('A missing bound parameter must not silently reuse the previous value');
+        } catch (\PDOException) {
+        }
+        self::assertSame(1, $connection->execute($sql, ['id' => 4, 'value' => 'four']));
+        self::assertSame([
+            ['id' => 3, 'value' => 'three'],
+            ['id' => 4, 'value' => 'four'],
+        ], $connection->queryAll('SELECT id, value FROM statement_cache_item WHERE id >= 3 ORDER BY id', []));
+    }
+
+    /** @return array<string, array{int}> */
+    public static function statementCacheSizes(): array
+    {
+        return ['enabled' => [64], 'disabled' => [0]];
+    }
+
+    #[DataProvider('liveDrivers')]
+    public function testRealDriversRejectMissingParametersAndAllowCleanRetry(string $driver): void
+    {
+        $prefix = 'PIXIAOKA_ORM_LIVE_' . strtoupper($driver);
+        $dsn = getenv($prefix . '_DSN');
+        if ($dsn === false || $dsn === '') {
+            self::markTestSkipped('未配置 ' . $prefix . '_DSN');
+        }
+        $user = getenv($prefix . '_USER');
+        $password = getenv($prefix . '_PASSWORD');
+        $pdo = new PDO($dsn, $user === false ? null : $user, $password === false ? null : $password, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ]);
+        $table = 'statement_cache_' . bin2hex(random_bytes(5));
+        $quote = $driver === 'mysql' ? '`' : '"';
+        try {
+            $pdo->exec("CREATE TABLE $quote$table$quote (id BIGINT PRIMARY KEY, value VARCHAR(20) NOT NULL)");
+            $connection = new PdoConnection($pdo);
+            $sql = "INSERT INTO $quote$table$quote (id, value) VALUES (:id, :value)";
+            $connection->execute($sql, ['id' => 1, 'value' => 'one']);
+            try {
+                $connection->execute($sql, ['id' => 1]);
+                self::fail('A missing parameter must fail instead of writing a stale value');
+            } catch (\PDOException) {
+            }
+            $connection->execute($sql, ['id' => 2, 'value' => 'two']);
+            self::assertSame(['one', 'two'], $pdo->query("SELECT value FROM $quote$table$quote ORDER BY id")->fetchAll(PDO::FETCH_COLUMN));
+        } finally {
+            $pdo->exec("DROP TABLE IF EXISTS $quote$table$quote");
+        }
+    }
+
+    /** @return array<string, array{string}> */
+    public static function liveDrivers(): array
+    {
+        return ['mysql' => ['mysql'], 'pgsql' => ['pgsql'], 'sqlite' => ['sqlite']];
     }
 
     /** @return array<string, PDOStatement> */

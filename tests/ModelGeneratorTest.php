@@ -510,6 +510,26 @@ final class ModelGeneratorTest extends TestCase
         $pdo->exec("INSERT INTO without_rowid_item (value) VALUES ('missing id')");
     }
 
+    public function testSqliteDistinguishesIndexedPrimaryKeysFromRowidAliases(): void
+    {
+        $pdo = $this->sqlite();
+        $pdo->exec('CREATE TABLE inline_desc_item (id INTEGER PRIMARY KEY DESC, value TEXT NOT NULL)');
+        $pdo->exec('CREATE TABLE table_desc_item (id INTEGER, value TEXT NOT NULL, PRIMARY KEY (id DESC))');
+        $pdo->exec("INSERT INTO inline_desc_item (id, value) VALUES (42, 'explicit')");
+        $pdo->exec("INSERT INTO table_desc_item (value) VALUES ('generated')");
+
+        $inspector = new SchemaInspector($pdo);
+        $indexed = $inspector->table('inline_desc_item');
+        self::assertSame(42, $pdo->query('SELECT id FROM inline_desc_item')->fetchColumn());
+        self::assertFalse($indexed->hasGeneratedKey());
+        $code = (new ModelGenerator($pdo))->render($indexed, 'SqlitePrimaryOrdering\\Model');
+        self::assertStringContainsString('#[PrimaryKey(order: 1)]', $code);
+        self::assertStringNotContainsString('generated: true', $code);
+
+        self::assertSame(1, $pdo->query('SELECT id FROM table_desc_item')->fetchColumn());
+        self::assertTrue($inspector->table('table_desc_item')->hasGeneratedKey());
+    }
+
     public function testExternalSchemaQueriesUseDistinctParameterNames(): void
     {
         $schema = file_get_contents(dirname(__DIR__) . '/src/Schema/SchemaInspector.php');

@@ -223,10 +223,15 @@ final class EntityGateway
         if (count($fields) !== count($values)) {
             throw new \LogicException('Relation key and value counts differ');
         }
+        return $this->relationTuplePredicate($fields, $values, 'relation_');
+    }
+
+    private function relationTuplePredicate(array $fields, array $values, string $prefix): Expression
+    {
         $parts = [];
         $params = [];
         foreach ($fields as $index => $field) {
-            $name = 'relation_' . $index;
+            $name = $prefix . $index;
             $parts[] = $this->quote($field->column) . ' = :' . $name;
             $params[$name] = $values[$index];
         }
@@ -239,18 +244,67 @@ final class EntityGateway
     {
         $params = [];
         $groups = [];
-        $index = 0;
-        foreach ($tuples as $tuple) {
-            $parts = [];
-            foreach ($fields as $offset => $field) {
-                $name = 'relation_' . $index++;
-                $parts[] = $this->quote($field->column) . ' = :' . $name;
-                $params[$name] = $tuple[$offset];
-            }
-            $groups[] = '(' . implode(' AND ', $parts) . ')';
+        foreach ($tuples as $index => $tuple) {
+            $predicate = $this->relationTuplePredicate($fields, $tuple, 'relation_' . $index . '_');
+            $groups[] = '(' . $predicate->sql . ')';
+            $params += $predicate->params;
         }
 
         return new Expression('(' . implode(' OR ', $groups) . ')', $params);
+    }
+
+    /**
+     * @internal 让数据库按与 WHERE 相同的等值语义返回每行匹配的全部元组。
+     * @return list<array{entity: Entity, matches: list<int>}>
+     */
+    public function executeRelationBatch(Builder $query, array $fields, array $tuples): array
+    {
+        $query->assertHydratableTerminal();
+        $query = clone $query;
+        $class = $query->modelClass();
+        $meta = $this->meta($class);
+        $columns = array_map(static fn ($field): string => $field->column, array_values($meta->fields));
+        $occupied = array_fill_keys(array_map(strtolower(...), $columns), true);
+        $query->select(...$columns);
+
+        // 每列用 30 位记录匹配标记，避免列数上限及 32 位整数溢出。
+        $maskWidth = 30;
+        $aliases = [];
+        foreach (array_chunk($tuples, $maskWidth) as $chunk) {
+            $parts = [];
+            $params = [];
+            foreach ($chunk as $bit => $tuple) {
+                $predicate = $this->relationTuplePredicate($fields, $tuple, 'match_' . $bit . '_');
+                $parts[] = 'CASE WHEN ' . $predicate->sql . ' THEN ' . (1 << $bit) . ' ELSE 0 END';
+                $params += $predicate->params;
+            }
+            $alias = '_orm_match_' . count($aliases);
+            while (isset($occupied[$alias])) {
+                $alias .= '_';
+            }
+            $occupied[$alias] = true;
+            $aliases[] = $alias;
+            $query->selectRaw(implode(' + ', $parts) . ' AS ' . $this->quote($alias), $params);
+        }
+
+        $result = [];
+        foreach ($query->rows() as $row) {
+            $matches = [];
+            foreach ($aliases as $block => $alias) {
+                $mask = (int) $row[$alias];
+                for ($bit = 0; $mask !== 0; $bit++, $mask >>= 1) {
+                    if (($mask & 1) !== 0) {
+                        $matches[] = $block * $maskWidth + $bit;
+                    }
+                }
+            }
+            $entity = $this->hydrate($meta, $row);
+            $this->forEntity($entity);
+            $this->transactions->rememberEntity($entity);
+            $result[] = ['entity' => $entity, 'matches' => $matches];
+        }
+
+        return $result;
     }
 
     /** 只有方言相关操作才要求连接显式提供驱动，保持旧 Connection 装饰器兼容。 */
@@ -300,12 +354,14 @@ final class EntityGateway
         }
 
         $columns = array_keys($params);
-        $sql = sprintf(
-            'INSERT INTO %s (%s) VALUES (%s)',
-            $this->quote($meta->table),
-            implode(', ', array_map($this->quote(...), $columns)),
-            implode(', ', array_map(static fn (string $column): string => ':' . $column, $columns)),
-        );
+        $sql = $columns === []
+            ? 'INSERT INTO ' . $this->quote($meta->table) . $this->defaultValuesClause()
+            : sprintf(
+                'INSERT INTO %s (%s) VALUES (%s)',
+                $this->quote($meta->table),
+                implode(', ', array_map($this->quote(...), $columns)),
+                implode(', ', array_map(static fn (string $column): string => ':' . $column, $columns)),
+            );
 
         // P0-3：pg/sqlite 走 INSERT ... RETURNING，直接取回生成列，
         // 不依赖 lastInsertId（PG 下无序列名时 lastInsertId 不可靠）。
@@ -323,10 +379,11 @@ final class EntityGateway
 
         if ($generated === null) {
             $entity->markPersisted($this);
+            $this->cacheSet($entity, true);
+            $this->transactions->rememberEntity($entity);
             $entity->afterSave();
             $entity->afterInsert();
-            $this->transactions->rememberEntity($entity);
-            $this->cacheSet($entity, true);
+            $this->persistedIdentityOf($entity, $meta);
 
             return;
         }
@@ -337,10 +394,11 @@ final class EntityGateway
 
         $entity->{$generated->property} = $this->caster->toPhp($meta->class, $generated, $id);
         $entity->markPersisted($this);
+        $this->cacheSet($entity, true);
+        $this->transactions->rememberEntity($entity);
         $entity->afterSave();
         $entity->afterInsert();
-        $this->transactions->rememberEntity($entity);
-        $this->cacheSet($entity, true);
+        $this->persistedIdentityOf($entity, $meta);
     }
 
     /**
@@ -357,6 +415,13 @@ final class EntityGateway
                 $this->cacheSet($entity, $inserted, $softDeleteMode);
             },
         );
+    }
+
+    private function defaultValuesClause(): string
+    {
+        return $this->connection instanceof DriverAwareConnection && $this->connection->driver() === 'mysql'
+            ? ' () VALUES ()'
+            : ' DEFAULT VALUES';
     }
 
     /** @internal 脏跟踪与关系合并共用数据库表示的字段值语义。 */
@@ -393,7 +458,7 @@ final class EntityGateway
     {
         $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
-        $identity = $this->identityOf($entity, $meta);
+        $identity = $this->persistedIdentityOf($entity, $meta);
         $this->transactions->rememberEntity($entity);
         $entity->beforeSave();
         $entity->beforeUpdate();
@@ -401,6 +466,7 @@ final class EntityGateway
         $original = $entity->takeOriginal();
         $expectedVersion = $this->expectedVersion($entity, $meta, $original);
         $this->fillUpdatedAt($entity, $meta, $original);
+        $identity = $this->persistedIdentityOf($entity, $meta);
         $sets = [];
         $params = [];
 
@@ -483,9 +549,10 @@ final class EntityGateway
     {
         $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
-        $identity = $this->identityOf($entity, $meta);
+        $identity = $this->persistedIdentityOf($entity, $meta);
         $this->transactions->rememberEntity($entity);
         $entity->beforeDelete();
+        $identity = $this->persistedIdentityOf($entity, $meta);
         $original = $entity->takeOriginal();
         $expectedVersion = $this->expectedVersion($entity, $meta, $original);
         $params = [];
@@ -541,6 +608,7 @@ final class EntityGateway
         }
         $entity->afterDelete();
         $this->cacheClear($entity, $identity);
+        $this->assertPrimaryIdentity($entity, $meta, $identity);
     }
 
     public function restore(Entity $entity): void
@@ -549,7 +617,7 @@ final class EntityGateway
         $meta = $this->metadata->read($entity::class);
         $field = $meta->softDeleteField()
             ?? throw new \LogicException($meta->class . ' does not declare a soft-delete field');
-        $identity = $this->identityOf($entity, $meta);
+        $identity = $this->persistedIdentityOf($entity, $meta);
         $this->transactions->rememberEntity($entity);
         $original = $entity->takeOriginal();
         $expectedVersion = $this->expectedVersion($entity, $meta, $original);
@@ -658,7 +726,7 @@ final class EntityGateway
     {
         $this->forEntity($entity);
         $meta = $this->metadata->read($entity::class);
-        $identity = $this->identityOf($entity, $meta);
+        $identity = $this->persistedIdentityOf($entity, $meta);
         $this->transactions->rememberEntity($entity);
         $params = [];
         $columns = array_map(
@@ -1041,6 +1109,45 @@ final class EntityGateway
         return new Identity($parts);
     }
 
+    /** 已持久化实体的 WHERE 与缓存身份必须同时匹配快照和当前属性，拒绝改键后误操作另一行。 */
+    private function persistedIdentityOf(Entity $entity, ModelMeta $meta, bool $checkKnownIdentity = true): Identity
+    {
+        $current = $this->identityOf($entity, $meta);
+        $original = $entity->takeOriginalPrimary();
+        foreach ($meta->primaryKey as $field) {
+            $property = $field->property;
+            if (!array_key_exists($property, $original)) {
+                throw new IdentityException($meta->class . ' has no persisted primary key snapshot; refresh before modifying it');
+            }
+            $persisted = $this->caster->toDb($meta->class, $field, $original[$property]);
+            if ($persisted !== $current->parts[$field->column]) {
+                throw new IdentityException($meta->class . '::' . $property . ' primary key cannot be changed on a persisted entity');
+            }
+        }
+
+        $known = $this->cache->knownIdentity($entity);
+        if ($checkKnownIdentity && $known !== null && $known !== $current->parts) {
+            throw new IdentityException($meta->class . ' primary key does not match its persisted cache identity; refresh before retrying');
+        }
+
+        return $current;
+    }
+
+    /** 钩子后的当前属性必须与数据库实际使用的身份一致，不得发布另一主键的缓存对象。 */
+    private function assertPrimaryIdentity(Entity $entity, ModelMeta $meta, Identity $identity): void
+    {
+        $current = $this->identityOf($entity, $meta);
+        if ($current->parts !== $identity->parts) {
+            throw new IdentityException($meta->class . ' primary key cannot be changed by a lifecycle hook after a database write', true);
+        }
+    }
+
+    /** @internal 批量写入与单实体写入共享同一钩子后身份校验。 */
+    public function assertPersistedIdentity(Entity $entity): void
+    {
+        $this->persistedIdentityOf($entity, $this->metadata->read($entity::class));
+    }
+
     private function identityFrom(ModelMeta $meta, array $key): Identity
     {
         $parts = [];
@@ -1156,6 +1263,11 @@ final class EntityGateway
         }
         if (count($parts) !== count($meta->primaryKey)) {
             return;
+        }
+        if (!$entity->isNew()) {
+            // 新插入或删除后重插可替换旧弱身份，但主键仍必须匹配真实 SQL 返回的持久化快照。
+            // 普通缓存回填还要匹配曾交付对象的弱身份，拒绝发布篡改后的另一主键。
+            $this->persistedIdentityOf($entity, $meta, !$inserted);
         }
         $cached = $this->cache->get($entity::class, $parts);
         if ($cached !== null && $cached !== $entity) {

@@ -46,6 +46,9 @@ abstract class Entity
     /** @var array<string, mixed> 持久化时的原值，用于脏跟踪 */
     private array $ormOriginal = [];
 
+    /** @var array<string, mixed> 持久化主键快照；身份不能随当前属性被静默改写。 */
+    private array $ormOriginalPrimary = [];
+
     /** @var array<string, Entity|list<Entity>|null> 仅保存显式加载的关系，不参与持久化。 */
     private array $ormRelations = [];
 
@@ -72,6 +75,12 @@ abstract class Entity
         $gateway->forEntity($this);
         $this->ormNew = false;
         $this->ormOriginal = $this->snapshot();
+        $this->ormOriginalPrimary = [];
+        foreach ($gateway->meta(static::class)->primaryKey as $field) {
+            if ($this->propSet($field->property)) {
+                $this->ormOriginalPrimary[$field->property] = $this->{$field->property};
+            }
+        }
     }
 
     /** 删除成功后标成未入库。之后 save 只能在原 Gateway 上重新插入。 */
@@ -79,6 +88,7 @@ abstract class Entity
     {
         $this->ormNew = true;
         $this->ormOriginal = [];
+        $this->ormOriginalPrimary = [];
         $this->clearLoadedRelations();
     }
 
@@ -149,6 +159,12 @@ abstract class Entity
         return $this->ormOriginal;
     }
 
+    /** @internal 已持久化身份快照，不参与普通字段的脏跟踪。 */
+    public function takeOriginalPrimary(): array
+    {
+        return $this->ormOriginalPrimary;
+    }
+
     /** @internal 仅首次接触实体时建立弱归属；过期也不能静默换绑。 */
     public function bindGateway(EntityGateway $gateway): void
     {
@@ -178,7 +194,7 @@ abstract class Entity
 
     /**
      * @internal 事务边界保存完整持久化状态，包含字段的未初始化状态。
-     * @return array{new: bool, original: array<string, mixed>, values: array<string, mixed>, relations: array<string, mixed>, loadedRelations: array<string, true>}
+     * @return array{new: bool, original: array<string, mixed>, originalPrimary: array<string, mixed>, values: array<string, mixed>, relations: array<string, mixed>, loadedRelations: array<string, true>}
      */
     public function captureState(ModelMeta $meta): array
     {
@@ -192,6 +208,7 @@ abstract class Entity
         return [
             'new' => $this->ormNew,
             'original' => $this->ormOriginal,
+            'originalPrimary' => $this->ormOriginalPrimary,
             'values' => $values,
             'relations' => $this->ormRelations,
             'loadedRelations' => $this->ormLoadedRelations,
@@ -199,7 +216,7 @@ abstract class Entity
     }
 
     /**
-     * @param array{new: bool, original: array<string, mixed>, values: array<string, mixed>, relations?: array<string, mixed>, loadedRelations?: array<string, true>} $state
+     * @param array{new: bool, original: array<string, mixed>, originalPrimary?: array<string, mixed>, values: array<string, mixed>, relations?: array<string, mixed>, loadedRelations?: array<string, true>} $state
      * @param ModelMeta $meta
      * @throws \ReflectionException
      * @internal 只在物理事务回滚时恢复，不能用于普通业务赋值。
@@ -216,6 +233,7 @@ abstract class Entity
         }
         $this->ormNew = $state['new'];
         $this->ormOriginal = $state['original'];
+        $this->ormOriginalPrimary = $state['originalPrimary'] ?? [];
         $this->ormRelations = $state['relations'] ?? [];
         $this->ormLoadedRelations = $state['loadedRelations'] ?? [];
     }

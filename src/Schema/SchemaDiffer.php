@@ -50,7 +50,6 @@ final class SchemaDiffer
         'character' => 'string', 'text' => 'string', 'tinytext' => 'string',
         'mediumtext' => 'string', 'longtext' => 'string', 'uuid' => 'string',
         'time' => 'string', 'time without time zone' => 'string',
-        'timestamp with time zone' => 'string', 'timestamptz' => 'string',
     ];
 
     /** @param array<string, array<string, string>> $databaseTypes 完整 PHP 类名 => 方言 => 受控类型标识符 */
@@ -91,11 +90,15 @@ final class SchemaDiffer
             $type = $this->databaseType($field, $driver);
             $column = $actual[$field->column] ?? null;
             if ($column === null) {
+                if ($driver === 'sqlite' && $field->generated) {
+                    $changes[] = $this->unsupported($field, 'add_column', $type, null);
+                    continue;
+                }
                 $changes[] = $this->change('add_column', $field->column, $type, null,
                     'ADD COLUMN ' . $this->columnDefinition($field, $type, $driver), true);
                 continue;
             }
-            if ($this->semanticType($type, $driver) !== $this->semanticType($column->databaseType, $driver)) {
+            if (!$this->compatibleTypes($type, $column->databaseType, $driver)) {
                 $definition = $this->columnDefinition($field, $type, $driver, false);
                 $changes[] = match ($driver) {
                     'mysql' => $this->change('change_type', $field->column, $type, $column->databaseType,
@@ -129,15 +132,17 @@ final class SchemaDiffer
             }
         }
         foreach ($this->compareIndexes($model, $table, $driver) as $change) {
+            if ($driver === 'mysql' && in_array($change['kind'], ['add_index', 'change_index'], true)
+                && !$this->mysqlIndexSupported($model, $change['expected']['columns'] ?? [])) {
+                $change['executable'] = false;
+                $change['note'] = 'MySQL TEXT/BLOB/JSON indexes require an explicit prefix length or a generated-column index; no silent truncation is generated';
+            }
             $changes[] = $change;
         }
 
         $tableName = $this->quote($model->table, $driver);
         foreach ($changes as &$change) {
-            if ($change['kind'] === 'add_index' && $driver !== 'mysql') {
-                continue;
-            }
-            if ($change['kind'] === 'drop_index' && $driver !== 'mysql') {
+            if ($driver !== 'mysql' && in_array($change['kind'], ['add_index', 'change_index', 'drop_index'], true)) {
                 continue;
             }
             $change['sql'] = 'ALTER TABLE ' . $tableName . ' ' . $change['sql'] . ';';
@@ -162,12 +167,32 @@ final class SchemaDiffer
         ];
     }
 
+    /** @param list<string> $columns */
+    private function mysqlIndexSupported(ModelMeta $model, array $columns): bool
+    {
+        foreach ($columns as $name) {
+            foreach ($model->fields as $field) {
+                if ($field->column !== $name) {
+                    continue;
+                }
+                $type = strtolower($this->databaseType($field, 'mysql'));
+                if (preg_match('/^(?:tiny|medium|long)?text$|^blob$|^json$/', $type) === 1) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
     /** @return list<string> 可执行预览 SQL；含不支持变更时拒绝返回残缺迁移计划。 */
     public function previewSql(ModelMeta $model, TableSchema $table, string $driver): array
     {
         $report = $this->compare($model, $table, $driver);
         if ($report['hasUnsupported']) {
-            throw new InvalidArgumentException($model->table . ' has SQLite changes that cannot be executed safely; rebuild the table manually according to the report');
+            throw new InvalidArgumentException($driver === 'sqlite'
+                ? $model->table . ' has SQLite changes that cannot be executed safely; rebuild the table manually according to the report'
+                : $model->table . ' has schema changes that cannot be executed safely; adjust the model or migration manually according to the report');
         }
 
         return array_map(static fn (array $change): string => $change['sql'], $report['changes']);
@@ -325,10 +350,34 @@ final class SchemaDiffer
         throw new InvalidArgumentException("No Schema type mapping for $name on $driver");
     }
 
+    private function compatibleTypes(string $expected, string $actual, string $driver): bool
+    {
+        $left = $this->semanticType($expected, $driver);
+        $right = $this->semanticType($actual, $driver);
+        if ($left === $right) {
+            return true;
+        }
+        if ($left !== 'string' || !str_starts_with($right, 'string(')) {
+            return false;
+        }
+
+        // 现有模型 string 默认映射 TEXT，保持向后兼容；显式 VARCHAR(n) 仍严格比较长度。
+        return match ($driver) {
+            'mysql' => $right === 'string(65535)',
+            'pgsql' => $right === 'string(*)',
+            default => true,
+        };
+    }
+
     private function semanticType(string $type, string $driver): string
     {
         $type = strtolower(trim($type));
         $type = preg_replace('/\s+/', ' ', $type) ?? $type;
+        $type = preg_replace('/^(timestamp|time)\((\d+)\)( with(?:out)? time zone)$/', '$1$3($2)', $type) ?? $type;
+        $type = preg_replace('/^(timestamp|time)( with(?:out)? time zone)\((\d+)\)$/', '$1($3)$2', $type) ?? $type;
+        if (preg_match('/^(timestamp|time)\((\d+)\) with time zone$/', $type, $matches) === 1) {
+            return $driver === 'sqlite' ? $type : 'datetime_tz(' . $matches[2] . ')';
+        }
         $base = trim(explode('(', $type, 2)[0]);
         if ($base === 'date') {
             return 'date';
@@ -350,6 +399,18 @@ final class SchemaDiffer
             return 'float';
         }
         if (isset(self::STRING_TYPES[$base])) {
+            if (in_array($base, ['char', 'varchar', 'character varying', 'character'], true)) {
+                if (preg_match('/\(\s*(\d+)\s*\)/', $type, $matches) === 1) {
+                    return 'string(' . $matches[1] . ')';
+                }
+                // 无长度声明按驱动默认值处理，而非与任意有限长度静默等价。
+                return match ($driver) {
+                    'mysql' => 'string(1)',
+                    'pgsql' => 'string(*)',
+                    default => 'string',
+                };
+            }
+
             return 'string';
         }
         if (in_array($base, ['bool', 'boolean'], true)) {
@@ -359,13 +420,24 @@ final class SchemaDiffer
             return 'array';
         }
         if (in_array($base, ['numeric', 'decimal'], true)) {
+            if (preg_match('/\(\s*(\d+)\s*,\s*(\d+)\s*\)/', $type, $matches) === 1) {
+                return 'decimal(' . $matches[1] . ',' . $matches[2] . ')';
+            }
+            if (preg_match('/\(\s*(\d+)\s*\)/', $type, $matches) === 1) {
+                return 'decimal(' . $matches[1] . ',0)';
+            }
+
             return 'decimal';
         }
         if ($driver === 'sqlite' && $base === 'text') {
             return 'string';
         }
         if ($driver !== 'sqlite' && in_array($base, ['timestamp with time zone', 'timestamptz'], true)) {
-            return 'datetime';
+            if (preg_match('/\((\d+)\)/', $type, $matches) === 1) {
+                return 'datetime_tz(' . $matches[1] . ')';
+            }
+
+            return 'datetime_tz';
         }
 
         return $type;

@@ -32,11 +32,5 @@ parameters:
             identifier: notIdentical.alwaysFalse
             path: src/Gateway/EntityGateway.php
         -
-            identifier: identical.alwaysFalse
-            path: src/Gateway/BulkWriter.php
-        -
             identifier: booleanAnd.alwaysFalse
             path: src/Gateway/EntityGateway.php
-        -
-            identifier: booleanAnd.alwaysFalse
-            path: src/Gateway/BulkWriter.php

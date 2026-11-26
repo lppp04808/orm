@@ -20,8 +20,8 @@ use Pixiaoka\Orm\Session;
 /**
  * @internal 事务状态、保存点恢复和身份历史；不强持有所属 EntityGateway。
  *
- * @phpstan-type BaseEntityState array{new: bool, original: array<string, mixed>, values: array<string, mixed>}
- * @phpstan-type EntityState array{new: bool, original: array<string, mixed>, values: array<string, mixed>, relations?: array<string, mixed>, loadedRelations?: array<string, true>}
+ * @phpstan-type BaseEntityState array{new: bool, original: array<string, mixed>, originalPrimary?: array<string, mixed>, values: array<string, mixed>}
+ * @phpstan-type EntityState array{new: bool, original: array<string, mixed>, originalPrimary?: array<string, mixed>, values: array<string, mixed>, relations?: array<string, mixed>, loadedRelations?: array<string, true>}
  * @phpstan-type CacheSnapshot array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, entities: list<Entity>}
  * @phpstan-type IdentityMetadata array{identities: array<string, BaseEntityState>, new: array<string, list<BaseEntityState|null>>}
  */
@@ -48,16 +48,16 @@ final class TransactionManager
     /** @var \WeakMap<Context, bool> 对象身份避免 Fiber 销毁后的数字 ID 重用。 */
     private \WeakMap $inTransactionByContext;
 
-    /** @var \WeakMap<Context, \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}>> */
+    /** @var \WeakMap<Context, \WeakMap<Entity, array{new: bool, original: array<string, mixed>, originalPrimary?: array<string, mixed>, values: array<string, mixed>}>> */
     private \WeakMap $txnStatesByContext;
 
-    /** @var \WeakMap<Context, array<string, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}>> 同主键共享最外层基线，禁止中途状态覆盖。 */
+    /** @var \WeakMap<Context, array<string, array{new: bool, original: array<string, mixed>, originalPrimary?: array<string, mixed>, values: array<string, mixed>}>> 同主键共享最外层基线，禁止中途状态覆盖。 */
     private \WeakMap $txnIdentityStates;
 
-    /** @var \WeakMap<Context, array<string, list<array{new: bool, original: array<string, mixed>, values: array<string, mixed>}|null>>> 同身份插入历史，回滚后按删除关系决定保留或失效。 */
+    /** @var \WeakMap<Context, array<string, list<array{new: bool, original: array<string, mixed>, originalPrimary?: array<string, mixed>, values: array<string, mixed>}|null>>> 同身份插入历史，回滚后按删除关系决定保留或失效。 */
     private \WeakMap $txnNewIdentities;
 
-    /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}>|null 插入前身份不完整时的对象快照。 */
+    /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, originalPrimary?: array<string, mixed>, values: array<string, mixed>}>|null 插入前身份不完整时的对象快照。 */
     private ?\WeakMap $pendingInsertStates = null;
 
     /** @var \WeakMap<Context, array{items: array<string, Entity>, identities: array<string, array<string, int|float|string|bool|null>>, entities: list<Entity>}> */
@@ -653,10 +653,10 @@ final class TransactionManager
         return $snapshot;
     }
 
-    /** @return \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}> */
+    /** @return \WeakMap<Entity, array{new: bool, original: array<string, mixed>, originalPrimary?: array<string, mixed>, values: array<string, mixed>}> */
     private function newTransactionStates(): \WeakMap
     {
-        /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}> $states */
+        /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, originalPrimary?: array<string, mixed>, values: array<string, mixed>}> $states */
         $states = new \WeakMap();
 
         return $states;
@@ -671,7 +671,7 @@ final class TransactionManager
         if (!($this->inTransactionByContext[$context] ?? false)) {
             return;
         }
-        /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, values: array<string, mixed>}> $states */
+        /** @var \WeakMap<Entity, array{new: bool, original: array<string, mixed>, originalPrimary?: array<string, mixed>, values: array<string, mixed>}> $states */
         $states = $this->txnStatesByContext[$context] ?? $this->newTransactionStates();
         if ($this->connection instanceof ManagedConnection && !isset($states[$entity])
             && !isset($this->outerTransactionStates[$entity])) {
@@ -722,6 +722,8 @@ final class TransactionManager
         $identity = $this->completeIdentityKey($entity, $meta);
         $identityState = $identity === null ? null : ($this->txnIdentityStates[$context][$identity] ?? null);
         $history = $identity === null ? null : ($this->txnNewIdentities[$context][$identity] ?? null);
+        // 插入后再次读取会得到另一个 PHP 实例；原实体仍优先使用插入前完整快照，
+        // 查询副本则保留下面的 new=true 已读取值，防止它被当成可更新的真实旧行。
         if ($history !== null && end($history) === null && isset($this->pendingInsertStates[$entity])) {
             return $this->pendingInsertStates[$entity];
         }

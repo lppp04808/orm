@@ -21,6 +21,7 @@ use Pixiaoka\Orm\Metadata\FieldMeta;
 use Pixiaoka\Orm\Metadata\MetadataReader;
 use Pixiaoka\Orm\Session;
 use PDO;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /** 本文件独立使用的枚举（与 OrmKernelTest 的 SampleStatus 解耦） */
@@ -210,6 +211,56 @@ final class OrmCastMetadataTest extends TestCase
         $this->caster->toDb(TypedRow::class, $field, 'yes');
     }
 
+    #[DataProvider('invalidDatabaseOutput')]
+    public function testCasterRejectsInvalidDatabaseOutput(string $property, mixed $value, string $message): void
+    {
+        $field = $this->fieldOf(TypedRow::class, $property);
+        $this->expectException(CastException::class);
+        $this->expectExceptionMessage($message);
+        $this->caster->toDb(TypedRow::class, $field, $value);
+    }
+
+    public static function invalidDatabaseOutput(): array
+    {
+        return [
+            'required null' => ['n_str', null, 'Cannot write null to a non-nullable field'],
+            'array runtime type' => ['n_arr', '[]', 'Expected an array value'],
+            'decimal runtime type' => ['n_dec', '1.25', 'Expected a Decimal value'],
+            'time runtime type' => ['n_time', '2026-01-01 00:00:00', 'Expected a DateTimeImmutable value'],
+            'enum runtime type' => ['n_enum', 1, 'Expected a BackedEnum value'],
+            'integer runtime type' => ['n_int', '42', 'Expected an int value'],
+            'float runtime type' => ['n_float', '1.25', 'Expected a numeric value'],
+            'string runtime type' => ['n_str', 42, 'Expected a string value'],
+        ];
+    }
+
+    #[DataProvider('invalidDatabaseInput')]
+    public function testCasterRejectsInvalidDatabaseInput(string $property, mixed $value, string $message): void
+    {
+        $field = $this->fieldOf(TypedRow::class, $property);
+        $this->expectException(CastException::class);
+        $this->expectExceptionMessage($message);
+        $this->caster->toPhp(TypedRow::class, $field, $value);
+    }
+
+    public static function invalidDatabaseInput(): array
+    {
+        return [
+            'float text' => ['n_float', 'not numeric', 'Cannot parse value as float'],
+            'string object' => ['n_str', new \stdClass(), 'Cannot parse value as string'],
+            'bool text' => ['n_bool', 'false', 'bool accepts only 0/1/true/false'],
+            'bool integer' => ['n_bool', 2, 'bool accepts only 0/1/true/false'],
+            'non-json scalar' => ['n_arr', 42, 'array accepts only JSON text or an array'],
+        ];
+    }
+
+    public function testCasterConvertsNumericDriverValuesIntoStringProperties(): void
+    {
+        $field = $this->fieldOf(TypedRow::class, 'n_str');
+        self::assertSame('42', $this->caster->toPhp(TypedRow::class, $field, 42));
+        self::assertSame('1.25', $this->caster->toPhp(TypedRow::class, $field, 1.25));
+    }
+
     public function testCasterToDbEncodesArrayAsJson(): void
     {
         $field = $this->fieldOf(TypedRow::class, 'n_arr');
@@ -311,6 +362,26 @@ final class OrmCastMetadataTest extends TestCase
     {
         $this->expectException(\InvalidArgumentException::class);
         BcDecimal::fromString('1e5');
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('invalidDecimalEndings')]
+    public function testDecimalRejectsTrailingControlCharacters(string $value): void
+    {
+        $field = $this->fieldOf(TypedRow::class, 'n_dec');
+        $this->expectException(CastException::class);
+        $this->caster->toPhp(TypedRow::class, $field, $value);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function invalidDecimalEndings(): array
+    {
+        return ['line feed' => ["12.3\n"], 'carriage return' => ["12.3\r"], 'trailing text' => ['12.3x']];
+    }
+
+    public function testBcDecimalRejectsTrailingNewline(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        BcDecimal::fromString("1\n");
     }
 
     public function testCastExceptionCarriesModelAndProperty(): void

@@ -149,6 +149,61 @@ final class TemporalStorageTest extends TestCase
         $this->caster->toPhp(TemporalStorageRecord::class, $field, $value);
     }
 
+    #[DataProvider('outOfRangeUnixValues')]
+    public function testUnixStorageRejectsValuesOutsidePhpIntegerRange(string $property, string $input): void
+    {
+        $field = $this->reader->read($property === 'nUnix' ? TemporalUnixSecondsRecord::class : TemporalStorageRecord::class)->field($property);
+        $this->expectException(CastException::class);
+        $this->expectExceptionMessage('Integer value exceeds PHP integer range');
+        $this->caster->toPhp(TemporalStorageRecord::class, $field, $input);
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function outOfRangeUnixValues(): array
+    {
+        $overflow = '9223372036854775808';
+        $underflow = '-9223372036854775809';
+        return [
+            'seconds overflow' => ['nUnix', $overflow],
+            'seconds underflow' => ['nUnix', $underflow],
+            'milliseconds overflow' => ['atMillis', $overflow],
+            'milliseconds underflow' => ['atMillis', $underflow],
+        ];
+    }
+
+    #[DataProvider('unixIntegerBoundaries')]
+    public function testUnixStorageRetainsValidIntegerBoundaries(string $property, string $input): void
+    {
+        $model = $property === 'nUnix' ? TemporalUnixSecondsRecord::class : TemporalStorageRecord::class;
+        $field = $this->reader->read($model)->field($property);
+        $value = $this->caster->toPhp($model, $field, $input);
+        self::assertSame((int) $input, $this->caster->toDb($model, $field, $value));
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function unixIntegerBoundaries(): array
+    {
+        return [
+            'seconds minimum' => ['nUnix', (string) PHP_INT_MIN],
+            'seconds maximum' => ['nUnix', (string) PHP_INT_MAX],
+            'milliseconds minimum' => ['atMillis', (string) PHP_INT_MIN],
+            'milliseconds maximum' => ['atMillis', (string) PHP_INT_MAX],
+        ];
+    }
+
+    public function testUnixMillisecondOutputRejectsOverflowInLastWholeSecond(): void
+    {
+        $model = TemporalStorageRecord::class;
+        $field = $this->reader->read($model)->field('atMillis');
+        $seconds = intdiv(PHP_INT_MAX, 1000);
+        $fraction = (PHP_INT_MAX % 1000 + 1) * 1000;
+        $value = (new DateTimeImmutable('@' . $seconds))->modify('+' . $fraction . ' microseconds');
+
+        $this->expectException(CastException::class);
+        $this->expectExceptionMessage('Unix millisecond timestamp exceeds PHP integer range');
+        $this->caster->toDb($model, $field, $value);
+    }
+
     public function testDisplayFormattingAffectsOnlyToArray(): void
     {
         $pdo = new PDO('sqlite::memory:');
@@ -374,6 +429,26 @@ final class TemporalStorageTest extends TestCase
         self::assertSame($column, $types[0]['name']);
     }
 
+    #[DataProvider('postgresTimezoneTypes')]
+    public function testPostgresTimezoneAwareTypesAreNotEquivalentToModelTimestamp(string $actual): void
+    {
+        $table = new TableSchema('temporal_schema_record', [new ColumnSchema('at_micros', $actual, false, null, 0, false)]);
+        $report = (new SchemaDiffer())->compare($this->reader->read(TemporalSchemaRecord::class), $table, 'pgsql');
+        $types = array_values(array_filter($report['changes'], static fn (array $change): bool => $change['kind'] === 'change_type'));
+        self::assertCount(1, $types);
+        self::assertSame('at_micros', $types[0]['name']);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function postgresTimezoneTypes(): array
+    {
+        return [
+            'with time zone' => ['timestamp with time zone'],
+            'alias' => ['timestamptz'],
+            'precision with time zone' => ['timestamp(6) with time zone'],
+        ];
+    }
+
     /** @return array<string, array{string}> */
     public static function liveDrivers(): array
     {
@@ -514,6 +589,20 @@ final class TemporalAutomaticPrecisionRecord extends Entity
     public static function table(): string
     {
         return 'temporal_automatic_precision';
+    }
+}
+
+final class TemporalUnixSecondsRecord extends Entity
+{
+    use TemporalStorageIdentity;
+
+    #[Column]
+    #[Temporal(Temporal::UNIX)]
+    public DateTimeImmutable $nUnix;
+
+    public static function table(): string
+    {
+        return 'unused';
     }
 }
 

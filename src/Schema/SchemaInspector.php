@@ -91,14 +91,17 @@ final class SchemaInspector
         $statement->execute();
         $rows = $statement->fetchAll(PDO::FETCH_ASSOC);
         $primaryCount = count(array_filter($rows, static fn (array $row): bool => (int) $row['pk'] > 0));
-        // INTEGER PRIMARY KEY 只有在 rowid 表中才隐式成为 rowid 别名。
-        // table_list 是 SQLite 3.37+ 提供的；当前支持环境可直接读取 wr 标志。
-        $tableRows = $this->pdo->query('PRAGMA table_list')->fetchAll(PDO::FETCH_ASSOC);
-        $withoutRowid = false;
-        foreach ($tableRows as $tableRow) {
-            if (($tableRow['name'] ?? '') === $table) {
-                $withoutRowid = (int) ($tableRow['wr'] ?? 0) === 1;
-                break;
+        // WITHOUT ROWID 和行内 INTEGER PRIMARY KEY DESC 都有独立的主键索引。
+        // 真正的 rowid 别名没有该索引，包含表级 PRIMARY KEY (id DESC) 的情形。
+        $hasPrimaryIndex = false;
+        if ($primaryCount === 1) {
+            $indexStatement = $this->pdo->prepare('PRAGMA index_list(' . $this->quote($table, '"') . ')');
+            $indexStatement->execute();
+            foreach ($indexStatement->fetchAll(PDO::FETCH_ASSOC) as $index) {
+                if ($index['origin'] === 'pk') {
+                    $hasPrimaryIndex = true;
+                    break;
+                }
             }
         }
 
@@ -113,8 +116,7 @@ final class SchemaInspector
                 default: $row['dflt_value'] === null ? null : (string) $row['dflt_value'],
                 defaultDialect: 'sqlite',
                 primaryOrder: $primaryOrder,
-                // SQLite 只有 rowid 表的单列 INTEGER PRIMARY KEY 是 rowid 别名。
-                generated: !$withoutRowid
+                generated: !$hasPrimaryIndex
                     && $primaryCount === 1
                     && $primaryOrder === 1
                     && strcasecmp(trim((string) $row['type']), 'INTEGER') === 0,
@@ -165,7 +167,7 @@ final class SchemaInspector
     private function pgsqlColumns(string $table): array
     {
         $statement = $this->pdo->prepare(
-            'SELECT c.column_name, c.udt_name, c.data_type, c.datetime_precision, c.is_nullable, c.column_default, c.is_identity, ' .
+            'SELECT c.column_name, c.udt_name, c.data_type, c.datetime_precision, c.numeric_precision, c.numeric_scale, c.character_maximum_length, c.is_nullable, c.column_default, c.is_identity, ' .
             'COALESCE(k.pk_order, 0) AS pk_order, ' .
             "(SELECT setting FROM pg_catalog.pg_settings WHERE name = 'server_encoding') AS server_encoding " .
             'FROM information_schema.columns c ' .
@@ -191,8 +193,13 @@ final class SchemaInspector
                 $dataType = (string) $row['udt_name'];
             }
             $precision = $row['datetime_precision'] ?? null;
-            if (is_numeric($precision) && preg_match('/^(?:timestamp|time)(?: with(?:out)? time zone)?$/i', $dataType) === 1) {
-                $dataType .= '(' . (int) $precision . ')';
+            if (is_numeric($precision) && preg_match('/^(timestamp|time)( with(?:out)? time zone)?$/i', $dataType, $matches) === 1) {
+                $dataType = $matches[1] . '(' . (int) $precision . ')' . ($matches[2] ?? '');
+            } elseif ($dataType === 'numeric' && is_numeric($row['numeric_precision'] ?? null)) {
+                $dataType .= '(' . (int) $row['numeric_precision'] . ',' . (int) ($row['numeric_scale'] ?? 0) . ')';
+            } elseif (in_array($dataType, ['character varying', 'character'], true)
+                && is_numeric($row['character_maximum_length'] ?? null)) {
+                $dataType .= '(' . (int) $row['character_maximum_length'] . ')';
             }
             $columns[] = new ColumnSchema(
                 name: $name,
@@ -220,6 +227,9 @@ final class SchemaInspector
                 continue;
             }
             $name = (string) $row['name'];
+            if ((int) $row['partial'] === 1) {
+                throw new RuntimeException("Index $name is partial and cannot be safely compared with model field indexes");
+            }
             $this->assertIdentifier($name);
             $info = $this->pdo->prepare('PRAGMA index_info(' . $this->quote($name, '"') . ')');
             $info->execute();
@@ -279,6 +289,7 @@ final class SchemaInspector
     {
         $statement = $this->pdo->prepare(
             'SELECT i.relname AS index_name, ix.indisunique AS is_unique, a.attname AS column_name, ' .
+            'CASE WHEN ix.indpred IS NULL THEN 0 ELSE 1 END AS is_partial, ' .
             'k.ordinal_position FROM pg_catalog.pg_class t ' .
             'JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace ' .
             'JOIN pg_catalog.pg_index ix ON ix.indrelid = t.oid ' .
@@ -293,6 +304,9 @@ final class SchemaInspector
         $definitions = [];
         foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
             $name = (string) $row['index_name'];
+            if ((int) $row['is_partial'] === 1) {
+                throw new RuntimeException("Index $name is partial and cannot be safely compared with model field indexes");
+            }
             if ($row['column_name'] === null) {
                 throw new RuntimeException("Index $name contains an expression or included column and cannot be safely compared with model field indexes");
             }

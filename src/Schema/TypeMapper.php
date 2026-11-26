@@ -44,10 +44,28 @@ final class TypeMapper
             return 'string';
         }
         if (str_starts_with($base, 'timestamp(') || str_starts_with($base, 'datetime(')) {
+            if ($column->defaultDialect === 'pgsql'
+                && preg_match('/^timestamp\([0-6]\) without time zone$/', $base) === 1) {
+                return DateTimeImmutable::class;
+            }
+
             return 'string';
         }
 
         return self::TYPES[$base] ?? 'string';
+    }
+
+    /** 数据库已声明精度时必须选择对应的微秒文本，不能退回默认秒级 Temporal。 */
+    public function temporal(ColumnSchema $column): ?string
+    {
+        if ($this->phpType($column) !== DateTimeImmutable::class) {
+            return null;
+        }
+        if (preg_match('/\([0-6]\)/', $column->databaseType) === 1) {
+            return Temporal::TEXT_US;
+        }
+
+        return Temporal::TEXT;
     }
 
     public function nullableType(ColumnSchema $column): string

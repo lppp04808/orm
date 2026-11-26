@@ -39,6 +39,10 @@ final readonly class BulkWriter
             return;
         }
 
+        $rows = array_values($rows);
+        $entities = [];
+        $prepared = [];
+        $now = time();
         $meta = $this->metadata->read($class);
         $generated = $meta->generatedField();
         /** @var array<string, FieldMeta> $columns */
@@ -52,14 +56,46 @@ final readonly class BulkWriter
             $fieldList[] = $field;
         }
         if ($fieldList === []) {
+            // 生成键是唯一字段时，空数组/未初始化实体都表示一行数据库默认值。
+            foreach ($rows as $index => $row) {
+                if (!$row instanceof Entity) {
+                    $prepared[$index] = $this->prepareBatchRow($meta, $columns, [], $row, $now);
+                    continue;
+                }
+                if (!$row instanceof $class) {
+                    throw new \InvalidArgumentException('Batch insert entities must be ' . $class . ', got ' . $row::class);
+                }
+                if (!$row->isNew()) {
+                    throw new IdentityException($row::class . ' is already persisted and cannot be batch-inserted');
+                }
+                if ($row->hasGatewayBinding()) {
+                    $bound = $row->boundGateway()
+                        ?? throw new \LogicException($row::class . ' has a destroyed Gateway; query it explicitly through a new Gateway');
+                    $gateway->assertSame($bound, 'batch insert');
+                }
+                $entities[$index] = $row;
+            }
+            foreach ($entities as $index => $row) {
+                $this->transactions->rememberEntity($row);
+                $row->beforeSave();
+                $row->beforeInsert();
+                $prepared[$index] = $this->prepareBatchRow($meta, $columns, [], $row, $now);
+            }
+            ksort($prepared);
+            $this->gatewayTransaction($gateway, function () use (
+                $gateway, $meta, $prepared, $generated, $entities, $cacheSet,
+            ): void {
+                foreach ($prepared as $index => $values) {
+                    $ids = $this->executeBatchChunk($meta, $generated, [], [$values]);
+                    if (isset($entities[$index])) {
+                        $this->publishBatchEntity($gateway, $entities[$index], $meta, $generated, $ids[0] ?? null, $cacheSet);
+                    }
+                }
+            });
+
             return;
         }
 
-        $rows = array_values($rows);
-        $entities = [];
-        $prepared = [];
-        $now = time();
-        // 数组值、实体类型、新旧状态和归属先预检；失败批次不提前绑定新实体。
         foreach ($rows as $index => $row) {
             if (!$row instanceof Entity) {
                 $prepared[$index] = $this->prepareBatchRow($meta, $columns, $fieldList, $row, $now);
@@ -200,6 +236,8 @@ final readonly class BulkWriter
         ?string $id,
         callable $cacheSet,
     ): void {
+        // 自动事务在预检后才开始，必须在生成键回填及持久化状态改变前登记新实体基线。
+        $this->transactions->rememberEntity($row);
         if ($generated !== null && !$row->propSet($generated->property)) {
             if ($id === null || $id === '' || $id === '0') {
                 throw new IdentityException($meta->class . ' row may have been written, but its generated column was not populated', true);
@@ -207,10 +245,11 @@ final readonly class BulkWriter
             $row->{$generated->property} = $this->caster->toPhp($meta->class, $generated, $id);
         }
         $row->markPersisted($gateway);
+        $cacheSet($row, true);
+        $this->transactions->rememberEntity($row);
         $row->afterSave();
         $row->afterInsert();
-        $this->transactions->rememberEntity($row);
-        $cacheSet($row, true);
+        $gateway->assertPersistedIdentity($row);
     }
 
     /**
@@ -243,12 +282,14 @@ final readonly class BulkWriter
             $valueGroups[] = '(' . implode(', ', $placeholders) . ')';
         }
 
-        $sql = sprintf(
-            'INSERT INTO %s (%s) VALUES %s',
-            $this->quote($meta->table),
-            implode(', ', $columns),
-            implode(', ', $valueGroups),
-        );
+        $sql = $fieldList === []
+            ? 'INSERT INTO ' . $this->quote($meta->table) . ($this->driver() === 'mysql' ? ' () VALUES ()' : ' DEFAULT VALUES')
+            : sprintf(
+                'INSERT INTO %s (%s) VALUES %s',
+                $this->quote($meta->table),
+                implode(', ', $columns),
+                implode(', ', $valueGroups),
+            );
 
         if ($generated !== null && $this->connection->supportsReturning()) {
             // P0-3：RETURNING 拿回本块全部生成列值，行序即结果序
@@ -519,8 +560,18 @@ final readonly class BulkWriter
             }
         }
         $updates = [];
+        $defaultUpdates = $updateColumns === null;
         $createdAtField = $meta->timestampField('created_at');
         $createdAt = $createdAtField === null ? [] : [$createdAtField->column];
+        $updatedAtField = $meta->timestampField('updated_at');
+        $updatedAt = $updatedAtField === null ? [] : [$updatedAtField->column];
+        // 默认更新只采用调用方实际提供的普通字段；自动填充的 updated_at 不能凭空制造更新需求。
+        $defaultUpdateColumns = array_values(array_diff(
+            array_keys($insert),
+            array_keys($conflicts),
+            $createdAt,
+            $updatedAt,
+        ));
         foreach (['created_at', 'updated_at'] as $timestamp) {
             $field = $meta->timestampField($timestamp);
             if ($field !== null && !array_key_exists($field->column, $insert)) {
@@ -533,19 +584,14 @@ final readonly class BulkWriter
             }
         }
         if ($updateColumns !== []) {
-            $updateColumns ??= array_values(array_diff(
-                array_keys($insert),
-                array_keys($conflicts),
-                // 创建时间只在插入时写入；即使显式传值，冲突更新也不覆盖。
-                $createdAt,
-            ));
+            $updateColumns ??= $defaultUpdateColumns;
             $updateColumns = array_values(array_diff($updateColumns, $createdAt));
             if ($updateColumns !== []) {
                 $updateColumns = array_map(
                     static fn (string $column): string => $resolve($column)->column,
                     $updateColumns,
                 );
-                $updatedAt = $meta->timestampField('updated_at')?->column;
+                $updatedAt = $updatedAtField?->column;
                 if ($updatedAt !== null
                     && $updateColumns !== [$updatedAt]
                     && !in_array($updatedAt, $updateColumns, true)) {
@@ -563,7 +609,7 @@ final readonly class BulkWriter
                 $updates[$field->column] = $field;
             }
         }
-        if ($updateColumns === null && $updates === []) {
+        if ($defaultUpdates && $updates === []) {
             throw new \InvalidArgumentException('UPSERT has no fields to update; pass $updateColumns=[] to ignore conflicts');
         }
         $columns = array_keys($insert);
